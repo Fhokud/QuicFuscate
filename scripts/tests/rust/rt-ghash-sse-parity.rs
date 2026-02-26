@@ -1,0 +1,33 @@
+#![cfg(target_arch = "x86_64")]
+#![cfg(feature = "rust-tests")]
+
+fn run_ghash_with_override(mode: &str, aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    quicfuscate::crypto::gcm::__test_set_ghash_override(Some(mode));
+    let result = quicfuscate::crypto::gcm::ghash([0x11; 16], aad, ct);
+    quicfuscate::crypto::gcm::__test_set_ghash_override(None);
+    result
+}
+
+#[test]
+fn ghash_sse_matches_scalar_when_available() {
+    if !std::arch::is_x86_feature_detected!("ssse3")
+        || !std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        return;
+    }
+
+    let aad = b"associated-data";
+    let ct = b"ciphertext-payload";
+
+    let before = quicfuscate::optimize::telemetry::GHASH_SSE_OPS.get();
+    let hw = run_ghash_with_override("sse", aad, ct);
+    let after = quicfuscate::optimize::telemetry::GHASH_SSE_OPS.get();
+    assert_eq!(before + 1, after);
+
+    let reference_before = quicfuscate::optimize::telemetry::GHASH_SCALAR_OPS.get();
+    let sw = run_ghash_with_override("scalar", aad, ct);
+    let reference_after = quicfuscate::optimize::telemetry::GHASH_SCALAR_OPS.get();
+    assert_eq!(reference_before + 1, reference_after);
+
+    assert_eq!(hw, sw, "SSE GHASH diverged from scalar reference");
+}

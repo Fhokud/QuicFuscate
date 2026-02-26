@@ -1,0 +1,55 @@
+name: Clippy Matrix
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy-matrix:
+    name: Clippy Matrix Check
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        features:
+          - ""
+          - "fec_advanced"
+          - "fec_advanced,wiedemann"
+          - "unsafe_rust"
+          - "unsafe_rust,compression_zstd_ffi"
+          - "simd-selfcheck"
+          - "optimized"
+          - "fec_advanced,unsafe_rust"
+          - "fec_advanced,unsafe_rust,compression_zstd_ffi"
+
+    steps:
+    - uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+        
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Run clippy check (features: ${{ matrix.features }})
+      run: |
+        if [ -n "${{ matrix.features }}" ]; then
+          cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
+        else
+          cargo clippy --all-targets -- -D warnings
+        fi

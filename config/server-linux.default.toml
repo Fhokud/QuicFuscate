@@ -1,0 +1,65 @@
+# QuicFuscate server config (Linux-friendly defaults)
+#
+# Used by:
+# - server CLI: `quicfuscate server --config /etc/quicfuscate/quicfuscate.toml`
+# - admin panel: /api/config (read/write) + /api/reload (apply)
+#
+# Notes:
+# - QUIC listen/bind, TLS cert/key and admin web bind are CLI/systemd concerns.
+# - This file focuses on runtime behavior (stealth, adaptive FEC tuning, optimize).
+
+[stealth]
+# Supported values include: "off", "auto", "max", "manual", "intelligent", "stealth", "performance"
+mode = "manual"
+
+enable_domain_fronting = true
+enable_http3_masquerading = true
+enable_xor_obfuscation = true
+use_tls_cover = true
+use_qpack_headers = true
+enable_protocol_mimicry = true
+
+enable_doh = true
+doh_provider = "https://cloudflare-dns.com/dns-query"
+
+# Keep empty to allow internal rotation/derivation (if enabled).
+fronting_domains = []
+
+# -----------------------------------------------------------------------------
+# FEC (server and client runtime)
+# -----------------------------------------------------------------------------
+enable_traffic_padding = true
+enable_timing_obfuscation = true
+enable_noble_timing_obfuscation = true
+[fec]
+mode = "manual"
+# Initial mode for runtime AdaptiveFec.
+# Accepted: dynamic/static/bursty/streaming and explicit zero/light/normal/medium/strong/extreme.
+initial_mode = "zero"
+window_excellent = 0
+window_good = 16
+window_fair = 64
+window_poor = 512
+enable_partial = true
+enable_pid = true
+enable_hysteresis = true
+enable_kalman = false
+stream_every = 5
+
+# -----------------------------------------------------------------------------
+# Optimization
+# -----------------------------------------------------------------------------
+[optimization]
+cpu_features_mode = "auto"
+memory_pool_size = 4194304
+memory_pool_alignment = 64
+num_worker_threads = 0
+
+# -----------------------------------------------------------------------------
+# Transport
+# -----------------------------------------------------------------------------
+# Note: This controls the QUIC transport layer behavior used for new connections.
+[transport]
+cc_algorithm = "reno"
+mtu = 1309
+enable_pacing = true

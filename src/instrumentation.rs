@@ -1,0 +1,622 @@
+//! Instrumentation for metrics collection throughout QuicFuscate.
+//!
+//! This module provides a global metrics registry that can be accessed
+//! from anywhere in the codebase to record events and statistics.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::LazyLock;
+
+/// Global metrics instance.
+static GLOBAL_METRICS: LazyLock<Arc<GlobalMetrics>> =
+    LazyLock::new(|| Arc::new(GlobalMetrics::new()));
+
+/// Get the global metrics instance.
+pub fn global() -> Arc<GlobalMetrics> {
+    GLOBAL_METRICS.clone()
+}
+
+/// Global metrics collector.
+#[derive(Debug)]
+pub struct GlobalMetrics {
+    // Server metrics
+    pub server: ServerMetrics,
+    // Client metrics
+    pub client: ClientMetrics,
+    // Transport metrics
+    pub transport: TransportMetrics,
+    // Stealth metrics
+    pub stealth: StealthMetrics,
+    // FEC metrics
+    pub fec: FecMetrics,
+}
+
+impl GlobalMetrics {
+    pub fn new() -> Self {
+        Self {
+            server: ServerMetrics::new(),
+            client: ClientMetrics::new(),
+            transport: TransportMetrics::new(),
+            stealth: StealthMetrics::new(),
+            fec: FecMetrics::new(),
+        }
+    }
+
+    /// Export all metrics in Prometheus format.
+    pub fn export_prometheus(&self) -> String {
+        let mut out = String::with_capacity(4096);
+
+        // Server metrics
+        self.server.export(&mut out);
+
+        // Transport metrics
+        self.transport.export(&mut out);
+
+        // Stealth metrics
+        self.stealth.export(&mut out);
+
+        // FEC metrics
+        self.fec.export(&mut out);
+
+        out
+    }
+
+    /// Export health status as JSON.
+    pub fn export_health(&self) -> String {
+        format!(
+            r#"{{"status":"ok","version":"{}","uptime":{},"clients":{}}}"#,
+            env!("CARGO_PKG_VERSION"),
+            self.server.uptime_secs(),
+            self.server.clients_active.load(Ordering::Relaxed)
+        )
+    }
+}
+
+impl Default for GlobalMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Server-specific metrics.
+#[derive(Debug)]
+pub struct ServerMetrics {
+    pub start_time: std::time::Instant,
+
+    // Connection metrics
+    pub clients_active: AtomicU64,
+    pub clients_total: AtomicU64,
+    pub connections_accepted: AtomicU64,
+    pub connections_rejected: AtomicU64,
+
+    // Session metrics
+    pub sessions_created: AtomicU64,
+    pub sessions_expired: AtomicU64,
+
+    // Error metrics
+    pub auth_failed: AtomicU64,
+    pub rate_limited: AtomicU64,
+}
+
+impl ServerMetrics {
+    pub fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            clients_active: AtomicU64::new(0),
+            clients_total: AtomicU64::new(0),
+            connections_accepted: AtomicU64::new(0),
+            connections_rejected: AtomicU64::new(0),
+            sessions_created: AtomicU64::new(0),
+            sessions_expired: AtomicU64::new(0),
+            auth_failed: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+        }
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    pub fn client_connected(&self) {
+        self.clients_active.fetch_add(1, Ordering::Relaxed);
+        self.clients_total.fetch_add(1, Ordering::Relaxed);
+        self.connections_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_disconnected(&self) {
+        self.clients_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_rejected(&self) {
+        self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn session_created(&self) {
+        self.sessions_created.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn session_expired(&self) {
+        self.sessions_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_failure(&self) {
+        self.auth_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn rate_limit_hit(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn export(&self, out: &mut String) {
+        out.push_str("# HELP quicfuscate_up Server is up\n");
+        out.push_str("# TYPE quicfuscate_up gauge\n");
+        out.push_str("quicfuscate_up 1\n\n");
+
+        out.push_str("# HELP quicfuscate_uptime_seconds Server uptime\n");
+        out.push_str("# TYPE quicfuscate_uptime_seconds counter\n");
+        out.push_str(&format!("quicfuscate_uptime_seconds {}\n\n", self.uptime_secs()));
+
+        out.push_str("# HELP quicfuscate_clients_active Active client connections\n");
+        out.push_str("# TYPE quicfuscate_clients_active gauge\n");
+        out.push_str(&format!(
+            "quicfuscate_clients_active {}\n\n",
+            self.clients_active.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_clients_total Total clients connected\n");
+        out.push_str("# TYPE quicfuscate_clients_total counter\n");
+        out.push_str(&format!(
+            "quicfuscate_clients_total {}\n\n",
+            self.clients_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_connections_accepted Accepted connections\n");
+        out.push_str("# TYPE quicfuscate_connections_accepted counter\n");
+        out.push_str(&format!(
+            "quicfuscate_connections_accepted {}\n\n",
+            self.connections_accepted.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_connections_rejected Rejected connections\n");
+        out.push_str("# TYPE quicfuscate_connections_rejected counter\n");
+        out.push_str(&format!(
+            "quicfuscate_connections_rejected {}\n\n",
+            self.connections_rejected.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_sessions_created Sessions created\n");
+        out.push_str("# TYPE quicfuscate_sessions_created counter\n");
+        out.push_str(&format!(
+            "quicfuscate_sessions_created {}\n\n",
+            self.sessions_created.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_sessions_expired Sessions expired\n");
+        out.push_str("# TYPE quicfuscate_sessions_expired counter\n");
+        out.push_str(&format!(
+            "quicfuscate_sessions_expired {}\n\n",
+            self.sessions_expired.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_auth_failed Authentication failures\n");
+        out.push_str("# TYPE quicfuscate_auth_failed counter\n");
+        out.push_str(&format!(
+            "quicfuscate_auth_failed {}\n\n",
+            self.auth_failed.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_rate_limited Rate limited connections\n");
+        out.push_str("# TYPE quicfuscate_rate_limited counter\n");
+        out.push_str(&format!(
+            "quicfuscate_rate_limited {}\n\n",
+            self.rate_limited.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Client-specific metrics.
+#[derive(Debug)]
+pub struct ClientMetrics {
+    pub connection_attempts: AtomicU64,
+    pub connection_successes: AtomicU64,
+    pub connection_failures: AtomicU64,
+    pub reconnects: AtomicU64,
+    pub uptime_secs: AtomicU64,
+}
+
+impl ClientMetrics {
+    pub fn new() -> Self {
+        Self {
+            connection_attempts: AtomicU64::new(0),
+            connection_successes: AtomicU64::new(0),
+            connection_failures: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+            uptime_secs: AtomicU64::new(0),
+        }
+    }
+
+    pub fn connection_attempt(&self) {
+        self.connection_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_success(&self) {
+        self.connection_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_failure(&self) {
+        self.connection_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reconnect(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Default for ClientMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Transport layer metrics.
+#[derive(Debug)]
+pub struct TransportMetrics {
+    // Traffic
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub packets_in: AtomicU64,
+    pub packets_out: AtomicU64,
+
+    // QUIC specific
+    pub streams_opened: AtomicU64,
+    pub streams_closed: AtomicU64,
+    pub datagrams_sent: AtomicU64,
+    pub datagrams_received: AtomicU64,
+
+    // Congestion
+    pub packets_lost: AtomicU64,
+    pub packets_retransmitted: AtomicU64,
+    pub rtt_samples: AtomicU64,
+    pub rtt_sum_us: AtomicU64,
+}
+
+impl TransportMetrics {
+    pub fn new() -> Self {
+        Self {
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            packets_in: AtomicU64::new(0),
+            packets_out: AtomicU64::new(0),
+            streams_opened: AtomicU64::new(0),
+            streams_closed: AtomicU64::new(0),
+            datagrams_sent: AtomicU64::new(0),
+            datagrams_received: AtomicU64::new(0),
+            packets_lost: AtomicU64::new(0),
+            packets_retransmitted: AtomicU64::new(0),
+            rtt_samples: AtomicU64::new(0),
+            rtt_sum_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_bytes_in(&self, bytes: u64) {
+        self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_bytes_out(&self, bytes: u64) {
+        self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_packet_in(&self) {
+        self.packets_in.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_packet_out(&self) {
+        self.packets_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_packet_loss(&self) {
+        self.packets_lost.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rtt(&self, rtt_us: u64) {
+        self.rtt_samples.fetch_add(1, Ordering::Relaxed);
+        self.rtt_sum_us.fetch_add(rtt_us, Ordering::Relaxed);
+    }
+
+    pub fn avg_rtt_ms(&self) -> f64 {
+        let samples = self.rtt_samples.load(Ordering::Relaxed);
+        if samples == 0 {
+            return 0.0;
+        }
+        let sum = self.rtt_sum_us.load(Ordering::Relaxed);
+        (sum as f64 / samples as f64) / 1000.0
+    }
+
+    pub fn loss_rate(&self) -> f64 {
+        let sent = self.packets_out.load(Ordering::Relaxed);
+        if sent == 0 {
+            return 0.0;
+        }
+        let lost = self.packets_lost.load(Ordering::Relaxed);
+        lost as f64 / sent as f64 * 100.0
+    }
+
+    fn export(&self, out: &mut String) {
+        out.push_str("# HELP quicfuscate_bytes_in Total bytes received\n");
+        out.push_str("# TYPE quicfuscate_bytes_in counter\n");
+        out.push_str(&format!(
+            "quicfuscate_bytes_in {}\n\n",
+            self.bytes_in.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_bytes_out Total bytes sent\n");
+        out.push_str("# TYPE quicfuscate_bytes_out counter\n");
+        out.push_str(&format!(
+            "quicfuscate_bytes_out {}\n\n",
+            self.bytes_out.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_packets_in Total packets received\n");
+        out.push_str("# TYPE quicfuscate_packets_in counter\n");
+        out.push_str(&format!(
+            "quicfuscate_packets_in {}\n\n",
+            self.packets_in.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_packets_out Total packets sent\n");
+        out.push_str("# TYPE quicfuscate_packets_out counter\n");
+        out.push_str(&format!(
+            "quicfuscate_packets_out {}\n\n",
+            self.packets_out.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_packets_lost Packets lost\n");
+        out.push_str("# TYPE quicfuscate_packets_lost counter\n");
+        out.push_str(&format!(
+            "quicfuscate_packets_lost {}\n\n",
+            self.packets_lost.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_rtt_avg_ms Average RTT in milliseconds\n");
+        out.push_str("# TYPE quicfuscate_rtt_avg_ms gauge\n");
+        out.push_str(&format!("quicfuscate_rtt_avg_ms {:.2}\n\n", self.avg_rtt_ms()));
+
+        out.push_str("# HELP quicfuscate_loss_rate Packet loss rate percent\n");
+        out.push_str("# TYPE quicfuscate_loss_rate gauge\n");
+        out.push_str(&format!("quicfuscate_loss_rate {:.2}\n\n", self.loss_rate()));
+    }
+}
+
+impl Default for TransportMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stealth mode metrics.
+#[derive(Debug)]
+pub struct StealthMetrics {
+    pub mode_off: AtomicU64,
+    pub mode_auto: AtomicU64,
+    pub mode_max: AtomicU64,
+    pub http3_active: AtomicU64,
+    pub tls13_active: AtomicU64,
+    pub padding_bytes: AtomicU64,
+    pub fingerprint_rotations: AtomicU64,
+}
+
+impl StealthMetrics {
+    pub fn new() -> Self {
+        Self {
+            mode_off: AtomicU64::new(0),
+            mode_auto: AtomicU64::new(0),
+            mode_max: AtomicU64::new(0),
+            http3_active: AtomicU64::new(0),
+            tls13_active: AtomicU64::new(0),
+            padding_bytes: AtomicU64::new(0),
+            fingerprint_rotations: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_mode(&self, mode: &str) {
+        match mode {
+            "off" => self.mode_off.fetch_add(1, Ordering::Relaxed),
+            "auto" => self.mode_auto.fetch_add(1, Ordering::Relaxed),
+            "max" => self.mode_max.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
+    pub fn record_padding(&self, bytes: u64) {
+        self.padding_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn set_http3_active(&self, count: u64) {
+        self.http3_active.store(count, Ordering::Relaxed);
+    }
+
+    pub fn set_tls13_active(&self, count: u64) {
+        self.tls13_active.store(count, Ordering::Relaxed);
+    }
+
+    fn export(&self, out: &mut String) {
+        out.push_str("# HELP quicfuscate_stealth_http3 Clients using HTTP/3 stealth\n");
+        out.push_str("# TYPE quicfuscate_stealth_http3 gauge\n");
+        out.push_str(&format!(
+            "quicfuscate_stealth_http3 {}\n\n",
+            self.http3_active.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_stealth_tls13 Clients using TLS 1.3 stealth\n");
+        out.push_str("# TYPE quicfuscate_stealth_tls13 gauge\n");
+        out.push_str(&format!(
+            "quicfuscate_stealth_tls13 {}\n\n",
+            self.tls13_active.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_padding_bytes Total padding bytes added\n");
+        out.push_str("# TYPE quicfuscate_padding_bytes counter\n");
+        out.push_str(&format!(
+            "quicfuscate_padding_bytes {}\n\n",
+            self.padding_bytes.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+impl Default for StealthMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// FEC (Forward Error Correction) metrics.
+#[derive(Debug)]
+pub struct FecMetrics {
+    pub packets_encoded: AtomicU64,
+    pub packets_decoded: AtomicU64,
+    pub packets_recovered: AtomicU64,
+    pub recovery_failures: AtomicU64,
+    pub redundancy_bytes: AtomicU64,
+}
+
+impl FecMetrics {
+    pub fn new() -> Self {
+        Self {
+            packets_encoded: AtomicU64::new(0),
+            packets_decoded: AtomicU64::new(0),
+            packets_recovered: AtomicU64::new(0),
+            recovery_failures: AtomicU64::new(0),
+            redundancy_bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_encode(&self) {
+        self.packets_encoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_decode(&self) {
+        self.packets_decoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery(&self) {
+        self.packets_recovered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery_failure(&self) {
+        self.recovery_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_redundancy(&self, bytes: u64) {
+        self.redundancy_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn recovery_rate(&self) -> f64 {
+        let total = self.packets_recovered.load(Ordering::Relaxed)
+            + self.recovery_failures.load(Ordering::Relaxed);
+        if total == 0 {
+            return 100.0;
+        }
+        let recovered = self.packets_recovered.load(Ordering::Relaxed);
+        recovered as f64 / total as f64 * 100.0
+    }
+
+    fn export(&self, out: &mut String) {
+        out.push_str("# HELP quicfuscate_fec_encoded FEC encoded packets\n");
+        out.push_str("# TYPE quicfuscate_fec_encoded counter\n");
+        out.push_str(&format!(
+            "quicfuscate_fec_encoded {}\n\n",
+            self.packets_encoded.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_fec_decoded FEC decoded packets\n");
+        out.push_str("# TYPE quicfuscate_fec_decoded counter\n");
+        out.push_str(&format!(
+            "quicfuscate_fec_decoded {}\n\n",
+            self.packets_decoded.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_fec_recovered FEC recovered packets\n");
+        out.push_str("# TYPE quicfuscate_fec_recovered counter\n");
+        out.push_str(&format!(
+            "quicfuscate_fec_recovered {}\n\n",
+            self.packets_recovered.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_fec_recovery_rate FEC recovery success rate\n");
+        out.push_str("# TYPE quicfuscate_fec_recovery_rate gauge\n");
+        out.push_str(&format!("quicfuscate_fec_recovery_rate {:.2}\n\n", self.recovery_rate()));
+
+        out.push_str("# HELP quicfuscate_fec_redundancy FEC redundancy bytes\n");
+        out.push_str("# TYPE quicfuscate_fec_redundancy counter\n");
+        out.push_str(&format!(
+            "quicfuscate_fec_redundancy {}\n",
+            self.redundancy_bytes.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+impl Default for FecMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_global_metrics() {
+        let metrics = GlobalMetrics::new();
+
+        metrics.server.client_connected();
+        metrics.server.client_connected();
+        metrics.server.client_disconnected();
+
+        assert_eq!(metrics.server.clients_active.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.server.clients_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_transport_metrics() {
+        let metrics = TransportMetrics::new();
+
+        metrics.record_bytes_in(1000);
+        metrics.record_bytes_out(500);
+        metrics.record_packet_in();
+        metrics.record_packet_out();
+        metrics.record_packet_loss();
+
+        assert_eq!(metrics.bytes_in.load(Ordering::Relaxed), 1000);
+        assert_eq!(metrics.loss_rate(), 100.0); // 1 lost / 1 sent
+    }
+
+    #[test]
+    fn test_fec_metrics() {
+        let metrics = FecMetrics::new();
+
+        metrics.record_recovery();
+        metrics.record_recovery();
+        metrics.record_recovery_failure();
+
+        // ~66.67%
+        let rate = metrics.recovery_rate();
+        assert!(rate > 66.0 && rate < 67.0);
+    }
+
+    #[test]
+    fn test_prometheus_export() {
+        let metrics = GlobalMetrics::new();
+        metrics.server.client_connected();
+
+        let output = metrics.export_prometheus();
+        assert!(output.contains("quicfuscate_up 1"));
+        assert!(output.contains("quicfuscate_clients_active 1"));
+    }
+}

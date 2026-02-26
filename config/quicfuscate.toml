@@ -1,0 +1,404 @@
+# QuicFuscate Configuration File
+# Complete configuration with all stealth and performance options
+# 
+# This is the canonical runtime configuration for QuicFuscate.
+# Used by engine embedding and CLI `--config` loading paths.
+# Load via: QuicFuscateEngine::from_file("config/quicfuscate.toml")
+
+# ==============================================================================
+# ENGINE CONFIGURATION
+# ==============================================================================
+
+[engine]
+# Engine operation mode
+# Options: "client", "server"
+mode = "client"
+
+# Log level (overrides [logging].level if set)
+# Options: "error", "warn", "info", "debug", "trace"
+log_level = "info"
+
+# Auto-start on engine creation
+auto_start = false
+
+# Graceful shutdown timeout (milliseconds)
+shutdown_timeout_ms = 5000
+
+# ==============================================================================
+# CONNECTION CONFIGURATION
+# ==============================================================================
+
+[connection]
+# Remote endpoint (server mode: listen address, client mode: server address)
+remote = "0.0.0.0:4433"
+
+# Local bind address (client mode: optional local bind)
+local = ""
+
+# Verify peer certificate (client mode)
+verify_peer = true
+
+# Custom CA file for peer verification (empty = system CAs)
+ca_file = ""
+
+# TLS certificate file (server mode, required)
+cert_file = ""
+
+# TLS private key file (server mode, required)
+key_file = ""
+
+# Application Layer Protocol Negotiation
+alpn = ["h3", "quicfuscate"]
+
+# Server Name Indication (client mode, empty = use remote hostname)
+sni = ""
+
+# Connection idle timeout (milliseconds, 0 = no timeout)
+idle_timeout_ms = 30000
+
+# Enable 0-RTT early data (reduces handshake latency)
+# WARNING: 0-RTT data can be replayed - only use for idempotent operations
+enable_0rtt = true
+
+# Maximum bidirectional streams
+max_streams_bidi = 100
+
+# Maximum unidirectional streams  
+max_streams_uni = 100
+
+# Connection migration support
+enable_migration = true
+
+# Retry token validation (server mode)
+enable_retry = true
+
+# ==============================================================================
+# CRYPTO CONFIGURATION
+# ==============================================================================
+
+[crypto]
+# AEAD cipher preference
+# Options: "auto", "aegis-128l", "aegis-128x4", "aegis-128x8", "morus", "aes-gcm"
+# - auto: Select best based on CPU features (recommended)
+# - aegis-128l: Prefer AEGIS-128L when hardware AES is available
+# - aegis-128x4: Prefer AEGIS-128X4 when hardware AES is available
+# - aegis-128x8: Prefer AEGIS-128X8 when hardware AES is available
+# - morus: Prefer MORUS-1280-128
+# - aes-gcm: Standard AES-GCM (widest compatibility)
+aead_preference = "auto"
+
+# Enable post-quantum cryptography (hybrid Kyber + X25519)
+# WARNING: Increases handshake size significantly (~1KB)
+enable_pq = false
+
+# Post-quantum signature algorithm (when enable_pq = true)
+# Options: "dilithium3", "falcon512"
+pq_signature = "dilithium3"
+
+# Force specific AEAD (overrides preference)
+# Options: "auto", "aegis-128l", "aegis-128x4", "aegis-128x8", "morus", "aes-gcm"
+force_aead = ""
+
+# Key update interval (packets, 0 = automatic per QUIC spec)
+key_update_interval = 0
+
+# Header protection algorithm
+# Options: "aes", "chacha20"
+header_protection = "aes"
+
+# ==============================================================================
+# STEALTH CONFIGURATION
+# ==============================================================================
+
+[stealth]
+# Stealth operation mode
+# Options: "off", "auto", "max", "manual"
+# - off: No stealth features enabled
+# - auto: Balanced stealth without performance impact (default)
+# - max: All features with aggressive settings
+# - manual: Custom configuration (use settings below)
+mode = "auto"
+
+# Manual mode settings (only used when mode = "manual")
+# ------------------------------------------------------------------------------
+
+# Domain fronting - Hide real destination behind CDN domains
+enable_domain_fronting = true
+
+# HTTP/3 masquerading - Make QUIC traffic look like HTTP/3
+enable_http3_masquerading = true
+
+# XOR obfuscation - Encrypt packet payloads with rolling key
+enable_xor_obfuscation = true
+
+# TLS Cover - Use synthetic cover handshakes for DPI evasion
+# When false, uses real TLS only
+use_tls_cover = true
+
+# QPACK headers - Use QPACK compression for HTTP/3 headers
+use_qpack_headers = true
+
+# Traffic padding - Add padding to obscure packet sizes
+# WARNING: May impact performance
+enable_traffic_padding = false
+
+# Timing obfuscation - Add random delays between packets
+# WARNING: Will impact latency
+enable_timing_obfuscation = false
+
+# Protocol mimicry - Make QUIC look like other protocols
+enable_protocol_mimicry = true
+
+# DNS-over-HTTPS - Use encrypted DNS resolution
+enable_doh = true
+
+# DoH provider URL
+# Options: 
+# - "https://cloudflare-dns.com/dns-query" (fast)
+# - "https://dns.quad9.net/dns-query" (privacy-focused)
+# - "https://dns.google/dns-query"
+doh_provider = "https://cloudflare-dns.com/dns-query"
+
+# Padding configuration
+# Strategy options: "random", "fixed", "adaptive", "browser_mimic"
+padding_strategy = "adaptive"
+max_padding_size = 256  # bytes (256 for auto, 2048 for max)
+
+# Custom fronting domains (leave empty to use default CDN rotation)
+fronting_domains = []
+
+# Browser and OS profiles for fingerprinting
+initial_browser = "chrome"  # chrome, firefox, safari, edge
+initial_os = "windows"      # windows, macos, linux, android, ios
+
+# ==============================================================================
+# FINGERPRINT ROTATION
+# ==============================================================================
+
+[fingerprint_rotation]
+# Enable fingerprint rotation (independent of stealth mode)
+enabled = false
+
+# Rotation interval in seconds (0 = disabled)
+# Auto mode: 0 (disabled)
+# Max mode: 120 (2 minutes)
+interval_secs = 300  # 5 minutes
+
+# Rotation mode
+# Options: "fixed", "slots", "all"
+# - fixed: Single profile, no rotation
+# - slots: Rotate through configured profile_slots
+# - all: Rotate through all available profiles
+mode = "fixed"
+
+# Profile slots for rotation (up to 3)
+# Format: ["browser:os", "browser:os", "browser:os"]
+# Leave empty to use defaults based on mode
+profile_slots = [
+    "chrome:windows",
+    "firefox:windows",
+    "safari:macos"
+]
+
+# ==============================================================================
+# FEC (FORWARD ERROR CORRECTION)
+# ==============================================================================
+
+[fec]
+# FEC operation mode
+# Options: "off", "auto", "manual"
+# - off: No FEC
+# - auto: Adaptive FEC based on network conditions (default)
+# - manual: Fixed FEC parameters (use settings below)
+mode = "auto"
+
+# Manual mode settings (only used when mode = "manual")
+# ------------------------------------------------------------------------------
+
+# Initial FEC mode (for manual configuration)
+# Options: "dynamic", "static", "bursty", "streaming"
+initial_mode = "dynamic"
+
+# FEC window sizes for different quality levels
+window_excellent = 0    # No FEC when network is excellent
+window_good = 10       # Light FEC
+window_fair = 30       # Medium FEC
+window_poor = 50       # Heavy FEC
+
+# Enable partial recovery for streaming
+enable_partial = true
+
+# PID controller for adaptive mode
+enable_pid = true
+
+# Hysteresis for mode switching (prevents oscillation)
+enable_hysteresis = true
+
+# Kalman filter for better predictions
+enable_kalman = true
+
+# Streaming emission period (packets)
+stream_every = 5
+
+# ==============================================================================
+# TRANSPORT CONFIGURATION
+# ==============================================================================
+
+[transport]
+# Congestion control algorithm
+# Options: "reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion"
+cc_algorithm = "cubic"
+
+# Maximum Transmission Unit (bytes)
+mtu = 1400
+
+# Maximum UDP payload size (bytes)
+max_udp_payload = 1350
+
+# Maximum idle timeout (milliseconds)
+max_idle_timeout = 30000
+
+# Initial RTT estimate (milliseconds, used before measurements)
+initial_rtt_ms = 100
+
+# Enable spin bit (for RTT measurement by middleboxes)
+enable_spin_bit = true
+
+# Enable pacing (smoother packet transmission)
+enable_pacing = true
+
+# Initial maximum data (bytes)
+initial_max_data = 10000000
+
+# Initial maximum stream data (bidirectional)
+initial_max_stream_data_bidi_local = 1000000
+initial_max_stream_data_bidi_remote = 1000000
+
+# Initial maximum stream data (unidirectional)
+initial_max_stream_data_uni = 1000000
+
+# Initial maximum streams (bidirectional)
+initial_max_streams_bidi = 100
+
+# Initial maximum streams (unidirectional)
+initial_max_streams_uni = 100
+
+# Enable 0-RTT (reduces handshake latency but less secure)
+enable_early_data = false
+
+# GSO (Generic Segmentation Offload) batch size
+gso_batch_size = 16
+
+# GRO (Generic Receive Offload) max batch
+gro_batch_size = 16
+
+# QUIC DATAGRAM queue lengths (0 disables datagrams)
+dgram_recv_queue_len = 1024
+dgram_send_queue_len = 1024
+
+# Disable path MTU discovery
+disable_pmtud = false
+
+# ==============================================================================
+# PERFORMANCE OPTIMIZATION
+# ==============================================================================
+
+[optimization]
+# CPU feature detection mode
+# Options: "auto", "manual", "disabled"
+cpu_features_mode = "auto"
+
+# Manual CPU features (only used when mode = "manual")
+enable_avx2 = true
+enable_avx512 = false
+enable_aesni = true
+enable_vaes = false
+enable_neon = false  # ARM only
+
+# Memory pool configuration
+memory_pool_size = 67108864  # 64MB
+memory_pool_alignment = 64   # Cache line alignment
+
+# Parallel processing
+num_worker_threads = 0  # 0 = auto-detect
+
+# ==============================================================================
+# INTERFACE CONFIGURATION
+# ==============================================================================
+
+[interface]
+# Interface type
+# Options: "tun", "tap", "xdp", "raw_socket"
+type = "tun"
+
+# TUN/TAP configuration
+tun_name = "quicfuse0"
+tun_mtu = 1500
+
+# Enable packet coalescing
+enable_gso = true
+enable_gro = true
+
+# XDP configuration (Linux only)
+xdp_mode = "skb"  # Options: "skb", "driver", "hardware"
+xdp_flags = ["update_if_noexist"]
+
+# ==============================================================================
+# TELEMETRY AND LOGGING
+# ==============================================================================
+
+[telemetry]
+# Enable telemetry collection
+enabled = true
+
+# Telemetry export interval (seconds)
+export_interval = 60
+
+# Metrics to collect
+collect_packet_stats = true
+collect_stream_stats = true
+collect_congestion_stats = true
+collect_fec_stats = true
+collect_stealth_stats = true
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+level = "info"
+
+# Log targets
+log_to_file = false
+log_file_path = "/var/log/quicfuscate.log"
+log_to_stdout = true
+
+# ==============================================================================
+# PRESETS (Quick configurations)
+# ==============================================================================
+# Uncomment one of these to override all settings above
+
+# Maximum privacy and stealth (performance impact)
+# [preset.max_stealth]
+# stealth.mode = "max"
+# fec.mode = "auto"
+# fingerprint_rotation.enabled = true
+# fingerprint_rotation.mode = "all"
+# fingerprint_rotation.interval_secs = 120
+
+# Balanced performance and stealth (recommended)
+# [preset.balanced]
+# stealth.mode = "auto"
+# fec.mode = "auto"
+# fingerprint_rotation.enabled = false
+
+# Maximum performance (no stealth)
+# [preset.performance]
+# stealth.mode = "off"
+# fec.mode = "off"
+# optimization.cpu_features_mode = "auto"
+# interface.enable_gso = true
+# interface.enable_gro = true
+
+# Development/testing mode
+# [preset.development]
+# stealth.mode = "manual"
+# logging.level = "debug"
+# telemetry.enabled = true

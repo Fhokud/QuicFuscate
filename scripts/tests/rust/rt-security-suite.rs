@@ -1,0 +1,349 @@
+#![cfg(feature = "rust-tests")]
+
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use crossbeam_channel::bounded;
+
+use quicfuscate::accelerate::random;
+use quicfuscate::crypto::aead_legacy::{AeadOpen, AeadSeal};
+use quicfuscate::crypto::chacha20poly1305::ChaCha20Poly1305;
+use quicfuscate::crypto::CryptoManager;
+use quicfuscate::error::ConnectionError;
+use quicfuscate::fec::{Encoder8, FecDecoder8, FecPacket};
+use quicfuscate::optimize::{ConstPacketPool, MemoryPool};
+use quicfuscate::transport::frames::{from_bytes, to_bytes, wire_len};
+use quicfuscate::transport::varint::{
+    read_varint, varint_len, write_varint, write_varint_with_len,
+};
+use quicfuscate::transport::{Frame, PacketType};
+
+fn encode_frame(frame: &Frame, pkt: PacketType) -> Vec<u8> {
+    let len = wire_len(frame);
+    let mut buf = vec![0u8; len];
+    let used = to_bytes(frame, &mut buf).expect("to_bytes");
+    assert_eq!(used, len);
+    let (decoded, used2) = from_bytes(&buf, pkt).expect("from_bytes");
+    assert_eq!(used2, len);
+    assert_eq!(&decoded, frame);
+    buf
+}
+
+#[test]
+fn malformed_packet_truncated_varint() {
+    let buf = vec![0x40];
+    let err = from_bytes(&buf, PacketType::Short).expect_err("truncated varint must fail");
+    assert!(matches!(err, ConnectionError::BufferTooShort));
+}
+
+#[test]
+fn malformed_packet_unknown_frame() {
+    let mut buf = vec![0u8; 2];
+    let used = write_varint(0x2f, &mut buf).expect("write varint");
+    let err = from_bytes(&buf[..used], PacketType::Short).expect_err("unknown frame must fail");
+    assert!(matches!(err, ConnectionError::InvalidFrame));
+}
+
+#[test]
+fn oversized_input_datagram_length() {
+    let len = 512u64;
+    let mut buf = vec![0u8; 1 + varint_len(len)];
+    buf[0] = 0x31;
+    write_varint(len, &mut buf[1..]).expect("write length");
+    let err = from_bytes(&buf, PacketType::Short).expect_err("oversized datagram must fail");
+    assert!(matches!(err, ConnectionError::BufferTooShort));
+}
+
+#[test]
+fn boundary_conditions_varint_edges() {
+    let values =
+        [0u64, 0x3f, 0x40, 0x3fff, 0x4000, 0x3fff_ffff, 0x4000_0000, 0x3fff_ffff_ffff_ffff];
+    for value in values {
+        let mut buf = vec![0u8; varint_len(value)];
+        let used = write_varint(value, &mut buf).expect("write varint");
+        let (decoded, used2) = read_varint(&buf).expect("read varint");
+        assert_eq!(used, used2);
+        assert_eq!(decoded, value);
+    }
+}
+
+#[test]
+fn integer_overflow_varint_rejected() {
+    let mut buf = vec![0u8; 8];
+    let err =
+        write_varint_with_len(0x4000_0000_0000_0000, 8, &mut buf).expect_err("overflow must fail");
+    assert!(matches!(err, ConnectionError::InvalidPacket));
+}
+
+#[test]
+fn buffer_overflow_varint_encode_rejected() {
+    let mut buf = vec![0u8; 2];
+    let err = write_varint(0x4000, &mut buf).expect_err("buffer too short must fail");
+    assert!(matches!(err, ConnectionError::BufferTooShort));
+}
+
+#[test]
+fn use_after_free_pool_clears_len() {
+    let mut pool: ConstPacketPool<2, 32> = ConstPacketPool::new();
+    let buf_ptr = {
+        let buf = pool.alloc().expect("alloc");
+        buf.write(b"payload");
+        assert_eq!(buf.as_slice(), b"payload");
+        buf as *const _
+    };
+    unsafe {
+        pool.free(&*buf_ptr);
+    }
+    let buf2 = pool.alloc().expect("re-alloc");
+    assert!(buf2.as_slice().is_empty());
+}
+
+#[test]
+fn double_free_guard_prevents_duplicate_allocation() {
+    let mut pool: ConstPacketPool<2, 32> = ConstPacketPool::new();
+    let buf_ptr = {
+        let buf = pool.alloc().expect("alloc");
+        buf as *const _
+    };
+    unsafe {
+        pool.free(&*buf_ptr);
+        pool.free(&*buf_ptr);
+    }
+    let first = pool.alloc().is_some();
+    let second = pool.alloc().is_none();
+    assert!(first);
+    assert!(second);
+}
+
+#[test]
+fn resource_exhaustion_prevents_overalloc() {
+    let mut pool: ConstPacketPool<3, 32> = ConstPacketPool::new();
+    let first = pool.alloc().is_some();
+    let second = pool.alloc().is_some();
+    let third = pool.alloc().is_none();
+    assert!(first);
+    assert!(second);
+    assert!(third);
+}
+
+#[test]
+fn timing_attack_tag_mismatch_rejected() {
+    let key = [0x11u8; 32];
+    let nonce = [0x22u8; 12];
+    let mut buf = vec![0u8; 64 + 16];
+    buf[..64].copy_from_slice(&[0xAB; 64]);
+    let seal = ChaCha20Poly1305::new(&key, &nonce);
+    let out_len = seal.seal_with_u64_counter(0, b"aad", &mut buf, 64, None).expect("seal");
+    assert_eq!(out_len, 80);
+    buf[79] ^= 0x01;
+    let open = ChaCha20Poly1305::new(&key, &nonce);
+    let err = open.open_with_u64_counter(0, b"aad", &mut buf).expect_err("tamper must fail");
+    assert!(matches!(err, ConnectionError::CryptoFail));
+}
+
+#[test]
+fn key_material_generated_is_nonzero() {
+    let mgr = CryptoManager::new();
+    let k1 = mgr.generate_session_key(32);
+    let k2 = mgr.generate_session_key(32);
+    assert_eq!(k1.len(), 32);
+    assert_eq!(k2.len(), 32);
+    assert!(k1.iter().any(|b| *b != 0));
+    assert!(k2.iter().any(|b| *b != 0));
+    assert_ne!(k1, k2);
+}
+
+#[test]
+fn prng_quality_two_draws_differ() {
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    random::random_bytes_secure(&mut a);
+    random::random_bytes_secure(&mut b);
+    assert!(a.iter().any(|v| *v != 0));
+    assert!(b.iter().any(|v| *v != 0));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn crypto_properties_roundtrip() {
+    let key = [0x5au8; 32];
+    let nonce = [0x7bu8; 12];
+    let plaintext = b"quicfuscate-crypto-roundtrip";
+    let mut buf = vec![0u8; plaintext.len() + 16];
+    buf[..plaintext.len()].copy_from_slice(plaintext);
+    let seal = ChaCha20Poly1305::new(&key, &nonce);
+    let sealed_len =
+        seal.seal_with_u64_counter(7, b"ad", &mut buf, plaintext.len(), None).expect("seal");
+    let open = ChaCha20Poly1305::new(&key, &nonce);
+    let opened_len = open.open_with_u64_counter(7, b"ad", &mut buf).expect("open");
+    assert_eq!(sealed_len, plaintext.len() + 16);
+    assert_eq!(opened_len, plaintext.len());
+    assert_eq!(&buf[..opened_len], plaintext);
+}
+
+#[test]
+fn replay_attack_duplicate_ack_ranges_collapsed() {
+    let frame =
+        Frame::Ack { ack_delay: 2, ranges: vec![(10, 12), (1, 2), (12, 13)], ecn_counts: None };
+    let len = wire_len(&frame);
+    let mut buf = vec![0u8; len];
+    let used = to_bytes(&frame, &mut buf).expect("to_bytes");
+    assert_eq!(used, len);
+    let (decoded, _) = from_bytes(&buf, PacketType::Short).expect("from_bytes");
+    match decoded {
+        Frame::Ack { ranges, .. } => {
+            assert_eq!(ranges, vec![(1, 2), (10, 13)]);
+        }
+        _ => panic!("unexpected frame"),
+    }
+}
+
+#[test]
+fn ack_block_overflow_rejected() {
+    const MAX_VARINT: u64 = 0x3fff_ffff_ffff_ffff;
+    let mut buf = vec![0u8; 1 + varint_len(0) + varint_len(0) + varint_len(MAX_VARINT)];
+    let mut off = 0usize;
+    off += write_varint(0x02, &mut buf[off..]).expect("type");
+    off += write_varint(0, &mut buf[off..]).expect("largest_ack");
+    off += write_varint(0, &mut buf[off..]).expect("ack_delay");
+    off += write_varint(MAX_VARINT, &mut buf[off..]).expect("num_blocks");
+    let err = from_bytes(&buf[..off], PacketType::Short).expect_err("overflow must fail");
+    assert!(matches!(err, ConnectionError::InvalidFrame));
+}
+
+#[test]
+fn amplification_attack_datagram_length_rejected() {
+    let len = 10_000u64;
+    let mut buf = vec![0u8; 1 + varint_len(len)];
+    buf[0] = 0x31;
+    write_varint(len, &mut buf[1..]).expect("write len");
+    let err = from_bytes(&buf, PacketType::Short).expect_err("datagram length must fail");
+    assert!(matches!(err, ConnectionError::BufferTooShort));
+}
+
+#[test]
+fn transport_invariants_frame_roundtrip() {
+    let frame = Frame::Stream { stream_id: 4, offset: 0, data: b"payload".to_vec(), fin: false };
+    let _ = encode_frame(&frame, PacketType::Short);
+}
+
+#[test]
+fn fec_properties_single_repair_recovers_missing() {
+    let pool = Arc::new(MemoryPool::new(32, 256));
+    let mut enc = Encoder8::new(4, 6);
+    let payloads = [
+        (1u64, b"one".to_vec()),
+        (2u64, b"two".to_vec()),
+        (3u64, b"three".to_vec()),
+        (4u64, b"four".to_vec()),
+    ];
+    for (id, data) in payloads.iter() {
+        let pkt = FecPacket::new(
+            *id,
+            Some(pool.alloc_from_slice(data)),
+            data.len(),
+            true,
+            None,
+            0,
+            Arc::clone(&pool),
+        );
+        enc.take_packet(pkt);
+    }
+    let repair = enc.generate_repair_packet(0, &pool).expect("repair packet");
+    let mut dec = FecDecoder8::new(4, Arc::clone(&pool));
+    for (id, data) in payloads.iter() {
+        if *id == 2 {
+            continue;
+        }
+        let pkt = FecPacket::new(
+            *id,
+            Some(pool.alloc_from_slice(data)),
+            data.len(),
+            true,
+            None,
+            0,
+            Arc::clone(&pool),
+        );
+        dec.take_packet(pkt);
+    }
+    dec.take_packet(repair);
+    let recovered = dec.poll_recovered();
+    let recovered_two = recovered.into_iter().find(|p| p.id == 2);
+    let recovered_two = recovered_two.expect("missing packet recovered");
+    let recovered_data = recovered_two.data.as_ref().expect("recovered data");
+    let recovered_slice = &recovered_data[..payloads[1].1.len()];
+    assert_eq!(recovered_slice, payloads[1].1.as_slice());
+}
+
+#[test]
+fn data_race_parallel_alloc_free() {
+    let pool = Arc::new(MemoryPool::new(64, 512));
+    let done = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = bounded(8);
+
+    for _ in 0..8 {
+        let pool = Arc::clone(&pool);
+        let done = Arc::clone(&done);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                let buf = pool.alloc();
+                done.fetch_add(buf.len(), Ordering::Relaxed);
+                pool.free(buf);
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    for _ in 0..8 {
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("thread stalled");
+    }
+    assert!(done.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn deadlock_detection_parallel_alloc_free() {
+    let pool = Arc::new(MemoryPool::new(32, 256));
+    let (tx, rx) = bounded(4);
+
+    for _ in 0..4 {
+        let pool = Arc::clone(&pool);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                let buf = pool.alloc();
+                pool.free(buf);
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    for _ in 0..4 {
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("deadlock detected");
+    }
+}
+
+#[test]
+fn race_conditions_parallel_alloc_free_consistency() {
+    let pool = Arc::new(MemoryPool::new(16, 128));
+    let (tx, rx) = bounded(6);
+
+    for _ in 0..6 {
+        let pool = Arc::clone(&pool);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..150 {
+                let buf = pool.alloc();
+                assert!(buf.len() >= 128);
+                pool.free(buf);
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    for _ in 0..6 {
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("race condition detected");
+    }
+}

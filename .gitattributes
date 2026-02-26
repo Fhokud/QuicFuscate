@@ -1,0 +1,20 @@
+# GitHub Linguist configuration for accurate language stats
+
+# Upstream vendored sources removed — project is Cargo-only.
+
+# Generated/build artifacts
+releases/** linguist-generated
+scripts/artifacts/logs/** linguist-generated
+
+# Documentation
+docs/** linguist-documentation
+ui/** linguist-documentation
+
+# Common documentation assets
+*.png linguist-documentation
+*.jpg linguist-documentation
+*.jpeg linguist-documentation
+*.svg linguist-documentation
+*.gif linguist-documentation
+*.webp linguist-documentation
+*.ico linguist-documentation

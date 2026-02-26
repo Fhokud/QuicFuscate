@@ -1,0 +1,77 @@
+# OS-specific
+.DS_Store
+.DS_Storage
+**/.DS_Store
+**/.DS_Storage
+
+# Rust/Cargo
+/target/
+**/target/
+/out/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Frontend build/test artifacts
+**/node_modules/
+**/dist/
+**/.vite/
+**/playwright-report/
+**/test-results/
+**/.playwright/
+**/*-snapshots/
+/scripts/out/
+
+# Secrets / TLS keys (never commit)
+server.key
+server.crt
+/config/dev-certs/**
+/config/local/**
+!/config/local/
+!/config/local/.gitkeep
+# Explicit local-sensitive files (covered by /config/local/**, kept for clarity)
+/config/local/admin-auth.json
+/config/local/*.qkeys.json
+/config/local/dev-certs/*.key
+
+# Admin runtime state
+/config/*.runtime.json
+
+# Editor/IDE
+/AGENTS.md
+/archive/
+/todo/
+/docs/todo/
+/docs/todo.md
+/docs/context.md
+/docs/changelog.md
+/docs/Changelog.md
+/.env
+/.env.*
+*.tsbuildinfo
+*.swp
+
+# IDE/editor (future-proof)
+.vscode/
+.idea/
+
+# Env manager (future-proof)
+.direnv/
+.envrc
+
+# Coverage/profiling (future-proof)
+coverage/
+.nyc_output/
+lcov.info
+*.profraw
+*.profdata
+
+# macOS debug symbols outside target/scripts/out (future-proof)
+**/*.dSYM/
+
+# Keep lockfiles versioned for app reproducibility
+!apps/desktop/bun.lock
+!apps/web-admin-ui/bun.lock

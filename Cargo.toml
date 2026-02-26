@@ -1,0 +1,397 @@
+[workspace]
+members = [
+    ".",
+]
+exclude = [
+    "apps/desktop/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["QuicFuscate Team"]
+license = "MIT"
+
+[package]
+name = "quicfuscate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+softaes = "0.1.3"
+aligned_box = "0.2"
+rustls = { version = "0.23", features = ["ring", "tls12", "logging", "std"] }
+rustls-native-certs = "0.8"
+rcgen = { version = "0.13", optional = true }
+webpki-roots = "0.26"
+morus = "0.1.3"
+aead = { version = "0.6.0-rc.1", features = ["alloc"], optional = true }
+rand = "0.8"
+fastrand = "2"
+log = "0.4"
+env_logger = "0.11.3"
+url = "2.5.0"
+crossbeam-utils = "0.8"
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+lazy_static = "1.4.0"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+cpufeatures = "0.2"
+getrandom = "0.2"
+libc = "0.2"
+sha2 = "0.10"
+sha2-asm = "0.6.4"
+hmac = "0.12"
+hkdf = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rayon = "1.7"
+toml = "0.8"
+sysinfo = "0.35"
+socket2 = "0.5"
+base64 = "0.21"
+clap = { version = "4.5", features = ["derive"] }
+argon2 = "0.5"
+password-hash = "0.5"
+md5 = "0.7"
+thiserror = "1"
+smallvec = "1.13"
+zeroize = "1.8"
+zstd = "0.13"
+zstd-sys = { version = "2.0.16", optional = true }
+
+[dev-dependencies]
+proptest = "1.6"
+hex = "0.4"
+
+[features]
+default = ["client", "server"]
+client = []
+server = ["rcgen"]
+rust-tests = []
+aes = []
+aggressive_inline = []
+amx-int8 = []
+amx-tile = []
+avx10_preview = []
+avx2 = []
+avx512f = []
+avx512vbmi2 = []
+benches = []
+compression_zstd_ffi = ["dep:zstd-sys"]
+crc = []
+dev-certs = ["rcgen"]
+fma = []
+gfni = []
+masque-tests = []
+neon = []
+orchestrator = []
+prefetch = []
+rate_limiter = []
+simd-selfcheck = []
+sse2 = []
+std = []
+stream_ring_buffer = []
+sve2 = []
+tun-tests = []
+tun-windows = []
+tun-ios = []
+unsafe_rust = []
+uring_sys = []
+vaes = []
+wiedemann = []
+zero_copy_dgram = []
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+codegen-units = 256
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "quicfuscate"
+path = "src/main.rs"
+
+[[example]]
+name = "tun_factory_example"
+path = "examples/tun_factory_example.rs"
+required-features = ["tun-tests"]
+
+[[test]]
+name = "rt-ack-merge-parity"
+path = "scripts/tests/rust/rt-ack-merge-parity.rs"
+
+[[test]]
+name = "rt-admin-http-contract"
+path = "scripts/tests/rust/rt-admin-http-contract.rs"
+
+[[test]]
+name = "rt-argsort-parity"
+path = "scripts/tests/rust/rt-argsort-parity.rs"
+
+[[test]]
+name = "rt-base64-decode-parity"
+path = "scripts/tests/rust/rt-base64-decode-parity.rs"
+
+[[test]]
+name = "rt-baseline-oracles"
+path = "scripts/tests/rust/rt-baseline-oracles.rs"
+
+[[test]]
+name = "rt-bitmap-range-parity"
+path = "scripts/tests/rust/rt-bitmap-range-parity.rs"
+
+[[test]]
+name = "rt-bitstream-parity"
+path = "scripts/tests/rust/rt-bitstream-parity.rs"
+
+[[test]]
+name = "rt-brain-activation-parity"
+path = "scripts/tests/rust/rt-brain-activation-parity.rs"
+
+[[test]]
+name = "rt-brain-histogram"
+path = "scripts/tests/rust/rt-brain-histogram.rs"
+
+[[test]]
+name = "rt-chacha-x16-parity"
+path = "scripts/tests/rust/rt-chacha-x16-parity.rs"
+
+[[test]]
+name = "rt-chacha-x4-parity"
+path = "scripts/tests/rust/rt-chacha-x4-parity.rs"
+
+[[test]]
+name = "rt-cli-help"
+path = "scripts/tests/rust/rt-cli-help.rs"
+
+[[test]]
+name = "rt-compress-preprocessor"
+path = "scripts/tests/rust/rt-compress-preprocessor.rs"
+
+[[test]]
+name = "rt-core-connection-basics"
+path = "scripts/tests/rust/rt-core-connection-basics.rs"
+
+[[test]]
+name = "rt-ecn-popcount"
+path = "scripts/tests/rust/rt-ecn-popcount.rs"
+
+[[test]]
+name = "rt-fake-hmac"
+path = "scripts/tests/rust/rt-fake-hmac.rs"
+
+[[test]]
+name = "rt-tls-cover-cipher"
+path = "scripts/tests/rust/rt-tls-cover-cipher.rs"
+
+[[test]]
+name = "rt-ghash-sse-parity"
+path = "scripts/tests/rust/rt-ghash-sse-parity.rs"
+
+[[test]]
+name = "rt-harness-cli"
+path = "scripts/tests/rust/rt-harness-cli.rs"
+
+[[test]]
+name = "rt-harness-udpfast"
+path = "scripts/tests/rust/rt-harness-udpfast.rs"
+
+[[test]]
+name = "rt-header-validate-parity"
+path = "scripts/tests/rust/rt-header-validate-parity.rs"
+
+[[test]]
+name = "rt-interface"
+path = "scripts/tests/rust/rt-interface.rs"
+
+[[test]]
+name = "rt-iter-reduction-telemetry"
+path = "scripts/tests/rust/rt-iter-reduction-telemetry.rs"
+
+[[test]]
+name = "rt-iter-reductions"
+path = "scripts/tests/rust/rt-iter-reductions.rs"
+
+[[test]]
+name = "rt-moving-average-parity"
+path = "scripts/tests/rust/rt-moving-average-parity.rs"
+
+[[test]]
+name = "rt-packet-number-parity"
+path = "scripts/tests/rust/rt-packet-number-parity.rs"
+
+[[test]]
+name = "rt-pnspace-ack-policy"
+path = "scripts/tests/rust/rt-pnspace-ack-policy.rs"
+
+[[test]]
+name = "rt-probe-detection"
+path = "scripts/tests/rust/rt-probe-detection.rs"
+
+[[test]]
+name = "rt-profile-aegis-selection"
+path = "scripts/tests/rust/rt-profile-aegis-selection.rs"
+
+[[test]]
+name = "rt-profile-fuzz-parity"
+path = "scripts/tests/rust/rt-profile-fuzz-parity.rs"
+
+[[test]]
+name = "rt-profile-overrides"
+path = "scripts/tests/rust/rt-profile-overrides.rs"
+
+[[test]]
+name = "rt-qftls-profiles"
+path = "scripts/tests/rust/rt-qftls-profiles.rs"
+
+[[test]]
+name = "rt-random-aes-ctr"
+path = "scripts/tests/rust/rt-random-aes-ctr.rs"
+
+[[test]]
+name = "rt-reality-targets"
+path = "scripts/tests/rust/rt-reality-targets.rs"
+
+[[test]]
+name = "rt-ring-buffer-parity"
+path = "scripts/tests/rust/rt-ring-buffer-parity.rs"
+
+[[test]]
+name = "rt-security-suite"
+path = "scripts/tests/rust/rt-security-suite.rs"
+
+[[test]]
+name = "rt-shuffle-parity"
+path = "scripts/tests/rust/rt-shuffle-parity.rs"
+
+[[test]]
+name = "rt-simd-selfcheck"
+path = "scripts/tests/rust/rt-simd-selfcheck.rs"
+
+[[test]]
+name = "rt-stealth-ascii-count"
+path = "scripts/tests/rust/rt-stealth-ascii-count.rs"
+
+[[test]]
+name = "rt-stealth-config-toml"
+path = "scripts/tests/rust/rt-stealth-config-toml.rs"
+
+[[test]]
+name = "rt-stealth-persona-headers"
+path = "scripts/tests/rust/rt-stealth-persona-headers.rs"
+
+[[test]]
+name = "rt-telemetry-counters"
+path = "scripts/tests/rust/rt-telemetry-counters.rs"
+
+[[test]]
+name = "rt-telemetry-http"
+path = "scripts/tests/rust/rt-telemetry-http.rs"
+
+[[test]]
+name = "rt-transport-batch-processor"
+path = "scripts/tests/rust/rt-transport-batch-processor.rs"
+
+[[test]]
+name = "rt-transport-config"
+path = "scripts/tests/rust/rt-transport-config.rs"
+
+[[test]]
+name = "rt-transport-connection"
+path = "scripts/tests/rust/rt-transport-connection.rs"
+
+[[test]]
+name = "rt-transport-frames-roundtrip"
+path = "scripts/tests/rust/rt-transport-frames-roundtrip.rs"
+
+[[test]]
+name = "rt-transport-packet-headers"
+path = "scripts/tests/rust/rt-transport-packet-headers.rs"
+
+[[test]]
+name = "rt-transport-recovery"
+path = "scripts/tests/rust/rt-transport-recovery.rs"
+
+[[test]]
+name = "rt-transport-udpfast"
+path = "scripts/tests/rust/rt-transport-udpfast.rs"
+
+[[test]]
+name = "rt-transport-uring"
+path = "scripts/tests/rust/rt-transport-uring.rs"
+
+[[test]]
+name = "rt-transport-xdp"
+path = "scripts/tests/rust/rt-transport-xdp.rs"
+
+[[test]]
+name = "rt-transpose-parity"
+path = "scripts/tests/rust/rt-transpose-parity.rs"
+
+[[test]]
+name = "rt-udp-batch-send"
+path = "scripts/tests/rust/rt-udp-batch-send.rs"
+
+[[test]]
+name = "rt-io-hotpath-kernel-integration"
+path = "scripts/tests/rust/rt-io-hotpath-kernel-integration.rs"
+
+[[test]]
+name = "rt-varint-roundtrip"
+path = "scripts/tests/rust/rt-varint-roundtrip.rs"
+
+[[test]]
+name = "rt-xor-obfuscator-parity"
+path = "scripts/tests/rust/rt-xor-obfuscator-parity.rs"
+
+[[test]]
+name = "rt-xor-parity"
+path = "scripts/tests/rust/rt-xor-parity.rs"
+
+[[test]]
+name = "rt-xor-sse2-parity"
+path = "scripts/tests/rust/rt-xor-sse2-parity.rs"
+
+[[test]]
+name = "rt-property-suite"
+path = "scripts/tests/rust/rt-property-suite.rs"
+
+[[test]]
+name = "it-engine-control-plane"
+path = "scripts/tests/rust/integration/engine_control_plane.rs"
+
+[[test]]
+name = "it-interface-capabilities"
+path = "scripts/tests/rust/integration/interface_capabilities.rs"
+
+[[test]]
+name = "it-masque-runtime-integration"
+path = "scripts/tests/rust/integration/masque_runtime_integration.rs"
+
+[[test]]
+name = "it-orchestrator-runtime-activation"
+path = "scripts/tests/rust/integration/orchestrator_runtime_activation.rs"
+
+[[test]]
+name = "it-qkey-auth-integration"
+path = "scripts/tests/rust/integration/qkey_auth_integration.rs"
+
+[[test]]
+name = "it-stealth-mode-matrix"
+path = "scripts/tests/rust/integration/stealth_mode_matrix.rs"

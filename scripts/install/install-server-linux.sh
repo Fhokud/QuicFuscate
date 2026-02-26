@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# Description: Install QuicFuscate server on Linux (binary, assets, config, systemd).
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: install-server-linux.sh --cert PATH --key PATH [--binary PATH | --build] [options]
+
+QuicFuscate Linux server installer (systemd + FHS layout).
+
+This script installs:
+- quicfuscate binary -> /usr/local/bin/quicfuscate
+- admin web assets   -> /usr/share/quicfuscate/admin-web
+- config             -> /etc/quicfuscate/quicfuscate.toml (created if missing)
+- env file           -> /etc/quicfuscate/quicfuscate.env (created if missing)
+- qkey registry      -> /var/lib/quicfuscate/qkeys.json
+- systemd unit       -> /etc/systemd/system/quicfuscate.service
+
+Required:
+  --cert PATH         TLS certificate (PEM)
+  --key PATH          TLS private key (PEM)
+
+Optional:
+  --binary PATH       Prebuilt quicfuscate binary to install (recommended)
+  --build             Build quicfuscate from source (requires Rust toolchain)
+  --assets PATH       Source admin web assets directory (default: ./assets/web-admin)
+  --config PATH       Config destination (default: /etc/quicfuscate/quicfuscate.toml)
+  --listen ADDR       QUIC listen addr (default: 0.0.0.0:4433)
+  --admin-web ADDR    Admin web bind (default: 127.0.0.1:9000)
+  --admin-user USER   Admin username (default: admin)
+  --admin-password PW Admin password (default: random)
+  --qkey-ttl SECS     Default QKey TTL seconds (default: 0, disables expiration)
+  --no-start          Do not start/enable the service
+
+Example:
+  sudo ./scripts/install/install-server-linux.sh \
+    --binary ./target/release/quicfuscate \
+    --cert /etc/letsencrypt/live/example/fullchain.pem \
+    --key  /etc/letsencrypt/live/example/privkey.pem
+EOF
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" != "0" ]]; then
+    echo "error: must run as root" >&2
+    exit 1
+  fi
+}
+
+random_password() {
+  if need_cmd openssl; then
+    openssl rand -base64 32 | tr -d '=\n' | tr '+/' 'AA' | cut -c1-24
+    return 0
+  fi
+  # fallback
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+}
+
+ensure_user() {
+  local user="$1"
+  if id -u "$user" >/dev/null 2>&1; then
+    return 0
+  fi
+  if need_cmd useradd; then
+    useradd --system --home-dir /var/lib/quicfuscate --no-create-home --shell /usr/sbin/nologin "$user"
+    return 0
+  fi
+  if need_cmd adduser; then
+    adduser --system --no-create-home --home /var/lib/quicfuscate --shell /usr/sbin/nologin --group "$user"
+    return 0
+  fi
+  echo "error: cannot create user '$user' (need useradd or adduser)" >&2
+  exit 1
+}
+
+copy_tree() {
+  local src="$1"
+  local dst="$2"
+  mkdir -p "$dst"
+  cp -a "$src/." "$dst/"
+}
+
+main() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  local binary=""
+  local build="0"
+  local assets=""
+  local cert=""
+  local key=""
+  local listen="0.0.0.0:4433"
+  local admin_web="127.0.0.1:9000"
+  local admin_user="admin"
+  local admin_password=""
+  local qkey_ttl="0"
+  local no_start="0"
+
+  local config_dst="/etc/quicfuscate/quicfuscate.toml"
+  local env_dst="/etc/quicfuscate/quicfuscate.env"
+  local web_dst="/usr/share/quicfuscate/admin-web"
+  local state_dir="/var/lib/quicfuscate"
+  local qkey_store="/var/lib/quicfuscate/qkeys.json"
+  local unit_dst="/etc/systemd/system/quicfuscate.service"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --binary) binary="${2:-}"; shift 2 ;;
+      --build) build="1"; shift ;;
+      --assets) assets="${2:-}"; shift 2 ;;
+      --cert) cert="${2:-}"; shift 2 ;;
+      --key) key="${2:-}"; shift 2 ;;
+      --config) config_dst="${2:-}"; shift 2 ;;
+      --listen) listen="${2:-}"; shift 2 ;;
+      --admin-web) admin_web="${2:-}"; shift 2 ;;
+      --admin-user) admin_user="${2:-}"; shift 2 ;;
+      --admin-password) admin_password="${2:-}"; shift 2 ;;
+      --qkey-ttl) qkey_ttl="${2:-}"; shift 2 ;;
+      --no-start) no_start="1"; shift ;;
+      *) echo "error: unknown argument: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+
+  require_root
+
+  # Bundle-friendly defaults:
+  # - If invoked from an extracted bundle, the typical layout is:
+  #   ops/install-server-linux.sh
+  #   ../bin/quicfuscate
+  #   ../share/admin-web
+  if [[ -z "$assets" ]]; then
+    for candidate in \
+      "${script_dir}/../share/admin-web" \
+      "./share/admin-web" \
+      "./assets/web-admin"
+    do
+      if [[ -f "$candidate/index.html" ]]; then
+        assets="$candidate"
+        break
+      fi
+    done
+    [[ -n "$assets" ]] || assets="./assets/web-admin"
+  fi
+
+  if [[ -z "$binary" && "$build" != "1" ]]; then
+    for candidate in \
+      "${script_dir}/../bin/quicfuscate" \
+      "./bin/quicfuscate" \
+      "./target/release/quicfuscate"
+    do
+      if [[ -f "$candidate" ]]; then
+        binary="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$cert" || -z "$key" ]]; then
+    echo "error: --cert and --key are required" >&2
+    usage
+    exit 1
+  fi
+  if [[ ! -f "$cert" ]]; then echo "error: cert not found: $cert" >&2; exit 1; fi
+  if [[ ! -f "$key" ]]; then echo "error: key not found: $key" >&2; exit 1; fi
+
+  if [[ -z "$binary" && "$build" != "1" ]]; then
+    echo "error: provide --binary PATH (recommended) or use --build" >&2
+    usage
+    exit 1
+  fi
+
+  ensure_user "quicfuscate"
+
+  mkdir -p /etc/quicfuscate "$state_dir" /usr/share/quicfuscate
+  chown -R quicfuscate:quicfuscate "$state_dir"
+  chmod 0750 /etc/quicfuscate || true
+  chmod 0750 "$state_dir" || true
+
+  if [[ "$build" == "1" ]]; then
+    if ! need_cmd cargo; then
+      echo "error: --build requires cargo (Rust toolchain)" >&2
+      exit 1
+    fi
+    (cd "$(pwd)" && cargo build --release --bin quicfuscate)
+    binary="./target/release/quicfuscate"
+  fi
+
+  if [[ ! -f "$binary" ]]; then
+    echo "error: binary not found: $binary" >&2
+    exit 1
+  fi
+
+  install -m 0755 "$binary" /usr/local/bin/quicfuscate
+
+  if [[ ! -f "$assets/index.html" ]]; then
+    echo "error: admin web assets missing: $assets/index.html" >&2
+    echo "hint: run ./scripts/build/build-web-admin.sh first, or pass --assets PATH" >&2
+    exit 1
+  fi
+  mkdir -p "$web_dst"
+  copy_tree "$assets" "$web_dst"
+
+  if [[ ! -f "$config_dst" ]]; then
+    local template=""
+    for candidate in \
+      "${script_dir}/server-linux.default.toml" \
+      "${script_dir}/../config/server-linux.default.toml" \
+      "./config/server-linux.default.toml"
+    do
+      if [[ -f "$candidate" ]]; then
+        template="$candidate"
+        break
+      fi
+    done
+    if [[ -z "$template" ]]; then
+      echo "error: missing server config template (server-linux.default.toml)" >&2
+      echo "hint: expected near installer script, or at ./config/server-linux.default.toml" >&2
+      exit 1
+    fi
+    install -m 0640 "$template" "$config_dst"
+    chown root:quicfuscate "$config_dst" || true
+  fi
+
+  if [[ -z "$admin_password" ]]; then
+    admin_password="$(random_password)"
+  fi
+
+  if [[ ! -f "$env_dst" ]]; then
+    cat >"$env_dst" <<EOF
+# QuicFuscate service environment.
+# This file contains admin credentials. Keep permissions tight.
+
+QUICFUSCATE_LISTEN=${listen}
+QUICFUSCATE_CERT=${cert}
+QUICFUSCATE_KEY=${key}
+QUICFUSCATE_CONFIG=${config_dst}
+QUICFUSCATE_ADMIN_WEB=${admin_web}
+QUICFUSCATE_ADMIN_WEB_ROOT=${web_dst}
+QUICFUSCATE_ADMIN_USER=${admin_user}
+QUICFUSCATE_ADMIN_PASSWORD=${admin_password}
+QUICFUSCATE_QKEY_STORE=${qkey_store}
+QUICFUSCATE_QKEY_TTL_SECS=${qkey_ttl}
+EOF
+    chmod 0640 "$env_dst" || true
+    chown root:quicfuscate "$env_dst" || true
+    echo "admin credentials:"
+    echo "  user: ${admin_user}"
+    echo "  pass: ${admin_password}"
+  else
+    echo "info: env file exists, not overwriting: $env_dst"
+  fi
+
+  if [[ ! -f "$qkey_store" ]]; then
+    mkdir -p "$(dirname "$qkey_store")"
+    printf "[]\n" >"$qkey_store"
+    chown quicfuscate:quicfuscate "$qkey_store" || true
+    chmod 0640 "$qkey_store" || true
+  fi
+
+  local unit_template=""
+  for candidate in \
+    "${script_dir}/quicfuscate-server.service" \
+    "${script_dir}/../install/quicfuscate-server.service" \
+    "./scripts/install/quicfuscate-server.service"
+  do
+    if [[ -f "$candidate" ]]; then
+      unit_template="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$unit_template" ]]; then
+    echo "error: missing unit template (quicfuscate-server.service)" >&2
+    echo "hint: expected near installer script, or at ./scripts/install/quicfuscate-server.service" >&2
+    exit 1
+  fi
+  install -m 0644 "$unit_template" "$unit_dst"
+
+  if need_cmd systemctl; then
+    systemctl daemon-reload
+    if [[ "$no_start" != "1" ]]; then
+      systemctl enable --now quicfuscate.service
+      systemctl status --no-pager quicfuscate.service || true
+    else
+      echo "info: service installed but not started (--no-start)"
+    fi
+  else
+    echo "warn: systemctl not found; unit installed at $unit_dst" >&2
+  fi
+}
+
+main "$@"

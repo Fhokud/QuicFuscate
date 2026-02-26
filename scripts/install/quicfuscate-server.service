@@ -1,0 +1,39 @@
+[Unit]
+Description=QuicFuscate Server (QUIC tunnel + Admin Web Panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quicfuscate
+Group=quicfuscate
+
+# Runtime configuration (credentials, bind addresses, paths).
+EnvironmentFile=/etc/quicfuscate/quicfuscate.env
+
+ExecStart=/usr/local/bin/quicfuscate server \
+  --listen ${QUICFUSCATE_LISTEN} \
+  --cert ${QUICFUSCATE_CERT} \
+  --key ${QUICFUSCATE_KEY} \
+  --config ${QUICFUSCATE_CONFIG} \
+  --admin-web ${QUICFUSCATE_ADMIN_WEB} \
+  --admin-web-root ${QUICFUSCATE_ADMIN_WEB_ROOT} \
+  --qkey-store ${QUICFUSCATE_QKEY_STORE} \
+  --qkey-ttl-secs ${QUICFUSCATE_QKEY_TTL_SECS}
+
+Restart=on-failure
+RestartSec=2
+
+# Basic hardening. The admin panel needs to write /etc/quicfuscate when you use the
+# in-panel config editor.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/etc/quicfuscate /var/lib/quicfuscate
+
+# Tune for higher connection counts.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
