@@ -224,7 +224,7 @@ impl TlsProfile {
     pub fn brave_1_73() -> Self {
         let mut profile = Self::chrome_130();
         profile.name = "Brave/1.73.0".into();
-        profile.enable_ech = false; // Brave disables ECH for now
+        profile.enable_ech = false; // Brave profile keeps ECH disabled.
         profile.grease_values.clear(); // Less GREASE
         profile
     }
@@ -424,6 +424,14 @@ pub trait QuicTlsProvider: Send + Sync {
     fn set_peer_transport_params(&mut self, params: &[u8]) -> Result<(), ConnectionError>;
     /// Initiate key update
     fn key_update(&mut self) -> Result<(), ConnectionError>;
+    /// Advance read-side 1-RTT keys only.
+    fn key_update_read(&mut self) -> Result<(), ConnectionError> {
+        self.key_update()
+    }
+    /// Advance write-side 1-RTT keys only.
+    fn key_update_write(&mut self) -> Result<(), ConnectionError> {
+        self.key_update()
+    }
     /// Get provider name (for debugging)
     fn provider_name(&self) -> &str;
     /// Check if provider supports real-time ClientHello override
@@ -648,6 +656,12 @@ impl QuicTlsProvider for CombinedProvider {
     fn key_update(&mut self) -> Result<(), ConnectionError> {
         self.rustls.key_update()
     }
+    fn key_update_read(&mut self) -> Result<(), ConnectionError> {
+        self.rustls.key_update_read()
+    }
+    fn key_update_write(&mut self) -> Result<(), ConnectionError> {
+        self.rustls.key_update_write()
+    }
     fn provider_name(&self) -> &str {
         if self.cover.is_some() {
             "unified-rustls+tls-cover"
@@ -680,6 +694,7 @@ mod rustls_provider {
     use rustls::DigitallySignedStruct;
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
     use rustls_native_certs::load_native_certs;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use webpki_roots;
 
@@ -697,6 +712,9 @@ mod rustls_provider {
         pub transport_params: Vec<u8>,
         pub peer_transport_params: Option<Vec<u8>>,
         pub profile: Option<TlsProfile>,
+        pub next_1rtt_secrets: Option<rustls::quic::Secrets>,
+        pub pending_local_1rtt: VecDeque<std::sync::Arc<dyn rustls::quic::PacketKey>>,
+        pub pending_remote_1rtt: VecDeque<std::sync::Arc<dyn rustls::quic::PacketKey>>,
 
         // Performance optimizations
         pub crypto_buffer: Vec<u8>,
@@ -748,45 +766,28 @@ mod rustls_provider {
         }
     }
 
-    /// Custom certificate verifier for maximum control
-    #[derive(Debug)]
-    struct AlienCertVerifier {
-        roots: Arc<RootCertStore>,
-        allow_invalid: bool,
-        fingerprints: Vec<Vec<u8>>,
+    fn env_flag_enabled(name: &str) -> bool {
+        match std::env::var(name) {
+            Ok(raw) => {
+                matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            }
+            Err(_) => false,
+        }
     }
 
-    impl ServerCertVerifier for AlienCertVerifier {
+    /// Insecure verifier used only when explicitly requested via env.
+    #[derive(Debug)]
+    struct InsecureAcceptAllVerifier;
+
+    impl ServerCertVerifier for InsecureAcceptAllVerifier {
         fn verify_server_cert(
             &self,
-            end_entity: &CertificateDer<'_>,
+            _end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
             _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, rustls::Error> {
-            // Check fingerprint allowlist
-            if !self.fingerprints.is_empty() {
-                let cert_hash = {
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(end_entity.as_ref());
-                    hasher.finalize().to_vec()
-                };
-                if self.fingerprints.contains(&cert_hash) {
-                    return Ok(ServerCertVerified::assertion());
-                }
-            }
-
-            if self.allow_invalid {
-                log::warn!("Accepting invalid certificate (allow_invalid=true)");
-                return Ok(ServerCertVerified::assertion());
-            }
-
-            // Minimal acceptance: require at least one root
-            if self.roots.is_empty() {
-                return Err(rustls::Error::General("No trust anchors available".into()));
-            }
             Ok(ServerCertVerified::assertion())
         }
 
@@ -845,6 +846,9 @@ mod rustls_provider {
                 transport_params: Self::default_transport_params(),
                 peer_transport_params: None,
                 profile: None,
+                next_1rtt_secrets: None,
+                pending_local_1rtt: VecDeque::new(),
+                pending_remote_1rtt: VecDeque::new(),
                 crypto_buffer: Vec::with_capacity(4096),
                 frame_buffer: Vec::new(),
                 session_cache: Some(Arc::new(RwLock::new(SessionCache::new(100)))),
@@ -890,7 +894,7 @@ mod rustls_provider {
                     self.install_handshake_keys(keys)?;
                     self.write_level = super::Level::Handshake;
                 }
-                rustls::quic::KeyChange::OneRtt { keys, next: _next } => {
+                rustls::quic::KeyChange::OneRtt { keys, next } => {
                     if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
                         eprintln!(
                             "[qftls] {:?} keychange=OneRtt",
@@ -898,6 +902,7 @@ mod rustls_provider {
                         );
                     }
                     self.install_1rtt_keys(keys)?;
+                    self.next_1rtt_secrets = Some(next);
                     self.write_level = super::Level::Application;
                 }
             }
@@ -961,6 +966,8 @@ mod rustls_provider {
             crypto.open_1rtt = Some(Box::new(RustlsPacketOpen { key: remote_pkt.clone() }));
             crypto.hp_1rtt = Some(Box::new(RustlsHp { key: local_hp.clone() }));
             crypto.hp_1rtt_open = Some(Box::new(RustlsHp { key: remote_hp.clone() }));
+            self.pending_local_1rtt.clear();
+            self.pending_remote_1rtt.clear();
             Ok(())
         }
 
@@ -985,18 +992,23 @@ mod rustls_provider {
                 }
             }
 
-            let config = ClientConfig::builder_with_provider(Arc::new(
+            let allow_invalid = env_flag_enabled("QUICFUSCATE_ALLOW_INVALID_CERTS");
+            let builder = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AlienCertVerifier {
-                roots: Arc::new(roots),
-                allow_invalid: std::env::var("QUICFUSCATE_ALLOW_INVALID_CERTS").is_ok(),
-                fingerprints: Vec::new(),
-            }))
-            .with_no_client_auth();
+            .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?;
+            let config = if allow_invalid {
+                log::warn!(
+                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled"
+                );
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
+                    .with_no_client_auth()
+            } else {
+                builder.with_root_certificates(Arc::new(roots)).with_no_client_auth()
+            };
 
             let mut config = config;
             // Enable QUIC
@@ -1154,7 +1166,7 @@ mod rustls_provider {
         }
 
         fn default_transport_params() -> Vec<u8> {
-            // QUIC transport parameters in simplified wire format
+            // QUIC transport parameters in wire format
             let mut params = Vec::new();
             // max_idle_timeout (0x01) = 30000ms
             params.extend_from_slice(&[0x01, 0x02, 0x75, 0x30]);
@@ -1202,18 +1214,23 @@ mod rustls_provider {
                     })?;
                 }
             }
-            let cfg = ClientConfig::builder_with_provider(Arc::new(
+            let allow_invalid = env_flag_enabled("QUICFUSCATE_ALLOW_INVALID_CERTS");
+            let builder = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AlienCertVerifier {
-                roots: Arc::new(roots),
-                allow_invalid: std::env::var("QUICFUSCATE_ALLOW_INVALID_CERTS").is_ok(),
-                fingerprints: Vec::new(),
-            }))
-            .with_no_client_auth();
+            .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?;
+            let cfg = if allow_invalid {
+                log::warn!(
+                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled"
+                );
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
+                    .with_no_client_auth()
+            } else {
+                builder.with_root_certificates(Arc::new(roots)).with_no_client_auth()
+            };
             let mut cfg = cfg;
             // Apply ALPN
             cfg.alpn_protocols =
@@ -1252,6 +1269,9 @@ mod rustls_provider {
                 crypto.hp_1rtt = None;
                 crypto.hp_1rtt_open = None;
             }
+            self.next_1rtt_secrets = None;
+            self.pending_local_1rtt.clear();
+            self.pending_remote_1rtt.clear();
             self.handshake_complete = false;
             self.alpn = None;
             self.peer_cert = None;
@@ -1259,6 +1279,61 @@ mod rustls_provider {
             self.bytes_received = 0;
             self.frame_buffer.clear();
             self.handshake_start = std::time::Instant::now();
+            Ok(())
+        }
+    }
+
+    impl RustlsProviderImpl {
+        fn ensure_1rtt_ready(&self) -> Result<(), ConnectionError> {
+            let ready = {
+                let crypto = self.crypto.read();
+                crypto.seal_1rtt.is_some() && crypto.open_1rtt.is_some()
+            };
+            if !self.handshake_complete || !ready {
+                return Err(ConnectionError::TlsError(
+                    "key_update requires established 1-RTT keys".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn derive_next_1rtt_pair(&mut self) -> Result<(), ConnectionError> {
+            let next = self.next_1rtt_secrets.as_mut().ok_or_else(|| {
+                ConnectionError::TlsError(
+                    "key_update requires secret-based or rustls-provided update keys".to_string(),
+                )
+            })?;
+            let keys = next.next_packet_keys();
+            self.pending_local_1rtt.push_back(keys.local.into());
+            self.pending_remote_1rtt.push_back(keys.remote.into());
+            Ok(())
+        }
+
+        fn update_write_from_rustls_chain(&mut self) -> Result<(), ConnectionError> {
+            if self.pending_local_1rtt.is_empty() {
+                self.derive_next_1rtt_pair()?;
+            }
+            let Some(packet_key) = self.pending_local_1rtt.pop_front() else {
+                return Err(ConnectionError::TlsError(
+                    "missing local 1-RTT key update material".to_string(),
+                ));
+            };
+            let mut crypto = self.crypto.write();
+            crypto.rotate_1rtt_write_keypair(Box::new(RustlsPacketSeal { key: packet_key }));
+            Ok(())
+        }
+
+        fn update_read_from_rustls_chain(&mut self) -> Result<(), ConnectionError> {
+            if self.pending_remote_1rtt.is_empty() {
+                self.derive_next_1rtt_pair()?;
+            }
+            let Some(packet_key) = self.pending_remote_1rtt.pop_front() else {
+                return Err(ConnectionError::TlsError(
+                    "missing remote 1-RTT key update material".to_string(),
+                ));
+            };
+            let mut crypto = self.crypto.write();
+            crypto.rotate_1rtt_read_keypair(Box::new(RustlsPacketOpen { key: packet_key }));
             Ok(())
         }
     }
@@ -1510,13 +1585,25 @@ mod rustls_provider {
         }
         fn export_keying_material(
             &self,
-            _label: &[u8],
-            _context: &[u8],
-            _length: usize,
+            label: &[u8],
+            context: &[u8],
+            length: usize,
         ) -> Result<Vec<u8>, ConnectionError> {
-            Err(ConnectionError::TlsError(
-                "export_keying_material not supported in this build".to_string(),
-            ))
+            if length == 0 {
+                return Err(ConnectionError::TlsError(
+                    "export_keying_material requires non-zero length".to_string(),
+                ));
+            }
+            let out = vec![0u8; length];
+            self.connection
+                .export_keying_material(
+                    out,
+                    label,
+                    if context.is_empty() { None } else { Some(context) },
+                )
+                .map_err(|e| {
+                    ConnectionError::TlsError(format!("export_keying_material failed: {}", e))
+                })
         }
         fn get_quic_transport_params(&self) -> Vec<u8> {
             self.transport_params.clone()
@@ -1526,7 +1613,22 @@ mod rustls_provider {
             Ok(())
         }
         fn key_update(&mut self) -> Result<(), ConnectionError> {
-            Ok(())
+            self.key_update_write()?;
+            self.key_update_read()
+        }
+        fn key_update_read(&mut self) -> Result<(), ConnectionError> {
+            self.ensure_1rtt_ready()?;
+            if self.crypto.write().key_update_1rtt_read() {
+                return Ok(());
+            }
+            self.update_read_from_rustls_chain()
+        }
+        fn key_update_write(&mut self) -> Result<(), ConnectionError> {
+            self.ensure_1rtt_ready()?;
+            if self.crypto.write().key_update_1rtt_write() {
+                return Ok(());
+            }
+            self.update_write_from_rustls_chain()
         }
         fn provider_name(&self) -> &str {
             "rustls-0.23-alien"
@@ -1632,6 +1734,12 @@ impl QuicTlsProvider for RustlsProvider {
     }
     fn key_update(&mut self) -> Result<(), ConnectionError> {
         self.0.key_update()
+    }
+    fn key_update_read(&mut self) -> Result<(), ConnectionError> {
+        self.0.key_update_read()
+    }
+    fn key_update_write(&mut self) -> Result<(), ConnectionError> {
+        self.0.key_update_write()
     }
     fn provider_name(&self) -> &str {
         self.0.provider_name()

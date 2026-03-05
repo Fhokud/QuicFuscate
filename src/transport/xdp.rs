@@ -27,6 +27,8 @@ pub mod linux {
     use super::*;
     use libc::c_void;
 
+    const XDP_RING_SIZE: u32 = 2048;
+
     // Legacy XDP structures removed - using pure UDP/io_uring
     #[repr(C)]
     pub struct SockaddrXdp {
@@ -39,6 +41,7 @@ pub mod linux {
 
     // UMEM descriptor for zero-copy
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     pub struct XdpDesc {
         pub addr: u64,
         pub len: u32,
@@ -46,12 +49,22 @@ pub mod linux {
     }
 
     // XDP ring structures
-    #[repr(C)]
     pub struct XdpRing {
-        pub producer: *mut u32,
-        pub consumer: *mut u32,
-        pub desc: *mut XdpDesc,
-        pub flags: *mut u32,
+        pub producer: u32,
+        pub consumer: u32,
+        pub desc: Box<[XdpDesc; XDP_RING_SIZE as usize]>,
+        pub flags: u32,
+    }
+
+    impl XdpRing {
+        fn new() -> Self {
+            Self {
+                producer: 0,
+                consumer: 0,
+                desc: Box::new([XdpDesc::default(); XDP_RING_SIZE as usize]),
+                flags: 0,
+            }
+        }
     }
 
     // XDP removed - use UdpFastPath or IoUringTransport instead
@@ -79,7 +92,16 @@ pub mod linux {
             frame_size: usize,
             frame_count: usize,
         ) -> Result<Self, std::io::Error> {
-            let _ = (ifindex, queue_id); // kept for signature stability
+            if frame_size == 0 || frame_count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "frame_size and frame_count must be greater than zero",
+                ));
+            }
+            let umem_size = frame_size.checked_mul(frame_count).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "UMEM size overflow")
+            })?;
+
             unsafe {
                 // Create AF_XDP socket
                 let fd = libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0);
@@ -87,9 +109,26 @@ pub mod linux {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // Allocate UMEM area
-                let umem_size = frame_size * frame_count;
-                let addr = libc::mmap(
+                let sockaddr = SockaddrXdp {
+                    sxdp_family: libc::AF_XDP as u16,
+                    sxdp_flags: 0,
+                    sxdp_ifindex: ifindex,
+                    sxdp_queue_id: queue_id,
+                    sxdp_shared_umem_fd: 0,
+                };
+                let bind_rc = libc::bind(
+                    fd,
+                    &sockaddr as *const SockaddrXdp as *const libc::sockaddr,
+                    std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+                );
+                if bind_rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(err);
+                }
+
+                // Allocate UMEM area (try huge pages first, then standard pages).
+                let mut addr = libc::mmap(
                     ptr::null_mut(),
                     umem_size,
                     libc::PROT_READ | libc::PROT_WRITE,
@@ -99,24 +138,27 @@ pub mod linux {
                 ) as *mut u8;
 
                 if addr == libc::MAP_FAILED as *mut u8 {
-                    libc::close(fd);
-                    return Err(std::io::Error::last_os_error());
+                    addr = libc::mmap(
+                        ptr::null_mut(),
+                        umem_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    ) as *mut u8;
+                    if addr == libc::MAP_FAILED as *mut u8 {
+                        libc::close(fd);
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
 
                 let umem = Arc::new(UmemArea { addr, size: umem_size, frame_size, frame_count });
 
-                // Setup rings (simplified)
-                let rx_ring = XdpRing {
-                    producer: Box::into_raw(Box::new(0u32)),
-                    consumer: Box::into_raw(Box::new(0u32)),
-                    desc: Box::into_raw(Box::new([XdpDesc { addr: 0, len: 0, options: 0 }; 2048]))
-                        as *mut XdpDesc,
-                    flags: Box::into_raw(Box::new(0u32)),
-                };
-
-                let tx_ring = XdpRing { ..rx_ring.clone() };
-                let fill_ring = XdpRing { ..rx_ring.clone() };
-                let comp_ring = XdpRing { ..rx_ring.clone() };
+                // Allocate independent software-side rings.
+                let rx_ring = XdpRing::new();
+                let tx_ring = XdpRing::new();
+                let fill_ring = XdpRing::new();
+                let comp_ring = XdpRing::new();
 
                 Ok(XdpSocket { fd, umem, rx_ring, tx_ring, fill_ring, comp_ring })
             }
@@ -124,33 +166,30 @@ pub mod linux {
 
         pub fn send_packet(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
             unsafe {
-                let producer = *self.tx_ring.producer;
-                let consumer = *self.tx_ring.consumer;
+                let producer = self.tx_ring.producer;
+                let consumer = self.tx_ring.consumer;
 
-                if producer - consumer >= 2048 {
+                if producer.wrapping_sub(consumer) >= XDP_RING_SIZE {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         "TX ring full",
                     ));
                 }
 
-                let idx = producer & (2048 - 1);
-                let desc = &mut *self.tx_ring.desc.add(idx as usize);
+                let idx = (producer & (XDP_RING_SIZE - 1)) as usize;
+                let desc = &mut self.tx_ring.desc[idx];
+                let copy_len = data.len().min(self.umem.frame_size);
 
                 // Copy data to UMEM
                 let frame_addr = self.umem.addr.add((idx as usize) * self.umem.frame_size);
-                ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    frame_addr,
-                    data.len().min(self.umem.frame_size),
-                );
+                ptr::copy_nonoverlapping(data.as_ptr(), frame_addr, copy_len);
 
                 desc.addr = (idx as u64) * (self.umem.frame_size as u64);
-                desc.len = data.len() as u32;
+                desc.len = copy_len as u32;
                 desc.options = 0;
 
                 // Update producer
-                *self.tx_ring.producer = producer + 1;
+                self.tx_ring.producer = producer.wrapping_add(1);
 
                 // Kick TX
                 libc::sendto(self.fd, ptr::null(), 0, libc::MSG_DONTWAIT, ptr::null(), 0);
@@ -161,8 +200,8 @@ pub mod linux {
 
         pub fn recv_packet(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
             unsafe {
-                let producer = *self.rx_ring.producer;
-                let consumer = *self.rx_ring.consumer;
+                let producer = self.rx_ring.producer;
+                let consumer = self.rx_ring.consumer;
 
                 if producer == consumer {
                     return Err(std::io::Error::new(
@@ -171,36 +210,33 @@ pub mod linux {
                     ));
                 }
 
-                let idx = consumer & (2048 - 1);
-                let desc = &*self.rx_ring.desc.add(idx as usize);
+                let idx = (consumer & (XDP_RING_SIZE - 1)) as usize;
+                let desc = self.rx_ring.desc[idx];
+                let frame_offset = desc.addr as usize;
+                if frame_offset >= self.umem.size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "RX descriptor points outside UMEM",
+                    ));
+                }
 
                 // Copy from UMEM
-                let frame_addr = self.umem.addr.add(desc.addr as usize);
-                let len = (desc.len as usize).min(buf.len());
+                let frame_addr = self.umem.addr.add(frame_offset);
+                let available = self.umem.size.saturating_sub(frame_offset);
+                let len = (desc.len as usize).min(buf.len()).min(available);
                 ptr::copy_nonoverlapping(frame_addr, buf.as_mut_ptr(), len);
 
                 // Update consumer
-                *self.rx_ring.consumer = consumer + 1;
+                self.rx_ring.consumer = consumer.wrapping_add(1);
 
                 // Refill
-                let fill_producer = *self.fill_ring.producer;
+                let fill_producer = self.fill_ring.producer;
                 let fill_desc =
-                    &mut *self.fill_ring.desc.add((fill_producer & (2048 - 1)) as usize);
+                    &mut self.fill_ring.desc[(fill_producer & (XDP_RING_SIZE - 1)) as usize];
                 fill_desc.addr = desc.addr;
-                *self.fill_ring.producer = fill_producer + 1;
+                self.fill_ring.producer = fill_producer.wrapping_add(1);
 
                 Ok(len)
-            }
-        }
-    }
-
-    impl XdpRing {
-        fn clone(&self) -> Self {
-            XdpRing {
-                producer: self.producer,
-                consumer: self.consumer,
-                desc: self.desc,
-                flags: self.flags,
             }
         }
     }

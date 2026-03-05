@@ -7,13 +7,35 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
 Usage: build-web-admin.sh
 
 Builds apps/web-admin-ui with Bun and copies dist/* to assets/web-admin.
-If assets/web-admin already exists and is non-empty, it is archived under archive/.
+By default, existing assets/web-admin content is replaced without archiving.
+To archive existing assets first:
+  - pass --archive-existing
+  - or set QF_ARCHIVE_WEB_ADMIN_ASSETS=1
 EOF
   exit 0
 fi
 
+ARCHIVE_EXISTING="${QF_ARCHIVE_WEB_ADMIN_ASSETS:-0}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --archive-existing)
+      ARCHIVE_EXISTING=1
+      ;;
+    --no-archive-existing)
+      ARCHIVE_EXISTING=0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Run with --help for usage." >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 REACT_APP_DIR="$PROJECT_ROOT/apps/web-admin-ui"
 
@@ -38,7 +60,7 @@ if [ ! -d "$SOURCE" ]; then
   exit 1
 fi
 
-if [ -d "$DEST" ] && [ "$(ls -A "$DEST" 2>/dev/null)" ]; then
+if [[ "$ARCHIVE_EXISTING" == "1" ]] && [ -d "$DEST" ] && [ "$(ls -A "$DEST" 2>/dev/null)" ]; then
   ARCHIVE_ROOT="$PROJECT_ROOT/archive"
   TS="$(date +"%Y%m%d_%H%M%S")"
   ARCHIVE_DIR="$ARCHIVE_ROOT/web-admin-assets-$TS"

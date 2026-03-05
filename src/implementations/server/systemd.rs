@@ -296,6 +296,34 @@ pub mod health {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    const MAX_REQUEST_BYTES: usize = 8192;
+
+    fn parse_request_line(req: &str) -> Option<(&str, &str)> {
+        let mut lines = req.lines();
+        let line = lines.next()?.trim();
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?;
+        let path = parts.next()?;
+        Some((method, path))
+    }
+
+    fn http_response(status: u16, body: &str) -> String {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            _ => "Internal Server Error",
+        };
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            reason,
+            body.len(),
+            body
+        )
+    }
+
     /// Health check server.
     pub struct HealthServer {
         addr: SocketAddr,
@@ -334,16 +362,33 @@ pub mod health {
                 .await
                 {
                     Ok(Ok((mut socket, _addr))) => {
-                        // Read request (simplified)
-                        let mut buf = [0u8; 1024];
-                        let _ = socket.read(&mut buf).await;
+                        let mut req = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    req.extend_from_slice(&chunk[..n]);
+                                    if req.windows(4).any(|w| w == b"\r\n\r\n")
+                                        || req.len() >= MAX_REQUEST_BYTES
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
 
-                        // Send response
-                        let response = "HTTP/1.1 200 OK\r\n\
-                                       Content-Type: application/json\r\n\
-                                       Content-Length: 15\r\n\
-                                       \r\n\
-                                       {\"status\":\"ok\"}";
+                        let req_str = String::from_utf8_lossy(&req);
+                        let (status, body) = match parse_request_line(&req_str) {
+                            Some(("GET", "/health" | "/ready" | "/live")) => {
+                                (200, "{\"status\":\"ok\"}")
+                            }
+                            Some(("GET", _)) => (404, "{\"error\":\"not_found\"}"),
+                            Some((_, _)) => (405, "{\"error\":\"method_not_allowed\"}"),
+                            None => (400, "{\"error\":\"bad_request\"}"),
+                        };
+                        let response = http_response(status, body);
                         let _ = socket.write_all(response.as_bytes()).await;
                     }
                     Ok(Err(e)) => {

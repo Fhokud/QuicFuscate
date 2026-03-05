@@ -110,7 +110,7 @@ This unity yields a homogeneous, believable fingerprint that remains difficult t
 - `QUICFUSCATE_TLS_COVER_TELEMETRY=1` - currently log-only (no extra telemetry output).
 - `QUICFUSCATE_CHACHA20_X4=auto|avx2|avx|sse|scalar` - override the TLS Cover ChaCha20 backend for diagnostics.
 - `QUICFUSCATE_PQ_HYBRID=1` - PQ-hybrid toggle; inactive in the standard build unless a dedicated `pq` feature build is enabled.
-- `QUICFUSCATE_ALLOW_INVALID_CERTS=1` - accept invalid peer certificates (development/testing only).
+- `QUICFUSCATE_ALLOW_INVALID_CERTS=1|true|yes|on` - accept invalid peer certificates (development/testing only).
 - `QUICFUSCATE_TLS_CH_OVERRIDE_TEMPLATE=<name>` - forward a ClientHello override template to TLS providers that support CH overrides.
 - `QUICFUSCATE_TRACE_TLS=1` - enable additional TLS handshake/key-change diagnostic logging in qftls and transport packet parsing.
 
@@ -1717,6 +1717,7 @@ Keep `--admin-web-root` pointing at `assets/web-admin` so `/assets/...` paths re
 
 Admin HTTP contract notes:
 - JSON endpoints respond with `AdminResponse { success, message, data }` and `/api/clients` is wrapped.
+- Admin API failures return appropriate HTTP error statuses (`4xx`/`5xx`) while keeping the same `AdminResponse` envelope (`success: false`, optional `message`/`data`).
 - `/api/qkey` is `POST` only, accepts `{ stealth, fec, ttl_seconds }` (presets + optional TTL), and returns `{ qkey, created_at, expires_at }` in `data`.
 - `/api/qkeys` returns entries with `created_at` and optional `expires_at` (expired entries are pruned).
 - QKey strings include the embedded token field and are validated in the admin contract test.
@@ -1747,7 +1748,7 @@ Admin HTTP contract notes:
   - Unsaved-changes warning on page leave, explicit Save/Reset, and pacing pinned on in config writes
 - **QKeys**: Generate server-issued QKeys with optional display name, copy the generated credential, list issued keys, single revoke, and bulk revoke for selected keys. TTL is not exposed in the admin UI flow.
 - **Logs**: Real-time log viewer with configurable logging mode (verbose/normal/minimal/no-log). No-Log suppresses all server log output and the UI stops polling logs. Logs are fetched incrementally via cursor-based pagination.
-- **Settings**: Admin access and security: change username and password. Default credentials (admin/123) are detected and the UI warns until changed.
+- **Settings**: Admin access and security: change username and password. Weak credentials (for example `admin/123`) are detected and the UI warns until changed.
 
 #### Authentication:
 - Login modal with username/password fields (empty by default).
@@ -2252,7 +2253,7 @@ At runtime you can override selected stealth options without changing the config
 - `QUICFUSCATE_BRAIN_PAD_MAX_HIGH`: integer (>= low, <=2048)
 
 **TLS Provider (qftls):**
-- `QUICFUSCATE_ALLOW_INVALID_CERTS=1` - Accept invalid peer certificates (development/testing only)
+- `QUICFUSCATE_ALLOW_INVALID_CERTS=1|true|yes|on` - Accept invalid peer certificates (development/testing only)
 - `QUICFUSCATE_TLS_CH_OVERRIDE_TEMPLATE=<name>` - Forward ClientHello template override names to providers that support `supports_ch_override()`
 - `QUICFUSCATE_TRACE_TLS=1` - Enable additional TLS handshake/key-change diagnostics in qftls/transport
 

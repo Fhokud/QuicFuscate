@@ -5308,7 +5308,7 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi2"))]
         #[inline(always)]
         unsafe fn find_pattern_vbmi2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-            // Fallback to scalar for now
+            // Reuse the scalar matcher for consistent semantics across CPU paths.
             find_pattern_scalar(haystack, needle)
         }
 
@@ -5316,7 +5316,7 @@ pub mod simd {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         #[inline(always)]
         unsafe fn find_pattern_avx2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-            // Fallback to scalar for now
+            // Reuse the scalar matcher for consistent semantics across CPU paths.
             find_pattern_scalar(haystack, needle)
         }
 

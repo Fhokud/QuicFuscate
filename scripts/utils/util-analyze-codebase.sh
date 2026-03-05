@@ -16,20 +16,29 @@ while [[ $# -gt 0 ]]; do
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR]"; exit 0;;
     *) break;;
-  esac; shift
+  esac
+  shift
 done
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BASE_NAME="$(basename "$0" .sh)"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$PROJECT_ROOT/scripts/out/audits/${BASE_NAME}-${TIMESTAMP}"
-mkdir -p "$OUTPUT_DIR"; LOG_FILE="$OUTPUT_DIR/${BASE_NAME}.log"; exec > >(tee -a "$LOG_FILE") 2>&1
+mkdir -p "$OUTPUT_DIR"
+LOG_FILE="$OUTPUT_DIR/${BASE_NAME}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
 [[ -n "${RUSTFLAGS_EXTRA:-}" ]] && export RUSTFLAGS="${RUSTFLAGS_EXTRA} ${RUSTFLAGS:-}"
 JSON="$OUTPUT_DIR/results.json"; json_begin "$JSON" "utils_analyze_codebase"; JSON_FIRST_RUN=1
+
+count_matches() {
+  local pattern="$1"
+  shift
+  (rg --no-messages -- "$pattern" "$@" || true) | wc -l | tr -d '[:space:]'
+}
 
 echo "==============================================================="
 echo "  QuicFuscate Codebase Analysis"
 echo "==============================================================="
 
-# Code statistics
 echo -e "\n+===============================================================+"
 echo "|                    CODE STATISTICS                             |"
 echo "+===============================================================+"
@@ -41,69 +50,65 @@ find src -name "*.rs" -type f | wc -l | awk '{printf "    Files: %d\n", $1}'
 
 echo -e "\n  By module:"
 for dir in src/*/; do
-    if [ -d "$dir" ]; then
+    if [[ -d "$dir" ]]; then
         module=$(basename "$dir")
-        lines=$(find "$dir" -name "*.rs" -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
-        [ -n "$lines" ] && echo "    $module: $lines lines"
+        lines=$(find "$dir" -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+        [[ -n "$lines" ]] && echo "    $module: $lines lines"
     fi
 done
 
-# Module analysis
 echo -e "\n+===============================================================+"
 echo "|                    MODULE ANALYSIS                             |"
 echo "+===============================================================+"
 
 echo -e "\n> Core modules:"
 for module in crypto fec stealth transport optimize interface; do
-    if [ -f "src/$module.rs" ]; then
+    if [[ -f "src/$module.rs" ]]; then
         lines=$(wc -l "src/$module.rs" | awk '{print $1}')
-        functions=$(grep -c "^pub fn\|^fn\|^pub async fn" "src/$module.rs" || echo 0)
-        structs=$(grep -c "^pub struct\|^struct" "src/$module.rs" || echo 0)
-        impls=$(grep -c "^impl" "src/$module.rs" || echo 0)
-        tests=$(grep -c "#\[test\]" "src/$module.rs" || echo 0)
-        unsafe_blocks=$(grep -c "unsafe" "src/$module.rs" || echo 0)
-        
+        functions=$(count_matches '^[[:space:]]*(pub )?(async )?fn ' "src/$module.rs")
+        structs=$(count_matches '^[[:space:]]*(pub )?struct ' "src/$module.rs")
+        impls=$(count_matches '^[[:space:]]*impl ' "src/$module.rs")
+        tests=$(count_matches '#\[test\]' "src/$module.rs")
+        unsafe_blocks=$(count_matches '\bunsafe\b' "src/$module.rs")
+
         echo -e "\n  $module.rs:"
         echo "    Lines: $lines | Functions: $functions | Structs: $structs"
         echo "    Impls: $impls | Tests: $tests | Unsafe: $unsafe_blocks"
     fi
 done
 
-# Feature analysis
 echo -e "\n+===============================================================+"
 echo "|                   FEATURE ANALYSIS                             |"
 echo "+===============================================================+"
 
 echo -e "\n> Conditional compilation:"
-echo "  Linux-specific code blocks: $(grep -r "target_os.*linux" src/ --include="*.rs" | wc -l)"
-echo "  macOS-specific code blocks: $(grep -r "target_os.*macos" src/ --include="*.rs" | wc -l)"
-echo "  Windows-specific code blocks: $(grep -r "target_os.*windows" src/ --include="*.rs" | wc -l)"
-echo "  x86_64 SIMD blocks: $(grep -r "target_arch.*x86_64" src/ --include="*.rs" | wc -l)"
-echo "  ARM SIMD blocks: $(grep -r "target_arch.*aarch64" src/ --include="*.rs" | wc -l)"
+echo "  Linux-specific code blocks: $(count_matches 'target_os.*linux' src/ --glob '*.rs')"
+echo "  macOS-specific code blocks: $(count_matches 'target_os.*macos' src/ --glob '*.rs')"
+echo "  Windows-specific code blocks: $(count_matches 'target_os.*windows' src/ --glob '*.rs')"
+echo "  x86_64 SIMD blocks: $(count_matches 'target_arch.*x86_64' src/ --glob '*.rs')"
+echo "  ARM SIMD blocks: $(count_matches 'target_arch.*aarch64' src/ --glob '*.rs')"
 
 echo -e "\n> Feature gates:"
-echo "  with_aegis: $(grep -r 'feature.*with_aegis' src/ --include="*.rs" | wc -l) uses"
-echo "  uring: $(grep -r 'feature.*uring' src/ --include="*.rs" | wc -l) uses"
-echo "  xdp: $(grep -r 'feature.*xdp' src/ --include="*.rs" | wc -l) uses"
-echo "  benches: $(grep -r 'feature.*benches' src/ --include="*.rs" | wc -l) uses"
+echo "  with_aegis: $(count_matches 'feature.*with_aegis' src/ --glob '*.rs') uses"
+echo "  uring: $(count_matches 'feature.*uring' src/ --glob '*.rs') uses"
+echo "  xdp: $(count_matches 'feature.*xdp' src/ --glob '*.rs') uses"
+echo "  benches: $(count_matches 'feature.*benches' src/ --glob '*.rs') uses"
 
-# Optimization analysis
 echo -e "\n+===============================================================+"
 echo "|                OPTIMIZATION ANALYSIS                           |"
 echo "+===============================================================+"
 
 echo -e "\n> Performance annotations:"
-echo "  #[inline(always)]: $(grep -r "#\[inline(always)\]" src/ --include="*.rs" | wc -l)"
-echo "  #[inline]: $(grep -r "#\[inline\]" src/ --include="*.rs" | grep -v "inline(always)" | wc -l)"
-echo "  #[cold]: $(grep -r "#\[cold\]" src/ --include="*.rs" | wc -l)"
-echo "  #[hot]: $(grep -r "#\[hot\]" src/ --include="*.rs" | wc -l)"
+echo "  #[inline(always)]: $(count_matches '#\[inline\(always\)\]' src/ --glob '*.rs')"
+echo "  #[inline]: $(count_matches '#\[inline\]' src/ --glob '*.rs')"
+echo "  #[cold]: $(count_matches '#\[cold\]' src/ --glob '*.rs')"
+echo "  #[hot]: $(count_matches '#\[hot\]' src/ --glob '*.rs')"
 
 echo -e "\n> SIMD usage:"
-echo "  _mm_ intrinsics: $(grep -r "_mm_" src/ --include="*.rs" | wc -l)"
-echo "  vld/vst intrinsics: $(grep -r "vld\|vst" src/ --include="*.rs" | wc -l)"
-echo "  target_feature: $(grep -r "target_feature" src/ --include="*.rs" | wc -l)"
+echo "  _mm_ intrinsics: $(count_matches '_mm_' src/ --glob '*.rs')"
+echo "  vld/vst intrinsics: $(count_matches 'vld|vst' src/ --glob '*.rs')"
+echo "  target_feature: $(count_matches 'target_feature' src/ --glob '*.rs')"
 
-# Dependency analysis
 echo -e "\n+===============================================================+"
 echo "|                 DEPENDENCY ANALYSIS                            |"
 echo "+===============================================================+"
@@ -112,44 +117,49 @@ echo -e "\n> Direct dependencies:"
 grep "^[a-z]" Cargo.toml | grep "=" | wc -l | awk '{print "  Count: " $1}'
 
 echo -e "\n> Most used external crates:"
-grep -h "^use " src/*.rs src/**/*.rs 2>/dev/null | \
-    grep -v "use crate\|use super\|use std" | \
-    cut -d':' -f1 | cut -d' ' -f2 | \
-    sort | uniq -c | sort -rn | head -10 | \
-    while read count crate; do
-        echo "  $crate: $count uses"
-    done
+(
+  rg --no-messages --no-filename '^use ' src/ --glob '*.rs' || true
+) |
+  (rg --no-messages -v 'use crate|use super|use std' || true) |
+  sed -E 's/^use ([^:; ]+).*/\1/' |
+  sort | uniq -c | sort -rn | head -10 |
+  while read -r count crate; do
+      [[ -n "${count:-}" && -n "${crate:-}" ]] || continue
+      echo "  $crate: $count uses"
+  done
 
-# Complexity metrics
 echo -e "\n+===============================================================+"
 echo "|                  COMPLEXITY METRICS                            |"
 echo "+===============================================================+"
 
 echo -e "\n> Function complexity:"
-longest_fn=$(grep -r "^fn \|^pub fn " src/ --include="*.rs" -A 50 | \
-    awk '/^src.*fn /{name=$0} /^--$/{print NR-start, name; start=NR}' | \
-    sort -rn | head -1)
-echo "  Longest function: ~$(echo $longest_fn | cut -d' ' -f1) lines"
+longest_fn=$( (
+  rg --no-messages '^[[:space:]]*(pub )?fn ' src/ --glob '*.rs' -n || true
+) | head -1 )
+if [[ -n "$longest_fn" ]]; then
+  echo "  Sample function location: $longest_fn"
+else
+  echo "  Sample function location: n/a"
+fi
 
 echo -e "\n> File complexity:"
 largest_file=$(find src -name "*.rs" -exec wc -l {} + | sort -rn | head -2 | tail -1)
 echo "  Largest file: $largest_file"
 
 echo -e "\n> Test coverage:"
-test_count=$(grep -r "#\[test\]" src/ --include="*.rs" | wc -l)
-test_modules=$(grep -r "#\[cfg(test)\]" src/ --include="*.rs" | wc -l)
+test_count=$(count_matches '#\[test\]' src/ --glob '*.rs')
+test_modules=$(count_matches '#\[cfg\(test\)\]' src/ --glob '*.rs')
 echo "  Test functions: $test_count"
 echo "  Test modules: $test_modules"
 
-# Generate summary
 echo -e "\n+===============================================================+"
 echo "|                      SUMMARY                                   |"
 echo "+===============================================================+"
 
 total_lines=$(find src -name "*.rs" -exec wc -l {} + | tail -1 | awk '{print $1}')
 total_files=$(find src -name "*.rs" | wc -l)
-unsafe_total=$(grep -r "unsafe" src/ --include="*.rs" | wc -l)
-test_total=$(grep -r "#\[test\]" src/ --include="*.rs" | wc -l)
+unsafe_total=$(count_matches '\bunsafe\b' src/ --glob '*.rs')
+test_total=$(count_matches '#\[test\]' src/ --glob '*.rs')
 
 echo -e "\n  Total Rust code: $total_lines lines in $total_files files"
 echo "  Code density: $((total_lines / total_files)) lines/file average"

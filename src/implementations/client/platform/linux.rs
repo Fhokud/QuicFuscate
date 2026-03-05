@@ -2,14 +2,31 @@
 
 use super::traits::*;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+const IFF_TUN: libc::c_short = 0x0001;
+const IFF_NO_PI: libc::c_short = 0x1000;
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+const RESOLV_CONF_BACKUP_PATH: &str = "/etc/resolv.conf.quicfuscate.bak";
+
+#[repr(C)]
+struct IfReq {
+    ifr_name: [libc::c_char; 16],
+    ifr_flags: libc::c_short,
+}
 
 /// Linux platform backend.
-pub struct LinuxPlatform;
+pub struct LinuxPlatform {
+    tun_name: Mutex<Option<String>>,
+    resolv_conf_backup: Mutex<Option<PathBuf>>,
+}
 
 impl LinuxPlatform {
     pub fn new() -> Self {
-        Self
+        Self { tun_name: Mutex::new(None), resolv_conf_backup: Mutex::new(None) }
     }
 
     /// Check if systemd-resolved is available.
@@ -17,15 +34,61 @@ impl LinuxPlatform {
         std::path::Path::new("/run/systemd/resolve/stub-resolv.conf").exists()
     }
 
-    /// Run ip command.
-    fn run_ip(&self, args: &[&str]) -> Result<(), PlatformError> {
-        let status = Command::new("ip")
+    fn active_tun_name(&self) -> Result<String, PlatformError> {
+        self.tun_name.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| {
+            PlatformError::DnsError(
+                "No active tunnel interface available for DNS setup".to_string(),
+            )
+        })
+    }
+
+    fn set_active_tun_name(&self, name: Option<String>) {
+        *self.tun_name.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    fn run_command(&self, cmd: &str, args: &[&str]) -> Result<(), PlatformError> {
+        let status = Command::new(cmd)
             .args(args)
             .status()
             .map_err(|e| PlatformError::CommandFailed(e.to_string()))?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(PlatformError::CommandFailed(format!("{} {} failed", cmd, args.join(" "))))
+    }
 
-        if !status.success() {
-            return Err(PlatformError::CommandFailed(format!("ip {} failed", args.join(" "))));
+    /// Run ip command.
+    fn run_ip(&self, args: &[&str]) -> Result<(), PlatformError> {
+        self.run_command("ip", args)
+    }
+
+    fn backup_resolv_conf_if_needed(&self) -> Result<(), PlatformError> {
+        let mut guard = self.resolv_conf_backup.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        let src = Path::new(RESOLV_CONF_PATH);
+        if !src.exists() {
+            return Ok(());
+        }
+        let backup = PathBuf::from(RESOLV_CONF_BACKUP_PATH);
+        std::fs::copy(src, &backup).map_err(|e| PlatformError::DnsError(e.to_string()))?;
+        *guard = Some(backup);
+        Ok(())
+    }
+
+    fn restore_resolv_conf_from_backup(&self) -> Result<(), PlatformError> {
+        let backup = {
+            let mut guard = self.resolv_conf_backup.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        let Some(path) = backup else {
+            return Ok(());
+        };
+        if path.exists() {
+            std::fs::copy(&path, RESOLV_CONF_PATH)
+                .map_err(|e| PlatformError::DnsError(e.to_string()))?;
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }
@@ -54,86 +117,173 @@ impl PlatformBackend for LinuxPlatform {
     }
 
     fn create_tun(&self, config: &TunDeviceConfig) -> Result<TunHandle, PlatformError> {
+        use std::ffi::CString;
+        use std::mem;
         use std::os::unix::io::AsRawFd;
         use std::os::unix::io::IntoRawFd;
 
-        // Open /dev/net/tun
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/net/tun")
-            .map_err(|e| PlatformError::DeviceError(e.to_string()))?;
+        let mut file = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/net/tun")
+        {
+            Ok(f) => f,
+            Err(_) => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tun")
+                .map_err(|e| PlatformError::DeviceError(e.to_string()))?,
+        };
 
         let fd = file.as_raw_fd();
+        let mut ifr: IfReq = unsafe { mem::zeroed() };
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        if let Some(ref requested_name) = config.name {
+            let c_name = CString::new(requested_name.as_str())
+                .map_err(|e| PlatformError::DeviceError(e.to_string()))?;
+            let bytes = c_name.as_bytes_with_nul();
+            let len = bytes.len().min(ifr.ifr_name.len());
+            for (dst, src) in ifr.ifr_name.iter_mut().zip(bytes.iter()).take(len) {
+                *dst = *src as libc::c_char;
+            }
+        }
+        let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
+        if ret < 0 {
+            return Err(PlatformError::DeviceError(std::io::Error::last_os_error().to_string()));
+        }
 
-        // Device name
-        let name = config.name.clone().unwrap_or_else(|| "qftun0".to_string());
-
-        // TUNSETIFF ioctl would go here - for now, use tuntap crate behavior
-        // This is a simplified version - real impl uses tun2 crate
+        let mut name = String::new();
+        for &c in &ifr.ifr_name {
+            if c == 0 {
+                break;
+            }
+            name.push(c as u8 as char);
+        }
+        if name.is_empty() {
+            return Err(PlatformError::DeviceError(
+                "Kernel did not return a valid tunnel interface name".to_string(),
+            ));
+        }
 
         // Configure the device via ip commands
         self.run_ip(&["link", "set", &name, "up"])?;
-
-        self.run_ip(&[
-            "addr",
-            "add",
-            &format!("{}/{}", config.address, config.netmask),
-            "dev",
-            &name,
-        ])?;
+        match config.address {
+            IpAddr::V4(_) => {
+                self.run_ip(&[
+                    "addr",
+                    "add",
+                    &format!("{}/{}", config.address, config.netmask),
+                    "dev",
+                    &name,
+                ])?;
+            }
+            IpAddr::V6(_) => {
+                self.run_ip(&[
+                    "-6",
+                    "addr",
+                    "add",
+                    &format!("{}/{}", config.address, config.netmask),
+                    "dev",
+                    &name,
+                ])?;
+            }
+        }
 
         self.run_ip(&["link", "set", &name, "mtu", &config.mtu.to_string()])?;
 
         log::info!("Created TUN device {} with IP {}/{}", name, config.address, config.netmask);
 
-        // Transfer fd ownership to caller-side lifecycle management.
-        let _ = file.into_raw_fd();
+        let c_name =
+            CString::new(name.clone()).map_err(|e| PlatformError::DeviceError(e.to_string()))?;
+        let id = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+        self.set_active_tun_name(Some(name.clone()));
 
-        Ok(TunHandle { name, id: 0, fd })
+        Ok(TunHandle { name, id, fd: file.into_raw_fd() })
     }
 
     fn destroy_tun(&self, handle: TunHandle) -> Result<(), PlatformError> {
-        self.run_ip(&["link", "set", &handle.name, "down"])?;
-        self.run_ip(&["link", "delete", &handle.name])?;
+        let _ = self.run_ip(&["link", "set", &handle.name, "down"]);
+        let _ = self.run_ip(&["link", "delete", &handle.name]);
 
         // Close file descriptor
         unsafe {
             libc::close(handle.fd);
         }
+        self.set_active_tun_name(None);
 
         log::info!("Destroyed TUN device {}", handle.name);
         Ok(())
     }
 
     fn add_route(&self, route: &RouteConfig) -> Result<(), PlatformError> {
-        self.run_ip(&[
-            "route",
-            "add",
-            &format!("{}/{}", route.destination, route.prefix_len),
-            "via",
-            &route.gateway.to_string(),
-            "metric",
-            &route.metric.to_string(),
-        ])
+        match (route.destination, route.gateway) {
+            (IpAddr::V4(_), IpAddr::V4(_)) => self.run_ip(&[
+                "route",
+                "add",
+                &format!("{}/{}", route.destination, route.prefix_len),
+                "via",
+                &route.gateway.to_string(),
+                "metric",
+                &route.metric.to_string(),
+            ]),
+            (IpAddr::V6(_), IpAddr::V6(_)) => self.run_ip(&[
+                "-6",
+                "route",
+                "add",
+                &format!("{}/{}", route.destination, route.prefix_len),
+                "via",
+                &route.gateway.to_string(),
+                "metric",
+                &route.metric.to_string(),
+            ]),
+            _ => Err(PlatformError::RoutingError(
+                "Route destination and gateway IP families must match".to_string(),
+            )),
+        }
     }
 
     fn remove_route(&self, route: &RouteConfig) -> Result<(), PlatformError> {
-        let _ =
-            self.run_ip(&["route", "del", &format!("{}/{}", route.destination, route.prefix_len)]);
+        match route.destination {
+            IpAddr::V4(_) => {
+                let _ = self.run_ip(&[
+                    "route",
+                    "del",
+                    &format!("{}/{}", route.destination, route.prefix_len),
+                ]);
+            }
+            IpAddr::V6(_) => {
+                let _ = self.run_ip(&[
+                    "-6",
+                    "route",
+                    "del",
+                    &format!("{}/{}", route.destination, route.prefix_len),
+                ]);
+            }
+        }
         Ok(())
     }
 
     fn set_dns(&self, config: &DnsConfig) -> Result<(), PlatformError> {
+        if config.servers.is_empty() {
+            return Err(PlatformError::DnsError("At least one DNS server is required".to_string()));
+        }
+        let tun_name = self.active_tun_name()?;
         if self.has_systemd_resolved() {
-            // Use resolvectl
-            for server in &config.servers {
-                let _ = Command::new("resolvectl")
-                    .args(["dns", "qftun0", &server.to_string()])
-                    .status();
+            let server_args: Vec<String> = config.servers.iter().map(|s| s.to_string()).collect();
+            let mut args = Vec::with_capacity(2 + server_args.len());
+            args.push("dns".to_string());
+            args.push(tun_name.clone());
+            args.extend(server_args);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.run_command("resolvectl", &arg_refs)?;
+
+            if !config.search_domains.is_empty() {
+                let mut dargs = Vec::with_capacity(2 + config.search_domains.len());
+                dargs.push("domain".to_string());
+                dargs.push(tun_name.clone());
+                dargs.extend(config.search_domains.iter().cloned());
+                let darg_refs: Vec<&str> = dargs.iter().map(String::as_str).collect();
+                self.run_command("resolvectl", &darg_refs)?;
             }
         } else {
-            // Write to /etc/resolv.conf
+            self.backup_resolv_conf_if_needed()?;
             let mut content = String::new();
             for server in &config.servers {
                 content.push_str(&format!("nameserver {}\n", server));
@@ -141,8 +291,7 @@ impl PlatformBackend for LinuxPlatform {
             for domain in &config.search_domains {
                 content.push_str(&format!("search {}\n", domain));
             }
-
-            std::fs::write("/etc/resolv.conf", content)
+            std::fs::write(RESOLV_CONF_PATH, content)
                 .map_err(|e| PlatformError::DnsError(e.to_string()))?;
         }
 
@@ -151,7 +300,12 @@ impl PlatformBackend for LinuxPlatform {
     }
 
     fn restore_dns(&self) -> Result<(), PlatformError> {
-        // In production, we'd restore the original DNS configuration
+        if self.has_systemd_resolved() {
+            if let Ok(name) = self.active_tun_name() {
+                let _ = self.run_command("resolvectl", &["revert", &name]);
+            }
+        }
+        self.restore_resolv_conf_from_backup()?;
         log::info!("DNS restored");
         Ok(())
     }
@@ -175,7 +329,22 @@ impl PlatformBackend for LinuxPlatform {
             }
         }
 
-        Err(PlatformError::RoutingError("Could not detect default gateway".to_string()))
+        let output_v6 = Command::new("ip")
+            .args(["-6", "route", "show", "default"])
+            .output()
+            .map_err(|e| PlatformError::CommandFailed(e.to_string()))?;
+        let stdout_v6 = String::from_utf8_lossy(&output_v6.stdout);
+        for (i, word) in stdout_v6.split_whitespace().enumerate() {
+            if word == "via" {
+                if let Some(gw) = stdout_v6.split_whitespace().nth(i + 1) {
+                    if let Ok(ip) = gw.parse() {
+                        return Ok(ip);
+                    }
+                }
+            }
+        }
+
+        Err(PlatformError::RoutingError("Could not detect default IPv4/IPv6 gateway".to_string()))
     }
 }
 

@@ -3,13 +3,16 @@
 use super::traits::*;
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Windows platform backend.
-pub struct WindowsPlatform;
+pub struct WindowsPlatform {
+    tun_interface: Mutex<Option<String>>,
+}
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        Self
+        Self { tun_interface: Mutex::new(None) }
     }
 
     /// Run netsh command.
@@ -37,6 +40,27 @@ impl WindowsPlatform {
         }
         Ok(())
     }
+
+    fn interface_exists(&self, name: &str) -> Result<bool, PlatformError> {
+        let output = Command::new("netsh")
+            .args(["interface", "show", "interface", &format!("name=\"{}\"", name)])
+            .output()
+            .map_err(|e| PlatformError::CommandFailed(e.to_string()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(output.status.success() && stdout.contains(name))
+    }
+
+    fn set_active_interface(&self, name: Option<String>) {
+        *self.tun_interface.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    fn active_interface(&self) -> Result<String, PlatformError> {
+        self.tun_interface.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| {
+            PlatformError::DnsError(
+                "No active tunnel interface available for DNS setup".to_string(),
+            )
+        })
+    }
 }
 
 impl Default for WindowsPlatform {
@@ -51,8 +75,7 @@ impl PlatformBackend for WindowsPlatform {
     }
 
     fn is_elevated(&self) -> bool {
-        // Check if running as Administrator
-        // Simplified check - real impl uses Windows API
+        // `net session` requires Administrator privileges.
         let output = Command::new("net").args(["session"]).output();
 
         match output {
@@ -69,15 +92,16 @@ impl PlatformBackend for WindowsPlatform {
     }
 
     fn create_tun(&self, config: &TunDeviceConfig) -> Result<TunHandle, PlatformError> {
-        // Windows uses WinTUN driver
-        // The wintun crate provides the interface
-
         let name = config.name.clone().unwrap_or_else(|| "QuicFuscate".to_string());
 
-        // In production, we'd use the wintun crate here
-        // For now, we simulate with netsh
+        if !self.interface_exists(&name)? {
+            return Err(PlatformError::Unsupported(format!(
+                "Interface '{}' not found. Create a WinTUN adapter with this name before connecting.",
+                name
+            )));
+        }
 
-        log::info!("Creating WinTUN adapter: {}", name);
+        log::info!("Configuring tunnel interface: {}", name);
 
         // Configure IP address via netsh
         self.run_netsh(&[
@@ -88,21 +112,19 @@ impl PlatformBackend for WindowsPlatform {
             &format!("name=\"{}\"", name),
             "static",
             &config.address.to_string(),
-            "255.255.255.0", // Simplified
+            &prefix_to_netmask(config.netmask),
         ])?;
+        self.set_active_interface(Some(name.clone()));
 
         log::info!("Created TUN device {} with IP {}", name, config.address);
 
-        Ok(TunHandle {
-            name,
-            id: 0,
-            handle: 0, // Would be actual HANDLE
-        })
+        Ok(TunHandle { name, id: 0, handle: 0 })
     }
 
     fn destroy_tun(&self, handle: TunHandle) -> Result<(), PlatformError> {
         // Disable the adapter
         self.run_netsh(&["interface", "set", "interface", &handle.name, "admin=disabled"])?;
+        self.set_active_interface(None);
 
         log::info!("Destroyed TUN device {}", handle.name);
         Ok(())
@@ -129,8 +151,7 @@ impl PlatformBackend for WindowsPlatform {
     }
 
     fn set_dns(&self, config: &DnsConfig) -> Result<(), PlatformError> {
-        // Get interface name (simplified)
-        let interface = "QuicFuscate";
+        let interface = self.active_interface()?;
 
         // Set primary DNS
         if let Some(primary) = config.servers.first() {
@@ -146,16 +167,16 @@ impl PlatformBackend for WindowsPlatform {
         }
 
         // Add secondary DNS servers
-        for dns in config.servers.iter().skip(1) {
-            let _ = self.run_netsh(&[
+        for (idx, dns) in config.servers.iter().enumerate().skip(1) {
+            self.run_netsh(&[
                 "interface",
                 "ip",
                 "add",
                 "dns",
                 &format!("name=\"{}\"", interface),
                 &dns.to_string(),
-                "index=2",
-            ]);
+                &format!("index={}", idx + 1),
+            ])?;
         }
 
         log::info!("DNS configured: {:?}", config.servers);
@@ -164,15 +185,15 @@ impl PlatformBackend for WindowsPlatform {
 
     fn restore_dns(&self) -> Result<(), PlatformError> {
         // Reset DNS to DHCP
-        let interface = "QuicFuscate";
-        let _ = self.run_netsh(&[
+        let interface = self.active_interface()?;
+        self.run_netsh(&[
             "interface",
             "ip",
             "set",
             "dns",
             &format!("name=\"{}\"", interface),
             "dhcp",
-        ]);
+        ])?;
 
         log::info!("DNS restored to DHCP");
         Ok(())
@@ -204,6 +225,12 @@ impl PlatformBackend for WindowsPlatform {
 
 /// Convert CIDR prefix length to dotted netmask.
 fn prefix_to_netmask(prefix: u8) -> String {
+    if prefix == 0 {
+        return "0.0.0.0".to_string();
+    }
+    if prefix >= 32 {
+        return "255.255.255.255".to_string();
+    }
     let mask: u32 = !((1u32 << (32 - prefix)) - 1);
     format!(
         "{}.{}.{}.{}",

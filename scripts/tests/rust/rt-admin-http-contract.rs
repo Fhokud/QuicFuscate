@@ -499,6 +499,19 @@ fn admin_http_contracts() {
     let resp: AdminResponse = serde_json::from_str(&body).expect("revoke response");
     assert!(resp.success);
 
+    let revoke_unknown_payload = serde_json::json!({ "id": "ffffffffffff" }).to_string();
+    let (status, body, _) = http_request_with_csrf(
+        local_addr,
+        "POST",
+        "/api/qkeys/revoke",
+        Some(&cookie),
+        Some(&csrf),
+        &revoke_unknown_payload,
+    );
+    assert_eq!(status, 404);
+    let resp: AdminResponse = serde_json::from_str(&body).expect("revoke unknown response");
+    assert!(!resp.success);
+
     let (status, body, _) = http_request(local_addr, "GET", "/api/metrics", Some(&cookie), "");
     assert_eq!(status, 200);
     assert!(body.contains("metrics"));
@@ -540,6 +553,19 @@ fn admin_http_contracts() {
     assert_eq!(status, 200);
     let resp: AdminResponse = serde_json::from_str(&body).expect("unblock response");
     assert!(resp.success);
+
+    let empty_mode_payload = serde_json::json!({ "mode": "" }).to_string();
+    let (status, body, _) = http_request_with_csrf(
+        local_addr,
+        "POST",
+        "/api/config/logging",
+        Some(&cookie),
+        Some(&csrf),
+        &empty_mode_payload,
+    );
+    assert_eq!(status, 400);
+    let resp: AdminResponse = serde_json::from_str(&body).expect("logging mode error response");
+    assert!(!resp.success);
 
     let (status, _body, _) = http_request(local_addr, "GET", "/api/qkey", Some(&cookie), "");
     assert_eq!(status, 404);

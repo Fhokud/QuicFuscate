@@ -46,3 +46,19 @@ fn connection_migrate_emits_path_events_in_order() {
     assert!(matches!(ev3, PathEvent::PeerMigrated(_, _)));
     assert!(conn.path_event_next().is_none());
 }
+
+#[test]
+fn connection_refuses_plaintext_short_header_send_without_aead() {
+    let mut cfg = Config::new_with_version(PROTOCOL_VERSION).expect("config");
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().expect("local");
+    let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("peer");
+    let scid = ConnectionId::from_ref(&[2u8; 8]);
+    let mut conn = packet::connect(None, scid.as_ref(), local, peer, &mut cfg).expect("connect");
+
+    conn.enable_datagrams(0, 1);
+    conn.dgram_send(b"x").expect("queue datagram");
+
+    let mut out = [0u8; 1500];
+    let err = conn.send(&mut out).expect_err("send without AEAD must fail");
+    assert!(matches!(err, ConnectionError::TlsError(_)));
+}

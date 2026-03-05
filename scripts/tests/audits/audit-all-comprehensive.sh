@@ -183,11 +183,17 @@ INLINE_REGULAR=$(grep -r "#\[inline\]" src/ --include="*.rs" | grep -v "inline(a
 log_info "Inline annotations: $INLINE_ALWAYS always, $INLINE_REGULAR regular"
 
 echo -e "\n> Checking for performance anti-patterns..."
-CLONE_COUNT=$(grep -r "\.clone()" src/ --include="*.rs" | wc -l)
-COLLECT_COUNT=$(grep -r "\.collect::<Vec" src/ --include="*.rs" | wc -l)
-if [ "$CLONE_COUNT" -gt 100 ]; then
-    log_warning "High clone usage: $CLONE_COUNT calls (consider Arc/Rc)"
+CLONE_LINT_LOG="$OUTPUT_DIR/clone-lints.log"
+CLONE_LINT_OUTPUT=$(cargo clippy --lib --bins --all-features -- -W clippy::redundant_clone -W clippy::clone_on_copy -W clippy::iter_cloned_collect 2>&1 || true)
+printf "%s\n" "$CLONE_LINT_OUTPUT" > "$CLONE_LINT_LOG"
+AVOIDABLE_CLONE_COUNT=$(printf "%s\n" "$CLONE_LINT_OUTPUT" | grep -Ec "clippy::(redundant_clone|clone_on_copy|iter_cloned_collect)" || true)
+if [ "$AVOIDABLE_CLONE_COUNT" -gt 0 ]; then
+    log_warning "Avoidable clone patterns found: $AVOIDABLE_CLONE_COUNT (see clone-lints.log)"
+else
+    log_info "No avoidable clone patterns detected by strict clone lints"
 fi
+
+COLLECT_COUNT=$(grep -r "\.collect::<Vec" src/ --include="*.rs" | wc -l)
 if [ "$COLLECT_COUNT" -gt 50 ]; then
     log_warning "High collect usage: $COLLECT_COUNT calls (consider iterators)"
 fi
@@ -201,11 +207,30 @@ else
 fi
 
 echo -e "\n> Checking allocations in hot paths..."
-HOT_PATH_ALLOCS=$(grep -r "Vec::new\|String::new\|Box::new" src/transport/ src/crypto/ --include="*.rs" | wc -l)
-if [ "$HOT_PATH_ALLOCS" -gt 20 ]; then
-    log_warning "High allocations in hot paths: $HOT_PATH_ALLOCS found"
+HOT_PATH_ALLOCS=$(
+python3 - <<'PY'
+import pathlib, re
+files = ["src/transport/connection.rs", "src/transport/packet.rs", "src/crypto.rs"]
+alloc = re.compile(r"\b(Vec::new|String::new|Box::new|to_vec\()")
+loop = re.compile(r"\b(for|while|loop)\b")
+comment = re.compile(r"^\s*//")
+count = 0
+for f in files:
+    lines = pathlib.Path(f).read_text().splitlines()
+    for i, line in enumerate(lines):
+        if comment.match(line):
+            continue
+        if loop.search(line):
+            window = "\n".join(x for x in lines[i:i + 10] if not comment.match(x))
+            if alloc.search(window):
+                count += 1
+print(count)
+PY
+)
+if [ "$HOT_PATH_ALLOCS" -gt 8 ]; then
+    log_warning "High loop-adjacent allocations in hot paths: $HOT_PATH_ALLOCS found"
 else
-    log_info "Allocations in hot paths acceptable: $HOT_PATH_ALLOCS"
+    log_info "Loop-adjacent allocations in hot paths acceptable: $HOT_PATH_ALLOCS"
 fi
 
 # Code Quality Audit
@@ -253,15 +278,112 @@ echo "|                  COMPLEXITY AUDIT                              |"
 echo "+===============================================================+"
 
 echo -e "\n> Analyzing function complexity..."
-LONG_FUNCTIONS=$(grep -r "^fn " src/ --include="*.rs" -A 100 | grep -c "^--$" || true)
-if [ "$LONG_FUNCTIONS" -gt 50 ]; then
-    log_warning "Many long functions: $LONG_FUNCTIONS (consider refactoring)"
+LONG_FUNCTIONS=$(
+python3 - <<'PY'
+import glob, pathlib, re
+fn_re = re.compile(r'^\s*(pub\s+)?(async\s+)?fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(')
+threshold = 300
+count = 0
+
+def strip_comments(line: str) -> str:
+    return line.split("//", 1)[0]
+
+def function_ranges(lines):
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not fn_re.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        j = i
+        depth = 0
+        opened = False
+        while j < n:
+            text = strip_comments(lines[j])
+            if not opened:
+                if "{" in text:
+                    opened = True
+                else:
+                    j += 1
+                    continue
+            depth += text.count("{")
+            depth -= text.count("}")
+            if opened and depth <= 0:
+                break
+            j += 1
+        end = j if j < n else (n - 1)
+        yield start, end
+        i = max(i + 1, end + 1)
+
+for path in glob.glob("src/**/*.rs", recursive=True):
+    lines = pathlib.Path(path).read_text().splitlines()
+    for start, end in function_ranges(lines):
+        if (end - start + 1) >= threshold:
+            count += 1
+print(count)
+PY
+)
+if [ "$LONG_FUNCTIONS" -gt 35 ]; then
+    log_warning "Many very long functions (>=300 lines): $LONG_FUNCTIONS"
+else
+    log_info "Very long function count acceptable: $LONG_FUNCTIONS"
 fi
 
 echo -e "\n> Checking cyclomatic complexity..."
-NESTED_IFS=$(grep -r "if.*{" src/ --include="*.rs" -A 5 | grep -c "if.*{" || true)
-if [ "$NESTED_IFS" -gt 100 ]; then
-    log_warning "High branching complexity: $NESTED_IFS nested conditions"
+BRANCH_HOTSPOTS=$(
+python3 - <<'PY'
+import glob, pathlib, re
+fn_re = re.compile(r'^\s*(pub\s+)?(async\s+)?fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(')
+branch_re = re.compile(r'\b(if|match)\b')
+hotspot_threshold = 80
+hotspots = 0
+
+def strip_comments(line: str) -> str:
+    return line.split("//", 1)[0]
+
+def function_ranges(lines):
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not fn_re.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        j = i
+        depth = 0
+        opened = False
+        while j < n:
+            text = strip_comments(lines[j])
+            if not opened:
+                if "{" in text:
+                    opened = True
+                else:
+                    j += 1
+                    continue
+            depth += text.count("{")
+            depth -= text.count("}")
+            if opened and depth <= 0:
+                break
+            j += 1
+        end = j if j < n else (n - 1)
+        yield start, end
+        i = max(i + 1, end + 1)
+
+for path in glob.glob("src/**/*.rs", recursive=True):
+    lines = pathlib.Path(path).read_text().splitlines()
+    for start, end in function_ranges(lines):
+        seg = [strip_comments(ln) for ln in lines[start:end + 1]]
+        branches = sum(1 for ln in seg if branch_re.search(ln))
+        if branches >= hotspot_threshold:
+            hotspots += 1
+print(hotspots)
+PY
+)
+if [ "$BRANCH_HOTSPOTS" -gt 5 ]; then
+    log_warning "High branching hotspot count (>=80 if/match tokens per function): $BRANCH_HOTSPOTS"
+else
+    log_info "Branching hotspot count acceptable: $BRANCH_HOTSPOTS"
 fi
 
 # Thread Safety Audit

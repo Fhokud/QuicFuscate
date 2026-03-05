@@ -8,7 +8,7 @@ use crate::engine::{EngineConfig, EngineError};
 
 /// Client connection wrapper.
 ///
-/// Wraps `QuicFuscateConnection` and provides a simplified interface
+/// Wraps `QuicFuscateConnection` and provides a streamlined interface
 /// for the client runtime.
 pub struct ClientConnection {
     inner: Arc<parking_lot::Mutex<QuicFuscateConnection>>,

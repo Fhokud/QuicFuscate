@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::optimize::{prefetch, PrefetchHint};
 
+const MAX_RX_KEY_UPDATE_ADVANCE: usize = 4;
+
 /// Path-related events
 #[derive(Debug, Clone)]
 pub enum PathEvent {
@@ -38,7 +40,7 @@ pub enum PathEvent {
 
 /// QUIC connection
 pub struct Connection {
-    // Internal state (simplified for now)
+    // Internal state
     scid: ConnectionId,
     dcid: ConnectionId,
     /// Original Destination Connection ID (ODCID) used for Initial key derivation (RFC 9001).
@@ -413,10 +415,11 @@ impl Connection {
         sni: &str,
     ) -> Result<(), crate::error::ConnectionError> {
         if let Some(provider) = &mut self.tls_provider {
-            provider.configure(profile)?;
+            let mut effective = profile.clone();
             if !sni.is_empty() {
-                provider.set_server_name(sni)?;
+                effective.sni = Some(sni.to_string());
             }
+            provider.configure(&effective)?;
             // Optionally enable 0-RTT when desired
             let _ = provider.enable_0rtt();
         }
@@ -677,8 +680,31 @@ impl Connection {
             } else {
                 self.dcid.as_ref()
             };
-            if let Err(e) = packet::verify_retry_tag(&buf[..], odcid, self.config.version) {
+            if let Err(e) = packet::verify_retry_tag(buf, odcid, self.config.version) {
                 self.local_error = Some(e);
+                if let Some(err) = self.local_error.clone() {
+                    return Err(err);
+                }
+                return Err(ConnectionError::InvalidState);
+            }
+
+            // Client-side Retry handling: adopt token/DCID and re-derive Initial keys.
+            if !self.is_server {
+                if let Ok((retry_hdr, _)) = packet::parse_header(buf, short_dcid_len) {
+                    if !retry_hdr.scid.is_empty() {
+                        self.set_destination_cid(ConnectionId::from_vec(retry_hdr.scid.clone()));
+                    }
+                    self.config.initial_token = retry_hdr.token.clone();
+                    let (client_secret, server_secret) =
+                        packet::derive_initial_secrets(self.dcid.as_ref(), self.config.version);
+                    let (read_secret, write_secret) =
+                        (server_secret.as_slice(), client_secret.as_slice());
+                    let mut crypto = self.crypto.write();
+                    crypto.install_aes_gcm_initial(read_secret, write_secret);
+                    crypto.install_hp_initial(read_secret, write_secret);
+                    self.next_send_pn_by_space[0] = 0;
+                    self.pkt_spaces[0] = pnspace::PktNumSpace::default();
+                }
             }
             // For Retry we do not parse further.
             self.stats.recv += 1;
@@ -687,16 +713,25 @@ impl Connection {
         }
 
         // Try to unprotect+decrypt using installed secrets.
-        // Important: keep the lock scope tight so we can mutably borrow `self` later (e.g. CRYPTO frames).
-        let (hdr_native, aad_len, pt_len) = {
-            let crypto_ref_for_rx = self.crypto.read();
-            match packet::unprotect_and_decrypt(
-                &crypto_ref_for_rx,
-                buf,
-                short_dcid_len,
-                largest_hint,
-            ) {
-                Ok(v) => v,
+        // For short-header packets, a bounded read-key catch-up loop tolerates peer key updates
+        // across multiple generations before we receive packets in each phase.
+        let mut rx_key_advances = 0usize;
+        let (hdr_native, aad_len, pt_len) = loop {
+            let decrypt = {
+                let crypto_ref_for_rx = self.crypto.read();
+                packet::unprotect_and_decrypt(&crypto_ref_for_rx, buf, short_dcid_len, largest_hint)
+            };
+            match decrypt {
+                Ok(v) => break v,
+                Err(ConnectionError::Done) | Err(ConnectionError::CryptoFail)
+                    if pre_ty == PacketType::Short
+                        && rx_key_advances < MAX_RX_KEY_UPDATE_ADVANCE
+                        && self.try_advance_read_keys() =>
+                {
+                    rx_key_advances += 1;
+                    continue;
+                }
+                Err(ConnectionError::Done) => return Err(ConnectionError::Done),
                 Err(e) => {
                     self.local_error = Some(e);
                     if let Some(err) = self.local_error.clone() {
@@ -737,14 +772,6 @@ impl Connection {
         if let Some(obs) = &self.observer {
             obs.on_packet_recv(hdr_native.pkt_num, pt_len);
         }
-        // Key phase handling (simplified rotation: synced to received short-header bit).
-        if pkt_ty == PacketType::Short
-            && hdr_native.pkt_num_len > 0
-            && hdr_native.key_phase != self.key_phase
-        {
-            // Update key phase bit; an actual key update would be triggered here if needed.
-            self.key_phase = hdr_native.key_phase;
-        }
         let space_idx = match pkt_ty {
             PacketType::Initial => 0,
             PacketType::Handshake => 1,
@@ -782,7 +809,7 @@ impl Connection {
                     }
                     off += used;
                     // Minimal: handle accounting for Stream/Crypto sizes
-                    // 0-RTT must not carry CRYPTO frames (simplified gate).
+                    // 0-RTT must not carry CRYPTO frames.
                     if pkt_ty == PacketType::ZeroRTT && matches!(frame, Frame::Crypto { .. }) {
                         continue;
                     }
@@ -1014,7 +1041,7 @@ impl Connection {
                                 PacketType::Handshake => crate::tls_provider::Level::Handshake,
                                 _ => crate::tls_provider::Level::Application,
                             };
-                            let _ = self.process_crypto_frame(lvl, offset, data);
+                            self.process_crypto_frame(lvl, offset, data)?;
                             ack_eliciting = true;
                         }
                         Frame::Ping { .. } => {
@@ -1075,6 +1102,306 @@ impl Connection {
             self.is_established = true;
         }
         Ok(len)
+    }
+
+    #[inline(always)]
+    fn tag_reserve_1rtt(&self) -> usize {
+        if self.crypto.read().seal_1rtt.is_some() {
+            16
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    fn flush_pending_control_frames(
+        &mut self,
+        out: &mut [u8],
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        while let Some(ctrl) = self.pending_control.front() {
+            let need = frames::wire_len(ctrl);
+            let tag_reserve = self.tag_reserve_1rtt();
+            if out.len() >= off + need + tag_reserve {
+                off += frames::to_bytes(ctrl, &mut out[off..])?;
+                self.pending_control.pop_front();
+            } else {
+                break;
+            }
+        }
+        Ok(off)
+    }
+
+    #[inline(always)]
+    fn maybe_emit_application_ack_frame(
+        &mut self,
+        out: &mut [u8],
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        if let Some((ack_delay, ack_ranges)) =
+            self.pkt_spaces[2].take_ack(self.config.ack_delay_exponent)
+        {
+            let ecn = if self.ecn_ect0 | self.ecn_ect1 | self.ecn_ce > 0 {
+                Some(EcnCounts { ect0: self.ecn_ect0, ect1: self.ecn_ect1, ce: self.ecn_ce })
+            } else {
+                None
+            };
+            let ack = Frame::Ack { ack_delay, ranges: ack_ranges, ecn_counts: ecn };
+            let need = frames::wire_len(&ack);
+            let tag_reserve = self.tag_reserve_1rtt();
+            let mut ack_written = false;
+            if out.len() >= off + need + tag_reserve {
+                off += frames::to_bytes(&ack, &mut out[off..])?;
+                ack_written = true;
+            }
+            if ack_written {
+                if let Some(obs) = &self.observer {
+                    if let Frame::Ack { ranges, .. } = &ack {
+                        obs.on_ack(ack_delay, ranges);
+                    }
+                }
+                if matches!(&ack, Frame::Ack { ecn_counts: Some(_), .. }) {
+                    self.ecn_ect0 = 0;
+                    self.ecn_ect1 = 0;
+                    self.ecn_ce = 0;
+                }
+                let exp = self.config.ack_delay_exponent.min(20);
+                let ack_delay_us = ack_delay << exp;
+                crate::telemetry::ACK_DELAY_LAST_US
+                    .store(ack_delay_us, std::sync::atomic::Ordering::Relaxed);
+                if let Some(obs) = self.observer.as_ref().cloned() {
+                    obs.apply_policy(self);
+                }
+            }
+        }
+        Ok(off)
+    }
+
+    #[inline(always)]
+    fn maybe_flush_one_writable_stream(
+        &mut self,
+        out: &mut [u8],
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        use crate::error::ConnectionError;
+
+        if let Some(stream_id) = self.writable_streams.front().copied() {
+            let tag_reserve = self.tag_reserve_1rtt();
+            if let Some(s) = self.streams.get_mut(&stream_id) {
+                let available = {
+                    #[cfg(not(feature = "stream_ring_buffer"))]
+                    {
+                        s.send_buf.len()
+                    }
+                    #[cfg(feature = "stream_ring_buffer")]
+                    {
+                        s.send_ring.len()
+                    }
+                };
+                if available > 0 {
+                    let header_overhead = 1
+                        + crate::transport::varint::varint_len(stream_id)
+                        + crate::transport::varint::varint_len(s.send_off)
+                        + 2;
+                    if off + header_overhead + tag_reserve < out.len() {
+                        #[cfg(not(feature = "stream_ring_buffer"))]
+                        if !s.send_buf.is_empty() {
+                            unsafe {
+                                crate::fec::prefetch_data(s.send_buf.as_ptr());
+                            }
+                        }
+                        let max_body = out.len() - off - header_overhead - tag_reserve;
+                        let conn_avail =
+                            self.peer_max_data.saturating_sub(self.conn_bytes_sent) as usize;
+                        let stream_avail = s.max_stream_data_tx.saturating_sub(s.send_off) as usize;
+                        let send_avail = conn_avail.min(stream_avail);
+                        if send_avail == 0 {
+                            self.pending_control
+                                .push_back(Frame::DataBlocked { limit: self.peer_max_data });
+                            self.pending_control.push_back(Frame::StreamDataBlocked {
+                                stream_id,
+                                limit: s.max_stream_data_tx,
+                            });
+                            return Err(ConnectionError::Done);
+                        }
+                        let body_len = std::cmp::min(max_body, available.min(send_avail));
+                        #[cfg(not(feature = "stream_ring_buffer"))]
+                        let data_vec = s.send_buf[..body_len].to_vec();
+                        #[cfg(feature = "stream_ring_buffer")]
+                        let data_vec = {
+                            let mut v = vec![0u8; body_len];
+                            let read = s.send_ring.read(&mut v[..]);
+                            if read < body_len {
+                                v.truncate(read);
+                            }
+                            v
+                        };
+                        let data_len = data_vec.len();
+                        let fin_now = {
+                            #[cfg(not(feature = "stream_ring_buffer"))]
+                            {
+                                s.send_fin && body_len == available
+                            }
+                            #[cfg(feature = "stream_ring_buffer")]
+                            {
+                                s.send_fin && s.send_ring.is_empty()
+                            }
+                        };
+                        let frame = Frame::Stream {
+                            stream_id: s.id,
+                            offset: s.send_off,
+                            data: data_vec,
+                            fin: fin_now,
+                        };
+                        let written = frames::to_bytes(&frame, &mut out[off..])?;
+                        off += written;
+                        s.send_off += data_len as u64;
+                        #[cfg(not(feature = "stream_ring_buffer"))]
+                        {
+                            s.send_buf.drain(0..data_len);
+                        }
+                        self.conn_bytes_sent = self.conn_bytes_sent.saturating_add(data_len as u64);
+                        self.stats.stream_sent_bytes += data_len as u64;
+                        let emptied = {
+                            #[cfg(not(feature = "stream_ring_buffer"))]
+                            {
+                                s.send_buf.is_empty()
+                            }
+                            #[cfg(feature = "stream_ring_buffer")]
+                            {
+                                s.send_ring.is_empty()
+                            }
+                        };
+                        if emptied && fin_now {
+                            self.writable_streams.retain(|&id| id != stream_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(off)
+    }
+
+    #[inline(always)]
+    fn maybe_flush_one_datagram_frame(
+        &mut self,
+        out: &mut [u8],
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        if let Some(front) = self.dgram_send_queue.front() {
+            #[cfg(not(feature = "zero_copy_dgram"))]
+            let need = 1 + 2 + front.len();
+            #[cfg(feature = "zero_copy_dgram")]
+            let need = 1 + 2 + front.len;
+            let tag_reserve = self.tag_reserve_1rtt();
+            if off + need + tag_reserve <= out.len() {
+                #[cfg(not(feature = "zero_copy_dgram"))]
+                {
+                    let Some(front_owned) = self.dgram_send_queue.pop_front() else {
+                        return Err(crate::error::ConnectionError::Done);
+                    };
+                    unsafe {
+                        crate::fec::prefetch_data(front_owned.as_ptr());
+                    }
+                    let frame = Frame::Datagram { data: front_owned };
+                    match frames::to_bytes(&frame, &mut out[off..]) {
+                        Ok(written) => {
+                            off += written;
+                        }
+                        Err(e) => {
+                            if let Frame::Datagram { data } = frame {
+                                self.dgram_send_queue.push_front(data);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                #[cfg(feature = "zero_copy_dgram")]
+                {
+                    let frame = Frame::Datagram { data: front.data[..front.len].to_vec() };
+                    let written = frames::to_bytes(&frame, &mut out[off..])?;
+                    off += written;
+                    let _ = self.dgram_send_queue.pop_front();
+                }
+            }
+        }
+        Ok(off)
+    }
+
+    #[inline(always)]
+    fn maybe_apply_stealth_padding(
+        &mut self,
+        out: &mut [u8],
+        pn_off: usize,
+        pn_len: usize,
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        if self.config.stealth_padding_enabled {
+            let ad_len = pn_off + pn_len;
+            let pt_len_now = off.saturating_sub(ad_len);
+            let tag_reserve = self.tag_reserve_1rtt();
+            let avail = out.len().saturating_sub(off + tag_reserve);
+            if avail > 0 {
+                let pad_len = self.compute_stealth_padding(pt_len_now, avail);
+                if pad_len > 0 {
+                    let pad = Frame::Padding { len: pad_len };
+                    let written = frames::to_bytes(&pad, &mut out[off..])?;
+                    off += written;
+                }
+            }
+        }
+        Ok(off)
+    }
+
+    #[inline(always)]
+    fn seal_short_header_packet(
+        &mut self,
+        out: &mut [u8],
+        pn: u64,
+        pn_off: usize,
+        pn_len: usize,
+        mut off: usize,
+    ) -> Result<usize, crate::error::ConnectionError> {
+        use crate::error::ConnectionError;
+
+        let crypto_guard = self.crypto.read();
+        if let Some(seal) = crypto_guard.seal_1rtt.as_deref().or(crypto_guard.seal_0rtt.as_deref())
+        {
+            let ad_len = pn_off + pn_len;
+            let (ad_slice, rest) = out.split_at_mut(ad_len);
+            let pt_len = off.saturating_sub(ad_len);
+            let sealed_len = seal.seal_with_u64_counter(pn, ad_slice, rest, pt_len, None)?;
+            off = ad_len + sealed_len;
+            let hp = if crypto_guard.seal_1rtt.is_some() {
+                crypto_guard.hp_1rtt.as_deref()
+            } else {
+                crypto_guard.hp_0rtt.as_deref().or(crypto_guard.hp_1rtt.as_deref())
+            };
+            if let Some(hp) = hp {
+                if off >= pn_off + 4 + packet::SAMPLE_LEN {
+                    let sample = &out[pn_off + 4..pn_off + 4 + packet::SAMPLE_LEN];
+                    let mut first_orig = 0x40 | (((pn_len as u8) - 1) & 0x03);
+                    if self.key_phase {
+                        first_orig |= packet::KEY_PHASE_BIT;
+                    }
+                    let mask = hp.new_mask(sample);
+                    out[0] = first_orig ^ (mask[0] & 0x1f);
+                    for i in 0..pn_len {
+                        out[pn_off + i] ^= mask[i + 1];
+                    }
+                } else {
+                    out[0] = (0x40 | (((pn_len as u8) - 1) & 0x03))
+                        | if self.key_phase { packet::KEY_PHASE_BIT } else { 0 };
+                }
+            } else {
+                out[0] = (0x40 | (((pn_len as u8) - 1) & 0x03))
+                    | if self.key_phase { packet::KEY_PHASE_BIT } else { 0 };
+            }
+            self.next_send_pn_by_space[2] = self.next_send_pn_by_space[2].wrapping_add(1);
+            Ok(off)
+        } else {
+            Err(ConnectionError::TlsError("missing AEAD sealer for short-header packet".into()))
+        }
     }
 
     /// Generates outgoing packet
@@ -1340,277 +1667,13 @@ impl Connection {
             }
         }
 
-        // Flush pending control frames first (MAX_DATA / MAX_STREAM_DATA)
-        while let Some(ctrl) = self.pending_control.front().cloned() {
-            let need = frames::wire_len(&ctrl);
-            // Leave space for AEAD tag (16 bytes) if we will encrypt
-            let tag_reserve = if self.crypto.read().seal_1rtt.is_some() { 16 } else { 0 };
-            if out.len() >= off + need + tag_reserve {
-                off += frames::to_bytes(&ctrl, &mut out[off..])?;
-                self.pending_control.pop_front();
-            } else {
-                break;
-            }
-        }
-        // If we have anything to ack, emit an ACK frame
-        // Prefer Application epoch for outgoing short header ACKs
-        if let Some((ack_delay, ack_ranges)) =
-            self.pkt_spaces[2].take_ack(self.config.ack_delay_exponent)
-        {
-            let ecn = if self.ecn_ect0 | self.ecn_ect1 | self.ecn_ce > 0 {
-                Some(EcnCounts { ect0: self.ecn_ect0, ect1: self.ecn_ect1, ce: self.ecn_ce })
-            } else {
-                None
-            };
-            let ack = Frame::Ack { ack_delay, ranges: ack_ranges, ecn_counts: ecn };
-            let need = frames::wire_len(&ack);
-            let tag_reserve = if self.crypto.read().seal_1rtt.is_some() { 16 } else { 0 };
-            let mut ack_written = false;
-            if out.len() >= off + need + tag_reserve {
-                off += frames::to_bytes(&ack, &mut out[off..])?;
-                ack_written = true;
-            }
-            if ack_written {
-                if let Some(obs) = &self.observer {
-                    if let Frame::Ack { ranges, .. } = &ack {
-                        obs.on_ack(ack_delay, ranges);
-                    }
-                }
-                // Reset ECN counters after emitting ACK with ECN
-                if matches!(&ack, Frame::Ack { ecn_counts: Some(_), .. }) {
-                    self.ecn_ect0 = 0;
-                    self.ecn_ect1 = 0;
-                    self.ecn_ce = 0;
-                }
-                // Telemetry: record effective ACK delay in microseconds (ack_delay << exponent)
-                let exp = self.config.ack_delay_exponent.min(20);
-                let ack_delay_us = ack_delay << exp;
-                crate::telemetry::ACK_DELAY_LAST_US
-                    .store(ack_delay_us, std::sync::atomic::Ordering::Relaxed);
-                // Allow observer to apply transport policy based on latest telemetry
-                // Clone Arc to avoid borrow conflict when passing &mut self
-                if let Some(obs) = self.observer.as_ref().cloned() {
-                    obs.apply_policy(self);
-                }
-            }
-        }
-        // Try to flush one writable stream
-        if let Some(stream_id) = self.writable_streams.front().copied() {
-            // Carry payload for FEC out of the mutable borrow scope to avoid borrow conflicts
-            if let Some(s) = self.streams.get_mut(&stream_id) {
-                // Determine available bytes depending on buffer implementation
-                let available = {
-                    #[cfg(not(feature = "stream_ring_buffer"))]
-                    {
-                        s.send_buf.len()
-                    }
-                    #[cfg(feature = "stream_ring_buffer")]
-                    {
-                        s.send_ring.len()
-                    }
-                };
-                if available > 0 {
-                    // Estimate header overhead for stream frame
-                    let header_overhead = 1
-                        + crate::transport::varint::varint_len(stream_id)
-                        + crate::transport::varint::varint_len(s.send_off)
-                        + 2;
-                    let tag_reserve = if self.crypto.read().seal_1rtt.is_some() { 16 } else { 0 };
-                    if off + header_overhead + tag_reserve < out.len() {
-                        // Prefetch stream payload buffer to speed up copy/read
-                        #[cfg(not(feature = "stream_ring_buffer"))]
-                        if !s.send_buf.is_empty() {
-                            unsafe {
-                                crate::fec::prefetch_data(s.send_buf.as_ptr());
-                            }
-                        }
-                        let max_body = out.len() - off - header_overhead - tag_reserve;
-                        // Respect sender flow control
-                        let conn_avail =
-                            self.peer_max_data.saturating_sub(self.conn_bytes_sent) as usize;
-                        let stream_avail = s.max_stream_data_tx.saturating_sub(s.send_off) as usize;
-                        let send_avail = conn_avail.min(stream_avail);
-                        if send_avail == 0 {
-                            self.pending_control
-                                .push_back(Frame::DataBlocked { limit: self.peer_max_data });
-                            self.pending_control.push_back(Frame::StreamDataBlocked {
-                                stream_id,
-                                limit: s.max_stream_data_tx,
-                            });
-                            return Err(ConnectionError::Done);
-                        }
-                        let body_len = std::cmp::min(max_body, available.min(send_avail));
-                        // Build frame payload depending on buffer implementation
-                        #[cfg(not(feature = "stream_ring_buffer"))]
-                        let data_vec = s.send_buf[..body_len].to_vec();
-                        #[cfg(feature = "stream_ring_buffer")]
-                        let data_vec = {
-                            let mut v = vec![0u8; body_len];
-                            let read = s.send_ring.read(&mut v[..]);
-                            if read < body_len {
-                                v.truncate(read);
-                            }
-                            v
-                        };
-                        let data_len = data_vec.len();
-                        let fin_now = {
-                            #[cfg(not(feature = "stream_ring_buffer"))]
-                            {
-                                s.send_fin && body_len == available
-                            }
-                            #[cfg(feature = "stream_ring_buffer")]
-                            {
-                                s.send_fin && s.send_ring.is_empty()
-                            }
-                        };
-                        let frame = Frame::Stream {
-                            stream_id: s.id,
-                            offset: s.send_off,
-                            data: data_vec,
-                            fin: fin_now,
-                        };
-                        let written = frames::to_bytes(&frame, &mut out[off..])?;
-                        off += written;
-                        s.send_off += data_len as u64;
-                        #[cfg(not(feature = "stream_ring_buffer"))]
-                        {
-                            s.send_buf.drain(0..data_len);
-                        }
-                        self.conn_bytes_sent = self.conn_bytes_sent.saturating_add(data_len as u64);
-                        self.stats.stream_sent_bytes += data_len as u64;
-                        // FEC feeding removed (Core-FEC handles redundancy outside transport)
-                        let emptied = {
-                            #[cfg(not(feature = "stream_ring_buffer"))]
-                            {
-                                s.send_buf.is_empty()
-                            }
-                            #[cfg(feature = "stream_ring_buffer")]
-                            {
-                                s.send_ring.is_empty()
-                            }
-                        };
-                        if emptied && fin_now {
-                            self.writable_streams.retain(|&id| id != stream_id);
-                        }
-                    }
-                }
-            }
-        }
+        off = self.flush_pending_control_frames(out, off)?;
+        off = self.maybe_emit_application_ack_frame(out, off)?;
+        off = self.maybe_flush_one_writable_stream(out, off)?;
         // FEC feed removed (handled by core)
-
-        // Flush one DATAGRAM frame if space allows
-        if let Some(front) = self.dgram_send_queue.front() {
-            // type (1) + length (2) + data
-            #[cfg(not(feature = "zero_copy_dgram"))]
-            let need = 1 + 2 + front.len();
-            #[cfg(feature = "zero_copy_dgram")]
-            let need = 1 + 2 + front.len;
-            let tag_reserve = if self.crypto.read().seal_1rtt.is_some() { 16 } else { 0 };
-            if off + need + tag_reserve <= out.len() {
-                #[cfg(not(feature = "zero_copy_dgram"))]
-                {
-                    let Some(front_owned) = self.dgram_send_queue.pop_front() else {
-                        return Err(ConnectionError::Done);
-                    };
-                    // Prefetch datagram payload buffer before encode
-                    unsafe {
-                        crate::fec::prefetch_data(front_owned.as_ptr());
-                    }
-                    let frame = Frame::Datagram { data: front_owned };
-                    match frames::to_bytes(&frame, &mut out[off..]) {
-                        Ok(written) => {
-                            off += written;
-                        }
-                        Err(e) => {
-                            if let Frame::Datagram { data } = frame {
-                                self.dgram_send_queue.push_front(data);
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                #[cfg(feature = "zero_copy_dgram")]
-                {
-                    let frame = Frame::Datagram { data: front.data[..front.len].to_vec() };
-                    let written = frames::to_bytes(&frame, &mut out[off..])?;
-                    off += written;
-                    // Remove from queue after encoding
-                    let _ = self.dgram_send_queue.pop_front();
-                }
-            }
-        }
-
-        // Stealth padding before sealing (so padding is authenticated and encrypted)
-        if self.config.stealth_padding_enabled {
-            let ad_len = pn_off + pn_len;
-            let pt_len_now = off.saturating_sub(ad_len);
-            let tag_reserve = if self.crypto.read().seal_1rtt.is_some() { 16 } else { 0 };
-            let avail = out.len().saturating_sub(off + tag_reserve);
-            if avail > 0 {
-                let pad_len = self.compute_stealth_padding(pt_len_now, avail);
-                if pad_len > 0 {
-                    let pad = Frame::Padding { len: pad_len };
-                    let written = frames::to_bytes(&pad, &mut out[off..])?;
-                    off += written;
-                }
-            }
-        }
-
-        // If we have AEAD secrets, seal payload and apply header protection.
-        // Prefer 1-RTT sealer, otherwise fall back to 0-RTT.
-        let crypto_guard = self.crypto.read();
-        if let Some(seal) = crypto_guard.seal_1rtt.as_deref().or(crypto_guard.seal_0rtt.as_deref())
-        {
-            // Associated data is header (first byte + DCID + PN)
-            let ad_len = pn_off + pn_len;
-            // Seal in place using disjoint slices for AD and payload
-            let (ad_slice, rest) = out.split_at_mut(ad_len);
-            let pt_len = off.saturating_sub(ad_len);
-            let sealed_len = seal.seal_with_u64_counter(pn, ad_slice, rest, pt_len, None)?;
-            off = ad_len + sealed_len; // include tag
-                                       // Apply header protection using sample starting at pn_off + 4
-            let hp = if crypto_guard.seal_1rtt.is_some() {
-                crypto_guard.hp_1rtt.as_deref()
-            } else {
-                crypto_guard.hp_0rtt.as_deref().or(crypto_guard.hp_1rtt.as_deref())
-            };
-            if let Some(hp) = hp {
-                // Only apply header protection if the actual packet length contains the sample.
-                // `out.len()` is the caller-provided capacity and may be far larger than the
-                // bytes we wrote into this packet.
-                if off >= pn_off + 4 + packet::SAMPLE_LEN {
-                    let sample = &out[pn_off + 4..pn_off + 4 + packet::SAMPLE_LEN];
-                    // Original first byte: fixed bit + PN len-1 (+ KeyPhase ggf.)
-                    let mut first_orig = 0x40 | (((pn_len as u8) - 1) & 0x03);
-                    if self.key_phase {
-                        first_orig |= packet::KEY_PHASE_BIT;
-                    }
-                    // XOR-mask first and PN bytes
-                    let mask = hp.new_mask(sample);
-                    // first
-                    let protected_first = first_orig ^ (mask[0] & 0x1f);
-                    out[0] = protected_first;
-                    // pn bytes
-                    for i in 0..pn_len {
-                        out[pn_off + i] ^= mask[i + 1];
-                    }
-                } else {
-                    // If sample not available due to tiny payload, leave header unprotected
-                    out[0] = (0x40 | (((pn_len as u8) - 1) & 0x03))
-                        | if self.key_phase { packet::KEY_PHASE_BIT } else { 0 };
-                }
-            } else {
-                // No HP: write original first byte (no key phase)
-                out[0] = (0x40 | (((pn_len as u8) - 1) & 0x03))
-                    | if self.key_phase { packet::KEY_PHASE_BIT } else { 0 };
-            }
-            // Advance send PN
-            self.next_send_pn_by_space[2] = self.next_send_pn_by_space[2].wrapping_add(1);
-        } else {
-            // No AEAD configured: keep plaintext header/payload
-            out[0] = (0x40 | (((pn_len as u8) - 1) & 0x03))
-                | if self.key_phase { packet::KEY_PHASE_BIT } else { 0 };
-        }
+        off = self.maybe_flush_one_datagram_frame(out, off)?;
+        off = self.maybe_apply_stealth_padding(out, pn_off, pn_len, off)?;
+        off = self.seal_short_header_packet(out, pn, pn_off, pn_len, off)?;
 
         // Mark bytes-in-flight timing start if we actually wrote payload beyond header
         if off > (pn_off + pn_len) && self.bytes_in_flight_started.is_none() {
@@ -1704,13 +1767,31 @@ impl Connection {
         self.key_phase = enabled;
     }
 
-    /// Performs a 1-RTT key update (simplified, synced for read/write) and toggles the header bit.
-    pub fn key_update(&mut self) {
-        {
-            let mut crypto = self.crypto.write();
-            crypto.key_update_1rtt();
+    fn try_advance_read_keys(&mut self) -> bool {
+        let provider_updated = self
+            .tls_provider
+            .as_mut()
+            .map(|provider| provider.key_update_read().is_ok())
+            .unwrap_or(false);
+        if provider_updated {
+            return true;
         }
-        self.key_phase = !self.key_phase;
+        self.crypto.write().key_update_1rtt_read()
+    }
+
+    /// Performs a local 1-RTT write key update and toggles the short-header key phase bit.
+    pub fn key_update(&mut self) {
+        let mut updated = self
+            .tls_provider
+            .as_mut()
+            .map(|provider| provider.key_update_write().is_ok())
+            .unwrap_or(false);
+        if !updated {
+            updated = self.crypto.write().key_update_1rtt_write();
+        }
+        if updated {
+            self.key_phase = !self.key_phase;
+        }
     }
 
     /// Receives data from a stream
@@ -2039,9 +2120,9 @@ impl Connection {
     pub fn fec_escalation_threshold(&self) -> f32 {
         self.fec_escalation_threshold
     }
-    /// Whether path is validated (minimal: true for now)
-    pub fn is_path_validated(&self, _from: SocketAddr, _to: SocketAddr) -> bool {
-        true
+    /// Whether the queried path matches the currently active validated path.
+    pub fn is_path_validated(&self, from: SocketAddr, to: SocketAddr) -> bool {
+        from == self.local_addr && to == self.peer_addr
     }
     /// Returns true if the connection is draining
     pub fn is_draining(&self) -> bool {

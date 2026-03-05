@@ -38,7 +38,6 @@ It is generated from all non-ignored files (respecting ignore rules) and is inte
 |-- .gitattributes
 |-- .github
 |   `-- workflows
-|       |-- build-quiche.yml
 |       |-- ci.yml
 |       `-- clippy-matrix.yml
 |-- .gitignore

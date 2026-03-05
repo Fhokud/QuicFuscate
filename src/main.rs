@@ -3024,12 +3024,37 @@ async fn run_server(
     if let Some(addr) = admin_web {
         let admin_user = admin_web_user
             .or_else(|| std::env::var("QUICFUSCATE_ADMIN_USER").ok())
-            .and_then(|u| if u.trim().is_empty() { None } else { Some(u) })
-            .unwrap_or_else(|| "admin".to_string());
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--admin-web requires --admin-web-user or QUICFUSCATE_ADMIN_USER",
+                )
+            })?;
         let admin_password = admin_web_password
             .or_else(|| std::env::var("QUICFUSCATE_ADMIN_PASSWORD").ok())
-            .and_then(|p| if p.is_empty() { None } else { Some(p) })
-            .unwrap_or_else(|| "123".to_string());
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--admin-web requires --admin-web-password or QUICFUSCATE_ADMIN_PASSWORD",
+                )
+            })?;
+        if admin_user == "admin" && admin_password == "123" {
+            let allow_weak_defaults = std::env::var("QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS")
+                .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !allow_weak_defaults {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Refusing weak default admin credentials [admin/123]. Set QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS=1 only for controlled test environments.",
+                ));
+            }
+            warn!(
+                "Admin web weak defaults [admin/123] explicitly allowed by QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS."
+            );
+        }
         let logging_mode = Arc::new(parking_lot::RwLock::new(initial_logging_mode));
         let handler = ServerAdminHttpHandler {
             metrics: metrics.clone(),

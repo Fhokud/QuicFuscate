@@ -25,13 +25,13 @@ export function LoginModal({
   void _error;
 
   const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("admin");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setUsername("admin");
-    setPassword("admin");
+    setPassword("");
   }, [open]);
 
   const usernameError = useMemo(() => {

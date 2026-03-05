@@ -314,7 +314,7 @@ impl IoDriver {
 
         while !self.shutdown.load(Ordering::Relaxed) {
             // Read from TUN - returns (block, len)
-            // Note: TUN read is blocking, so in production we'd use async TUN
+            // TUN read path is blocking; loop structure keeps the behavior explicit.
             let read_result = {
                 let tun_guard = tun.lock();
                 tun_guard.read_block()

@@ -256,9 +256,14 @@ pub mod chacha20poly1305 {
         }
 
         #[inline(always)]
-        fn make_nonce(&self, _counter: u64) -> [u8; 12] {
-            // RFC 8439: 96-bit nonce is separate; counter is the 32-bit block counter parameter.
-            self.nonce
+        fn make_nonce(&self, counter: u64) -> [u8; 12] {
+            // QUIC/TLS style nonce construction: nonce = base_iv XOR packet_number.
+            let mut nonce = self.nonce;
+            let seq = counter.to_be_bytes();
+            for (idx, b) in seq.iter().enumerate() {
+                nonce[4 + idx] ^= *b;
+            }
+            nonce
         }
 
         #[inline(always)]
@@ -298,11 +303,9 @@ pub mod chacha20poly1305 {
             let (pt, rest) = buf.split_at_mut(len);
 
             let nonce12 = self.make_nonce(counter);
-            let mut ctr = (counter & 0xffff_ffff) as u32;
-            let poly_key = self.one_time_key(ctr, &nonce12);
-            ctr = ctr.wrapping_add(1);
+            let poly_key = self.one_time_key(0, &nonce12);
 
-            self.process_in_place(ctr, &nonce12, pt);
+            self.process_in_place(1, &nonce12, pt);
 
             let tag = poly1305::aead_tag_chacha20poly1305(ad, pt, &poly_key);
             rest[..16].copy_from_slice(&tag);
@@ -326,16 +329,14 @@ pub mod chacha20poly1305 {
             tag.copy_from_slice(&tag_in[..16]);
 
             let nonce12 = self.make_nonce(counter);
-            let mut ctr = (counter & 0xffff_ffff) as u32;
-            let poly_key = self.one_time_key(ctr, &nonce12);
-            ctr = ctr.wrapping_add(1);
+            let poly_key = self.one_time_key(0, &nonce12);
 
             let tag_calc = poly1305::aead_tag_chacha20poly1305(ad, ct, &poly_key);
             if !crate::crypto::subtle_ct_eq(&tag_calc, &tag) {
                 return Err(ConnectionError::CryptoFail);
             }
 
-            self.process_in_place(ctr, &nonce12, ct);
+            self.process_in_place(1, &nonce12, ct);
             Ok(ct_len)
         }
     }

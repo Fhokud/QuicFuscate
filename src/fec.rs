@@ -1213,7 +1213,7 @@ impl TransportObserver for FecTransportObserver {
     }
 
     fn on_packet_recv(&self, _pn: u64, _pt_len: usize) {
-        // No-op for now. Could be used to approximate delivery-rate if needed.
+        // Hook reserved for future receive-side delivery-rate sampling.
     }
 
     fn on_ecn_update(&self, ect0: u64, ect1: u64, ce: u64) {

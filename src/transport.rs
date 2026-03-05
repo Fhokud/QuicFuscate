@@ -383,7 +383,7 @@ pub const MAX_PKT_NUM_LEN: usize = 4;
 //
 // Packet type bits are defined within the `packet` module to avoid duplication
 
-/// Congestion control choices (kept in parity with quiche).
+/// Congestion control choices supported by the in-tree QUIC transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CongestionControlAlgorithm {
     Reno,
@@ -618,7 +618,7 @@ impl ConnectionId {
     }
 }
 
-/// Minimal ConnectionIdSet to track active IDs (subset of quiche::cid)
+/// Minimal ConnectionIdSet to track active IDs.
 pub const MIN_CLIENT_INITIAL_LEN: usize = 1200;
 
 /// Initial window size
@@ -762,8 +762,8 @@ pub enum Error {
     Done,
     /// FEC error
     Fec,
-    /// Quiche error
-    Quiche,
+    /// Generic transport backend error
+    Transport,
 
     /// Buffer is too short
     BufferTooShort,

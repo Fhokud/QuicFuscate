@@ -14,6 +14,29 @@ use quicfuscate::transport::h3::NameValue;
 use quicfuscate::transport::packet::PacketType;
 use quicfuscate::transport::{Config, ConnectionId, RecvInfo, PROTOCOL_VERSION};
 
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 fn mk_hex(ch: char) -> String {
     std::iter::repeat_n(ch, 64).collect()
 }
@@ -341,6 +364,7 @@ fn qkey_http3_auth_accepts_valid_and_rejects_invalid_token() {
         .name("qkey_auth_integration".to_string())
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
+            let _allow_invalid_guard = ScopedEnvVar::set("QUICFUSCATE_ALLOW_INVALID_CERTS", "1");
             let good_token = mk_hex('a');
             let bad_token = mk_hex('b');
 

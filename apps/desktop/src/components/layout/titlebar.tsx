@@ -5,7 +5,7 @@ export function Titlebar() {
         QuicFuscate
       </span>
       <span className="text-[9px] text-text-ghost/40 tabular-nums">
-        v0.1.0
+        v0.2.0
       </span>
     </header>
   );

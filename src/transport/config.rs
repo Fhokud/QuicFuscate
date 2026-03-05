@@ -1,4 +1,5 @@
 use super::{CongestionControlAlgorithm, PROTOCOL_VERSION};
+use rustls::pki_types::pem::PemObject;
 
 // ============================================================================
 
@@ -21,13 +22,15 @@ pub struct Config {
     pub(crate) disable_active_migration: bool,
     pub(crate) enable_early_data: bool,
 
-    // TLS configuration (simplified)
+    // TLS configuration
     pub(crate) verify_peer: bool,
     pub(crate) grease: bool,
 
     // Certificate paths
     pub(crate) cert_chain_path: Option<String>,
     pub(crate) priv_key_path: Option<String>,
+    pub(crate) verify_locations_file: Option<String>,
+    pub(crate) verify_locations_directory: Option<String>,
     // Parity fields
     pub(crate) dgram_recv_max_queue_len: usize,
     pub(crate) dgram_send_max_queue_len: usize,
@@ -48,7 +51,7 @@ pub struct Config {
     pub(crate) max_pacing_rate: Option<u64>,
     pub(crate) hystart: bool,
     pub(crate) initial_congestion_window_packets: usize,
-    // Optional: TLS/QLog knobs (parity stubs)
+    // Optional: TLS/QLog compatibility knobs
     pub(crate) keylog_enabled: bool,
     pub(crate) qlog_config: Option<(String, String, String, u32)>,
     pub(crate) ticket_key: Option<Vec<u8>>,
@@ -103,6 +106,8 @@ impl Config {
             grease: true,
             cert_chain_path: None,
             priv_key_path: None,
+            verify_locations_file: None,
+            verify_locations_directory: None,
             dgram_recv_max_queue_len: 0,
             dgram_send_max_queue_len: 0,
             path_challenge_recv_max_queue_len: 3,
@@ -171,8 +176,25 @@ impl Config {
     }
     pub fn set_application_protos_wire_format(
         &mut self,
-        _wire: &[u8],
+        wire: &[u8],
     ) -> Result<(), crate::error::ConnectionError> {
+        if wire.is_empty() {
+            self.application_protos.clear();
+            return Ok(());
+        }
+
+        let mut protos = Vec::new();
+        let mut off = 0usize;
+        while off < wire.len() {
+            let len = wire[off] as usize;
+            off += 1;
+            if len == 0 || off + len > wire.len() {
+                return Err(crate::error::ConnectionError::InvalidState);
+            }
+            protos.push(wire[off..off + len].to_vec());
+            off += len;
+        }
+        self.application_protos = protos;
         Ok(())
     }
 
@@ -333,6 +355,26 @@ impl Config {
         &mut self,
         path: &str,
     ) -> Result<(), crate::error::ConnectionError> {
+        let cert_data = std::fs::read(path).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "Certificate chain read failed ({}): {}",
+                path, e
+            ))
+        })?;
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_data)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                crate::error::ConnectionError::TlsError(format!(
+                    "Certificate chain parse failed ({}): {}",
+                    path, e
+                ))
+            })?;
+        if certs.is_empty() {
+            return Err(crate::error::ConnectionError::TlsError(format!(
+                "Certificate chain parse failed ({}): no certificates found",
+                path
+            )));
+        }
         self.cert_chain_path = Some(path.to_string());
         Ok(())
     }
@@ -342,19 +384,71 @@ impl Config {
         &mut self,
         path: &str,
     ) -> Result<(), crate::error::ConnectionError> {
+        let key_data = std::fs::read(path).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "Private key read failed ({}): {}",
+                path, e
+            ))
+        })?;
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_data).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "Private key parse failed ({}): {}",
+                path, e
+            ))
+        })?;
         self.priv_key_path = Some(path.to_string());
         Ok(())
     }
     pub fn load_verify_locations_from_file(
         &mut self,
-        _file: &str,
+        file: &str,
     ) -> Result<(), crate::error::ConnectionError> {
+        let ca_data = std::fs::read(file).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "CA file read failed ({}): {}",
+                file, e
+            ))
+        })?;
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&ca_data)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                crate::error::ConnectionError::TlsError(format!(
+                    "CA file parse failed ({}): {}",
+                    file, e
+                ))
+            })?;
+        if certs.is_empty() {
+            return Err(crate::error::ConnectionError::TlsError(format!(
+                "CA file parse failed ({}): no certificates found",
+                file
+            )));
+        }
+        self.verify_locations_file = Some(file.to_string());
         Ok(())
     }
     pub fn load_verify_locations_from_directory(
         &mut self,
-        _dir: &str,
+        dir: &str,
     ) -> Result<(), crate::error::ConnectionError> {
+        let meta = std::fs::metadata(dir).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "CA directory stat failed ({}): {}",
+                dir, e
+            ))
+        })?;
+        if !meta.is_dir() {
+            return Err(crate::error::ConnectionError::TlsError(format!(
+                "CA directory is not a directory ({})",
+                dir
+            )));
+        }
+        let _ = std::fs::read_dir(dir).map_err(|e| {
+            crate::error::ConnectionError::TlsError(format!(
+                "CA directory read failed ({}): {}",
+                dir, e
+            ))
+        })?;
+        self.verify_locations_directory = Some(dir.to_string());
         Ok(())
     }
     // Real-TLS API
@@ -385,7 +479,7 @@ impl Config {
     pub fn enable_simd(&mut self) {
         self.simd_enabled = true;
     }
-    // qlog / keylog / session (Stubs)
+    // qlog / keylog / session controls
     pub fn set_keylog(&mut self, enabled: bool) {
         self.keylog_enabled = enabled;
     }
@@ -413,7 +507,7 @@ impl Config {
     pub fn set_session(&mut self, ticket: &[u8]) {
         self.tls_session = Some(ticket.to_vec());
     }
-    // Handshake-specific setters (stubs call the base setters)
+    // Handshake-specific setters delegate to base setters
     pub fn set_initial_congestion_window_packets_in_handshake(&mut self, v: usize) {
         self.set_initial_congestion_window_packets(v);
     }

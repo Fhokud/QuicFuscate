@@ -3,15 +3,17 @@
 use super::traits::*;
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::Mutex;
 
 /// macOS platform backend.
 pub struct MacOSPlatform {
     utun_counter: std::sync::atomic::AtomicU32,
+    dns_service: Mutex<Option<String>>,
 }
 
 impl MacOSPlatform {
     pub fn new() -> Self {
-        Self { utun_counter: std::sync::atomic::AtomicU32::new(10) }
+        Self { utun_counter: std::sync::atomic::AtomicU32::new(10), dns_service: Mutex::new(None) }
     }
 
     /// Run route command.
@@ -41,6 +43,98 @@ impl MacOSPlatform {
             )));
         }
         Ok(())
+    }
+
+    fn run_networksetup(&self, args: &[&str]) -> Result<(), PlatformError> {
+        let status = Command::new("networksetup")
+            .args(args)
+            .status()
+            .map_err(|e| PlatformError::DnsError(e.to_string()))?;
+        if !status.success() {
+            return Err(PlatformError::DnsError(format!("networksetup {} failed", args.join(" "))));
+        }
+        Ok(())
+    }
+
+    fn detect_default_interface(&self) -> Result<String, PlatformError> {
+        let output = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .map_err(|e| PlatformError::CommandFailed(e.to_string()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("interface:") {
+                let iface = rest.trim();
+                if !iface.is_empty() {
+                    return Ok(iface.to_string());
+                }
+            }
+        }
+        Err(PlatformError::DnsError("Could not determine default network interface".to_string()))
+    }
+
+    fn resolve_network_service_for_device(&self, device: &str) -> Result<String, PlatformError> {
+        let output = Command::new("networksetup")
+            .args(["-listnetworkserviceorder"])
+            .output()
+            .map_err(|e| PlatformError::DnsError(e.to_string()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let mut current_service: Option<String> = None;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('(') && trimmed.contains("Hardware Port:") {
+                if let Some(idx) = trimmed.find("Device:") {
+                    let dev = trimmed[idx + "Device:".len()..].trim().trim_end_matches(')').trim();
+                    if dev == device {
+                        if let Some(service) = current_service {
+                            return Ok(service);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if let Some(pos) = trimmed.find(')') {
+                let service = trimmed[pos + 1..].trim().trim_start_matches('*').trim();
+                if !service.is_empty() {
+                    current_service = Some(service.to_string());
+                }
+            }
+        }
+
+        Err(PlatformError::DnsError(format!(
+            "Could not map interface '{}' to a network service",
+            device
+        )))
+    }
+
+    fn dns_service_name(&self) -> Result<String, PlatformError> {
+        if let Some(existing) = self.dns_service.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(existing);
+        }
+        let iface = self.detect_default_interface()?;
+        let service = self.resolve_network_service_for_device(&iface)?;
+        *self.dns_service.lock().unwrap_or_else(|e| e.into_inner()) = Some(service.clone());
+        Ok(service)
+    }
+
+    fn prefix_to_netmask(prefix: u8) -> String {
+        if prefix == 0 {
+            return "0.0.0.0".to_string();
+        }
+        if prefix >= 32 {
+            return "255.255.255.255".to_string();
+        }
+        let mask: u32 = !((1u32 << (32 - prefix)) - 1);
+        format!(
+            "{}.{}.{}.{}",
+            (mask >> 24) & 0xFF,
+            (mask >> 16) & 0xFF,
+            (mask >> 8) & 0xFF,
+            mask & 0xFF
+        )
     }
 }
 
@@ -88,7 +182,7 @@ impl PlatformBackend for MacOSPlatform {
             &config.address.to_string(),
             &config.address.to_string(), // Point-to-point
             "netmask",
-            "255.255.255.0",
+            &Self::prefix_to_netmask(config.netmask),
             "mtu",
             &config.mtu.to_string(),
             "up",
@@ -133,26 +227,14 @@ impl PlatformBackend for MacOSPlatform {
     }
 
     fn set_dns(&self, config: &DnsConfig) -> Result<(), PlatformError> {
-        // Use scutil to set DNS
-        // networksetup -setdnsservers "Wi-Fi" 1.1.1.1 8.8.8.8
-
-        // Get network service name (simplified - assumes Wi-Fi)
-        let service = "Wi-Fi";
-
-        let mut args = vec!["-setdnsservers", service];
-        let server_strs: Vec<String> = config.servers.iter().map(|s| s.to_string()).collect();
-        for s in &server_strs {
-            args.push(s);
+        let service = self.dns_service_name()?;
+        let mut args = vec!["-setdnsservers".to_string(), service];
+        args.extend(config.servers.iter().map(|s| s.to_string()));
+        if config.servers.is_empty() {
+            args.push("Empty".to_string());
         }
-
-        let status = Command::new("networksetup")
-            .args(&args)
-            .status()
-            .map_err(|e| PlatformError::DnsError(e.to_string()))?;
-
-        if !status.success() {
-            log::warn!("networksetup DNS failed, trying scutil");
-        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_networksetup(&arg_refs)?;
 
         log::info!("DNS configured: {:?}", config.servers);
         Ok(())
@@ -160,7 +242,8 @@ impl PlatformBackend for MacOSPlatform {
 
     fn restore_dns(&self) -> Result<(), PlatformError> {
         // Reset DNS to DHCP
-        let _ = Command::new("networksetup").args(["-setdnsservers", "Wi-Fi", "Empty"]).status();
+        let service = self.dns_service_name()?;
+        self.run_networksetup(&["-setdnsservers", &service, "Empty"])?;
 
         log::info!("DNS restored to DHCP");
         Ok(())

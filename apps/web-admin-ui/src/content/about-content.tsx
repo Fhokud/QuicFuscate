@@ -15,7 +15,7 @@ export const ABOUT_PAGE_CONTENT = {
     { key: "UI", value: "React | Tauri [App]" },
   ] as const satisfies readonly SpecLine[],
   footer: ["Censorship-resistant VPN tunneling", "over obfuscated QUIC transport"],
-  defaultVersion: "v0.1.0",
+  defaultVersion: "v0.2.0",
   defaultVersionLoading: "Loading...",
   defaultVersionUnavailable: "Unknown",
 } as const;

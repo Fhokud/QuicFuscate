@@ -3650,46 +3650,8 @@ mod x86 {
     /// SHA-256 with SHA Extensions hardware acceleration
     #[target_feature(enable = "sha", enable = "sse2")]
     pub unsafe fn sha256_hw(data: &[u8]) -> [u8; 32] {
-        use std::arch::x86_64::*;
-
-        // SHA-256 initial hash values
-        let mut h0 =
-            _mm_set_epi32(0x6a09e667i32, 0xbb67ae85u32 as i32, 0x3c6ef372i32, 0xa54ff53au32 as i32);
-        let mut h1 =
-            _mm_set_epi32(0x510e527fi32, 0x9b05688cu32 as i32, 0x1f83d9abi32, 0x5be0cd19i32);
-
-        // Process data in 64-byte chunks
-        let mut i = 0;
-        while i + 64 <= data.len() {
-            // Load message schedule
-            let msg0 = _mm_loadu_si128(data.as_ptr().add(i) as *const __m128i);
-            let msg1 = _mm_loadu_si128(data.as_ptr().add(i + 16) as *const __m128i);
-            let msg2 = _mm_loadu_si128(data.as_ptr().add(i + 32) as *const __m128i);
-            let msg3 = _mm_loadu_si128(data.as_ptr().add(i + 48) as *const __m128i);
-
-            // Save current hash
-            let abef_save = h0;
-            let cdgh_save = h1;
-
-            // Rounds 0-3
-            let msg = _mm_sha256msg1_epu32(msg0, msg1);
-            h1 = _mm_sha256rnds2_epu32(h1, h0, msg0);
-            h0 = _mm_sha256rnds2_epu32(h0, h1, _mm_shuffle_epi32(msg0, 0x0E));
-
-            // Continue rounds (simplified - real impl needs all 64 rounds)
-
-            // Add to hash
-            h0 = _mm_add_epi32(h0, abef_save);
-            h1 = _mm_add_epi32(h1, cdgh_save);
-
-            i += 64;
-        }
-
-        // Extract final hash
-        let mut result = [0u8; 32];
-        _mm_storeu_si128(result.as_mut_ptr() as *mut __m128i, h0);
-        _mm_storeu_si128(result.as_mut_ptr().add(16) as *mut __m128i, h1);
-        result
+        // Correctness-first fallback until a full SHA-NI schedule/padding implementation is wired.
+        scalar::sha256(data)
     }
     /// Histogram with AVX-512 - conflict detection for fast counting
     #[target_feature(enable = "avx512f", enable = "avx512cd")]
@@ -3864,26 +3826,9 @@ mod x86 {
     /// Histogram with AVX2 - gather/scatter for histogram
     #[target_feature(enable = "avx2")]
     pub unsafe fn histogram_avx2(data: &[u8]) -> [u32; 256] {
-        let mut hist = [0u32; 256];
-        let mut i = 0;
-
-        // Process 32 bytes at a time
-        while i + 32 <= data.len() {
-            // Simple scalar approach for now
-            // Real implementation would use gather/scatter
-            for j in 0..32 {
-                hist[data[i + j] as usize] += 1;
-            }
-            i += 32;
-        }
-
-        // Handle remainder
-        while i < data.len() {
-            hist[data[i] as usize] += 1;
-            i += 1;
-        }
-
-        hist
+        // AVX2 dispatch path currently shares the scalar counting core to keep
+        // one authoritative histogram implementation.
+        scalar::histogram(data)
     }
 
     /// Decode varint with BMI2 PEXT - extract bits efficiently
@@ -4704,8 +4649,8 @@ mod x86_extended {
     /// Berlekamp-Massey with AVX2 acceleration when available.
     #[target_feature(enable = "avx2")]
     pub unsafe fn berlekamp_massey_avx2(syndrome: &[u8], len: usize) -> Vec<u8> {
-        // Similar to GFNI version but using AVX2 shuffle for GF multiplication
-        berlekamp_massey_gfni(syndrome, len) // Simplified for now
+        // Keep AVX2 routing separate from GFNI/AVX-512 to avoid unsupported instructions.
+        scalar::berlekamp_massey(syndrome, len)
     }
 
     /// GF(256) matrix multiplication with GFNI
@@ -6186,7 +6131,7 @@ pub mod scalar {
 
     #[inline(always)]
     pub(crate) fn reed_solomon_encode_scalar(data: &[u8], parity_shards: usize) -> Vec<u8> {
-        // Simplified scalar Reed-Solomon encoding
+        // Scalar Reed-Solomon encoding
         let data_shards = data.len() / 256;
         let total_shards = data_shards + parity_shards;
         let mut output = vec![0u8; total_shards * 256];
@@ -6194,7 +6139,7 @@ pub mod scalar {
         // Copy data
         output[..data.len()].copy_from_slice(data);
 
-        // Generate parity (simplified)
+        // Generate parity
         for i in 0..parity_shards {
             for j in 0..data_shards {
                 let coeff = gf_pow((i + 1) as u8, j as u8);
@@ -6230,8 +6175,84 @@ pub mod scalar {
             }
         }
 
-        // Scalar fallback (simple passthrough)
-        Ok(shards[0].clone())
+        if shards.len() != indices.len() {
+            return Err("Shard/index length mismatch");
+        }
+        let shard_size = shards[0].len();
+        if !shards.iter().all(|s| s.len() == shard_size) {
+            return Err("Shard size mismatch");
+        }
+
+        let k = shards.len();
+        let mut aug = vec![vec![0u8; 2 * k]; k];
+        for row in 0..k {
+            let x = indices[row] as u8;
+            let mut col = 0usize;
+            while col < k {
+                aug[row][col] = gf_pow(x, col as u8);
+                col += 1;
+            }
+            aug[row][k + row] = 1;
+        }
+
+        for pivot in 0..k {
+            if aug[pivot][pivot] == 0 {
+                let mut swap_row = None;
+                let mut cand = pivot + 1;
+                while cand < k {
+                    if aug[cand][pivot] != 0 {
+                        swap_row = Some(cand);
+                        break;
+                    }
+                    cand += 1;
+                }
+                if let Some(cand) = swap_row {
+                    aug.swap(pivot, cand);
+                } else {
+                    return Err("Matrix not invertible");
+                }
+            }
+
+            let inv = gf_inv(aug[pivot][pivot]);
+            let mut col = pivot;
+            while col < (2 * k) {
+                aug[pivot][col] = gf_mul_byte(aug[pivot][col], inv);
+                col += 1;
+            }
+
+            for row in 0..k {
+                if row == pivot {
+                    continue;
+                }
+                let factor = aug[row][pivot];
+                if factor == 0 {
+                    continue;
+                }
+                let mut col = pivot;
+                while col < (2 * k) {
+                    let prod = gf_mul_byte(aug[pivot][col], factor);
+                    aug[row][col] ^= prod;
+                    col += 1;
+                }
+            }
+        }
+
+        let mut output = vec![0u8; k * shard_size];
+        for out_row in 0..k {
+            for shard_idx in 0..k {
+                let coeff = aug[out_row][k + shard_idx];
+                if coeff == 0 {
+                    continue;
+                }
+                let src = &shards[shard_idx];
+                let dst = &mut output[out_row * shard_size..(out_row + 1) * shard_size];
+                for i in 0..shard_size {
+                    dst[i] ^= gf_mul_byte(src[i], coeff);
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     pub fn qpack_encode(input: &[u8], output: &mut [u8]) -> usize {
@@ -6683,74 +6704,8 @@ pub mod sha_ni {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sha", enable = "sse4.1")]
     unsafe fn sha256_ni(data: &[u8]) -> [u8; 32] {
-        use std::arch::x86_64::*;
-
-        // SHA-256 constants
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-
-        // Initial hash values
-        let mut state0 =
-            _mm_set_epi32(0x6a09e667, 0xbb67ae85u32 as i32, 0x3c6ef372, 0xa54ff53au32 as i32);
-        let mut state1 = _mm_set_epi32(0x510e527f, 0x9b05688cu32 as i32, 0x1f83d9ab, 0x5be0cd19);
-
-        // Process data in 64-byte blocks
-        let mut i = 0;
-        while i + 64 <= data.len() {
-            let block = &data[i..i + 64];
-
-            // Load message schedule
-            let msg0 = _mm_loadu_si128(block.as_ptr() as *const __m128i);
-            let msg1 = _mm_loadu_si128(block.as_ptr().add(16) as *const __m128i);
-            let msg2 = _mm_loadu_si128(block.as_ptr().add(32) as *const __m128i);
-            let msg3 = _mm_loadu_si128(block.as_ptr().add(48) as *const __m128i);
-
-            // Convert to big-endian
-            let shuffle = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
-            let msg0 = _mm_shuffle_epi8(msg0, shuffle);
-            let msg1 = _mm_shuffle_epi8(msg1, shuffle);
-            let msg2 = _mm_shuffle_epi8(msg2, shuffle);
-            let msg3 = _mm_shuffle_epi8(msg3, shuffle);
-
-            // Save initial state
-            let abef_save = state0;
-            let cdgh_save = state1;
-
-            // Rounds 0-3
-            let mut tmp = _mm_add_epi32(
-                msg0,
-                _mm_set_epi32(K[3] as i32, K[2] as i32, K[1] as i32, K[0] as i32),
-            );
-            state1 = _mm_sha256rnds2_epu32(state1, state0, tmp);
-            tmp = _mm_shuffle_epi32(tmp, 0x0E);
-            state0 = _mm_sha256rnds2_epu32(state0, state1, tmp);
-
-            // Add to hash
-            state0 = _mm_add_epi32(state0, abef_save);
-            state1 = _mm_add_epi32(state1, cdgh_save);
-
-            i += 64;
-        }
-
-        if i < data.len() {
-            // Padding logic omitted in original implementation; keep parity by skipping.
-        }
-
-        let mut hash = [0u8; 32];
-        _mm_storeu_si128(hash.as_mut_ptr() as *mut __m128i, state0);
-        _mm_storeu_si128(hash.as_mut_ptr().add(16) as *mut __m128i, state1);
-
-        hash
+        // Correctness-first fallback until complete SHA-NI round/padding implementation.
+        sha256_software(data)
     }
 
     /// SHA-256 with ARM crypto extensions

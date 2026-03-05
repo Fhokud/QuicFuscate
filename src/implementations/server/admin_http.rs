@@ -25,6 +25,8 @@ use super::admin::{AdminResponse, ClientInfo};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_USERNAME_CHARS: usize = 64;
+const MAX_PASSWORD_BYTES: usize = 256;
 const SESSION_COOKIE: &str = "qf_admin_session";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const CSRF_TOKEN_BYTES: usize = 16;
@@ -570,6 +572,9 @@ fn handle_connection(
         if req.path == "/api/login" {
             return handle_login(&mut stream, req, auth.as_ref(), sessions, rate_limiter, peer);
         }
+        if req.path == "/api/logout" {
+            return handle_logout(&mut stream, &req, auth.as_ref(), &sessions, peer);
+        }
         if !authorize(&req, auth.as_ref(), &sessions) {
             return respond_json(&mut stream, 401, &AdminResponse::error("Unauthorized"));
         }
@@ -593,10 +598,6 @@ fn handle_connection(
             if let Some(csrf_error) = validate_csrf_request(&req, &sessions) {
                 return respond_json(&mut stream, 403, &AdminResponse::error(csrf_error));
             }
-        }
-
-        if req.path == "/api/logout" {
-            return handle_logout(&mut stream, &req, auth.as_ref(), &sessions, peer);
         }
         if let Some(auth_ref) = auth.as_ref() {
             let requires_pw_change =
@@ -784,6 +785,12 @@ fn handle_login(
         Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
     };
     let username = payload.username.trim();
+    if username.chars().count() > MAX_USERNAME_CHARS {
+        return respond_json(stream, 400, &AdminResponse::error("Username too long"));
+    }
+    if payload.password.len() > MAX_PASSWORD_BYTES {
+        return respond_json(stream, 400, &AdminResponse::error("Password too long"));
+    }
     let ok =
         auth.read().map(|guard| guard.verify(username, payload.password.as_str())).unwrap_or(false);
     if !ok {
@@ -822,7 +829,7 @@ fn handle_logout(
     peer: Option<SocketAddr>,
 ) -> std::io::Result<()> {
     if auth.is_none() {
-        return respond_json(stream, 200, &AdminResponse::ok_with_message("Logged out"));
+        return respond_admin_json(stream, &AdminResponse::ok_with_message("Logged out"));
     }
     if let Some(session_id) = get_cookie(req, SESSION_COOKIE) {
         let mut store = sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -872,7 +879,7 @@ fn handle_admin_auth(
             .unwrap_or_else(
                 |_| serde_json::json!({ "user": "admin", "requires_password_change": false }),
             );
-        return respond_json(stream, 200, &AdminResponse::ok_with_data(payload));
+        return respond_admin_json(stream, &AdminResponse::ok_with_data(payload));
     }
 
     if req.method != "POST" {
@@ -883,6 +890,13 @@ fn handle_admin_auth(
         Ok(p) => p,
         Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
     };
+    if payload.current_password.len() > MAX_PASSWORD_BYTES {
+        return respond_json(
+            stream,
+            400,
+            &AdminResponse::error("Password too long (max 256 chars)"),
+        );
+    }
 
     if payload.new_username.is_none() && payload.new_password.is_none() {
         return respond_json(stream, 400, &AdminResponse::error("No update requested"));
@@ -943,7 +957,7 @@ fn handle_admin_auth(
     if new_user.is_empty() {
         return respond_json(stream, 400, &AdminResponse::error("Username cannot be empty"));
     }
-    if new_user.chars().count() > 64 {
+    if new_user.chars().count() > MAX_USERNAME_CHARS {
         return respond_json(
             stream,
             400,
@@ -961,7 +975,7 @@ fn handle_admin_auth(
     {
         let mut guard = auth.write().unwrap_or_else(|e| e.into_inner());
         if let Some(pw) = new_password {
-            if pw.len() > 256 {
+            if pw.len() > MAX_PASSWORD_BYTES {
                 return respond_json(
                     stream,
                     400,
@@ -1208,60 +1222,64 @@ mod tests {
 
     #[test]
     fn session_cookie_is_secure_only_for_https_forwarded_proto() {
-        let base = HttpRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![],
-            body: Vec::new(),
-        };
-        let https = HttpRequest {
-            headers: vec![("x-forwarded-proto".to_string(), "https".to_string())],
-            ..base
-        };
-        let http = HttpRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![("x-forwarded-proto".to_string(), "http".to_string())],
-            body: Vec::new(),
-        };
+        with_trust_proxy_env(true, || {
+            let base = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![],
+                body: Vec::new(),
+            };
+            let https = HttpRequest {
+                headers: vec![("x-forwarded-proto".to_string(), "https".to_string())],
+                ..base
+            };
+            let http = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![("x-forwarded-proto".to_string(), "http".to_string())],
+                body: Vec::new(),
+            };
 
-        let c1 = build_session_cookie("sid", &https);
-        assert!(c1.contains("HttpOnly"));
-        assert!(c1.contains("SameSite=Strict"));
-        assert!(c1.contains("; Secure"));
+            let c1 = build_session_cookie("sid", &https);
+            assert!(c1.contains("HttpOnly"));
+            assert!(c1.contains("SameSite=Strict"));
+            assert!(c1.contains("; Secure"));
 
-        let c2 = build_session_cookie("sid", &http);
-        assert!(!c2.contains("; Secure"));
+            let c2 = build_session_cookie("sid", &http);
+            assert!(!c2.contains("; Secure"));
+        });
     }
 
     #[test]
     fn expired_cookie_is_secure_only_for_https_forwarded_proto() {
-        let base = HttpRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![],
-            body: Vec::new(),
-        };
-        let https = HttpRequest {
-            headers: vec![("x-forwarded-proto".to_string(), "https".to_string())],
-            ..base
-        };
-        let http = HttpRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![("x-forwarded-proto".to_string(), "http".to_string())],
-            body: Vec::new(),
-        };
+        with_trust_proxy_env(true, || {
+            let base = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![],
+                body: Vec::new(),
+            };
+            let https = HttpRequest {
+                headers: vec![("x-forwarded-proto".to_string(), "https".to_string())],
+                ..base
+            };
+            let http = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![("x-forwarded-proto".to_string(), "http".to_string())],
+                body: Vec::new(),
+            };
 
-        let c1 = build_expired_cookie(&https);
-        assert!(c1.contains("HttpOnly"));
-        assert!(c1.contains("SameSite=Strict"));
-        assert!(c1.contains("; Secure"));
-        assert!(c1.contains("Max-Age=0"));
-        assert!(c1.contains("Expires="));
+            let c1 = build_expired_cookie(&https);
+            assert!(c1.contains("HttpOnly"));
+            assert!(c1.contains("SameSite=Strict"));
+            assert!(c1.contains("; Secure"));
+            assert!(c1.contains("Max-Age=0"));
+            assert!(c1.contains("Expires="));
 
-        let c2 = build_expired_cookie(&http);
-        assert!(!c2.contains("; Secure"));
+            let c2 = build_expired_cookie(&http);
+            assert!(!c2.contains("; Secure"));
+        });
     }
 
     #[test]
@@ -1721,42 +1739,45 @@ mod tests {
 
     #[test]
     fn secure_cookie_is_set_only_for_forwarded_https() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
+        with_trust_proxy_env(true, || {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+            let addr = listener.local_addr().unwrap();
 
-        let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+            let web_root = std::env::temp_dir();
+            let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
+                "admin".to_string(),
+                "123".to_string(),
+                false,
+            ))));
+            let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
+            let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
+            let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
 
-        // 2 login requests
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
+            // 2 login requests
+            let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
 
-        let body = r#"{"username":"admin","password":"123"}"#;
-        let mk = |proto: Option<&str>| {
-            let extra = proto.map(|p| format!("X-Forwarded-Proto: {}\r\n", p)).unwrap_or_default();
-            format!(
-                "POST /api/login HTTP/1.1\r\nHost: localhost\r\n{}Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                extra,
-                body.len(),
-                body
-            )
-        };
+            let body = r#"{"username":"admin","password":"123"}"#;
+            let mk = |proto: Option<&str>| {
+                let extra =
+                    proto.map(|p| format!("X-Forwarded-Proto: {}\r\n", p)).unwrap_or_default();
+                format!(
+                    "POST /api/login HTTP/1.1\r\nHost: localhost\r\n{}Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    extra,
+                    body.len(),
+                    body
+                )
+            };
 
-        let http = send_req(addr, &mk(None));
-        assert_eq!(parse_status(&http), 200);
-        let set_cookie = parse_set_cookie(&http).expect("set-cookie");
-        assert!(!set_cookie.to_ascii_lowercase().contains("secure"));
+            let http = send_req(addr, &mk(None));
+            assert_eq!(parse_status(&http), 200);
+            let set_cookie = parse_set_cookie(&http).expect("set-cookie");
+            assert!(!set_cookie.to_ascii_lowercase().contains("secure"));
 
-        let https = send_req(addr, &mk(Some("https")));
-        assert_eq!(parse_status(&https), 200);
-        let set_cookie = parse_set_cookie(&https).expect("set-cookie");
-        assert!(set_cookie.to_ascii_lowercase().contains("secure"));
+            let https = send_req(addr, &mk(Some("https")));
+            assert_eq!(parse_status(&https), 200);
+            let set_cookie = parse_set_cookie(&https).expect("set-cookie");
+            assert!(set_cookie.to_ascii_lowercase().contains("secure"));
+        });
     }
 
     #[test]
@@ -2812,11 +2833,11 @@ fn handle_api(
             };
             let resp = handler.handle_kick(&id);
             log_action(peer, "kick", &format!("id={}", id), resp.success);
-            return respond_json(stream, 200, &resp);
+            return respond_admin_json(stream, &resp);
         }
     }
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/status") => respond_json(stream, 200, &handler.handle_status()),
+        ("GET", "/api/status") => respond_admin_json(stream, &handler.handle_status()),
         ("GET", "/api/clients") => {
             let clients = handler.handle_list_clients();
             respond_json(
@@ -2827,11 +2848,11 @@ fn handle_api(
                 ),
             )
         }
-        ("GET", "/api/blocked") => respond_json(stream, 200, &handler.handle_list_blocked_ips()),
-        ("GET", "/api/config") => respond_json(stream, 200, &handler.handle_read_config()),
+        ("GET", "/api/blocked") => respond_admin_json(stream, &handler.handle_list_blocked_ips()),
+        ("GET", "/api/config") => respond_admin_json(stream, &handler.handle_read_config()),
         ("GET", "/api/metrics") => respond_text(stream, 200, &handler.handle_metrics_text()),
-        ("GET", "/api/metrics/json") => respond_json(stream, 200, &handler.handle_metrics_json()),
-        ("GET", "/api/qkeys") => respond_json(stream, 200, &handler.handle_list_qkeys()),
+        ("GET", "/api/metrics/json") => respond_admin_json(stream, &handler.handle_metrics_json()),
+        ("GET", "/api/qkeys") => respond_admin_json(stream, &handler.handle_list_qkeys()),
         ("POST", "/api/kick") => {
             let payload: IdPayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
@@ -2846,7 +2867,7 @@ fn handle_api(
             };
             let resp = handler.handle_kick(&id);
             log_action(peer, "kick", &format!("id={}", id), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/block") => {
             let payload: IpPayload = match serde_json::from_slice(&req.body) {
@@ -2858,7 +2879,7 @@ fn handle_api(
             };
             let resp = handler.handle_block(&ip);
             log_action(peer, "block", &format!("ip={}", ip), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/unblock") => {
             let payload: IpPayload = match serde_json::from_slice(&req.body) {
@@ -2870,12 +2891,12 @@ fn handle_api(
             };
             let resp = handler.handle_unblock(&ip);
             log_action(peer, "unblock", &format!("ip={}", ip), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/reload") => {
             let resp = handler.handle_reload();
             log_action(peer, "reload", "-", resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/qkey") => {
             let payload: QKeyCreatePayload = if req.body.is_empty() {
@@ -2929,7 +2950,7 @@ fn handle_api(
             };
             let resp = handler.handle_qkey(req);
             log_action(peer, "qkey", "-", resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/qkeys/revoke") => {
             let payload: QKeyRevokePayload = match serde_json::from_slice(&req.body) {
@@ -2944,12 +2965,15 @@ fn handle_api(
             };
             let resp = handler.handle_revoke_qkey(&id);
             log_action(peer, "qkey-revoke", &format!("id={}", id), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/shutdown") => {
+            if !admin_shutdown_enabled() {
+                return respond_text(stream, 404, "Not Found");
+            }
             let resp = handler.handle_shutdown();
             log_action(peer, "shutdown", "-", resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("POST", "/api/config") => {
             let payload: ConfigPayload = match serde_json::from_slice(&req.body) {
@@ -2961,10 +2985,10 @@ fn handle_api(
             }
             let resp = handler.handle_write_config(&payload.config);
             log_action(peer, "config", &format!("bytes={}", payload.config.len()), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         ("GET", "/api/config/logging") => {
-            respond_json(stream, 200, &handler.handle_get_logging_config())
+            respond_admin_json(stream, &handler.handle_get_logging_config())
         }
         ("POST", "/api/config/logging") => {
             let payload: LoggingModePayload = match serde_json::from_slice(&req.body) {
@@ -2973,9 +2997,12 @@ fn handle_api(
             };
             let resp = handler.handle_set_logging_config(&payload.mode);
             log_action(peer, "logging", &format!("mode={}", payload.mode), resp.success);
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
-        ("GET", path) if path.starts_with("/api/logs") => {
+        ("GET", "/api/logs") | ("GET", "/api/logs?") => {
+            respond_admin_json(stream, &handler.handle_get_logs(0))
+        }
+        ("GET", path) if path.starts_with("/api/logs?") => {
             let cursor = path
                 .split('?')
                 .nth(1)
@@ -2986,7 +3013,7 @@ fn handle_api(
                         .and_then(|v| v.parse::<u64>().ok())
                 })
                 .unwrap_or(0);
-            respond_json(stream, 200, &handler.handle_get_logs(cursor))
+            respond_admin_json(stream, &handler.handle_get_logs(cursor))
         }
         ("POST", "/api/logs/clear") => {
             let resp = handler.handle_clear_logs();
@@ -2995,7 +3022,7 @@ fn handle_api(
             if !resp.success {
                 log_action(peer, "logs-clear", "-", false);
             }
-            respond_json(stream, 200, &resp)
+            respond_admin_json(stream, &resp)
         }
         _ => respond_text(stream, 404, "Not Found"),
     }
@@ -3008,6 +3035,10 @@ fn respond_json<T: Serialize>(
 ) -> std::io::Result<()> {
     let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     respond_bytes(stream, status, "application/json", &payload)
+}
+
+fn respond_admin_json(stream: &mut TcpStream, body: &AdminResponse) -> std::io::Result<()> {
+    respond_json(stream, admin_response_status(body), body)
 }
 
 fn respond_json_with_headers<T: Serialize>(
@@ -3316,9 +3347,34 @@ fn build_expired_cookie(req: &HttpRequest) -> String {
 }
 
 fn is_secure_request(req: &HttpRequest) -> bool {
+    if !trust_proxy_enabled() {
+        return false;
+    }
     req.headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("x-forwarded-proto") && v.eq_ignore_ascii_case("https")
     })
+}
+
+fn admin_shutdown_enabled() -> bool {
+    std::env::var("QUICFUSCATE_ENABLE_ADMIN_SHUTDOWN")
+        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn admin_response_status(resp: &AdminResponse) -> u16 {
+    if resp.success {
+        return 200;
+    }
+    let msg = resp.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    if msg.contains("not found") {
+        404
+    } else if msg.contains("invalid") || msg.contains("missing") {
+        400
+    } else if msg.contains("conflict") || msg.contains("already") || msg.contains("exists") {
+        409
+    } else {
+        400
+    }
 }
 
 fn normalize_csrf_token(raw: &str) -> Option<String> {
@@ -3441,6 +3497,9 @@ fn hash_password(password: &str) -> String {
 }
 
 fn verify_password(password_phc: &str, password: &str) -> bool {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
     let Ok(parsed) = PasswordHash::new(password_phc) else {
         return false;
     };

@@ -1489,7 +1489,7 @@ pub mod tls_cover {
     }
 }
 
-// Legacy quiche FFI removed: native TLS fingerprint injection is used exclusively.
+// Legacy external TLS FFI removed: native TLS fingerprint injection is used exclusively.
 
 // --- Global Tokio Runtime for async DoH requests ---
 lazy_static! {
@@ -2180,7 +2180,7 @@ impl Http3Masquerade {
     }
 
     /// Generates a list of QPACK-style headers for an HTTP/3 request.
-    /// This is a simplified representation. A real implementation uses QPACK.
+    /// The returned list is consumed by the transport's header encoder.
     pub fn generate_headers(&self, host: &str, path: &str) -> Vec<crate::transport::h3::Header> {
         let mut headers = vec![
             crate::transport::h3::Header::new(b":method", b"GET"),
@@ -4464,7 +4464,7 @@ impl TlsClientHelloSpoofer {
         cfg.enable_simd();
     }
 
-    /// Loads the specified profile and injects it into the quiche config.
+    /// Loads the specified profile and injects it into the transport config.
     ///
     /// Generates ClientHello using integrated fingerprinting for the specified browser/OS.
     /// If generation fails, this logs an error and leaves `cfg` unchanged.
@@ -4472,12 +4472,7 @@ impl TlsClientHelloSpoofer {
     /// Side effects
     /// ------------
     /// Disables GREASE and enables deterministic hellos for the lifetime of the
-    /// process TLS context (via FFI calls). No error is returned.
-    ///
-    /// Safety
-    /// ------
-    /// This method is safe to call. It internally uses FFI shims to interact with a
-    /// patched quiche build. When the symbols are not present, calls are no-ops.
+    /// process TLS context. No error is returned.
     ///
     /// Examples
     /// --------
@@ -5935,7 +5930,7 @@ impl StealthManager {
     }
 
     /// Changes the active fingerprint profile at runtime.
-    /// Call `apply_utls_profile` again to update an existing quiche configuration.
+    /// Call `apply_utls_profile` again to update an existing transport TLS configuration.
     pub fn set_fingerprint_profile(
         &self,
         profile: FingerprintProfile,

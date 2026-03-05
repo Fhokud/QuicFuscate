@@ -70,7 +70,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # No vendored quiche; pure Cargo build/test
+      # Pure Cargo build/test (no vendored external QUIC stack)
 
       - name: Run Clippy
         shell: bash
