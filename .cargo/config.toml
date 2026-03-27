@@ -1,39 +1,8 @@
 [build]
-# Einheitlicher Target-Ordner im Root
+# Unified target directory in repo root
 target-dir = "target"
 
-# Standard: Dev-Build (schnell)
-[profile.dev]
-opt-level = 0
-debug = true
-lto = false
-codegen-units = 256
-incremental = true
-panic = "unwind"
-
-[profile.release]
-opt-level = 3
-debug = false
-lto = "thin"
-codegen-units = 1
-strip = true
-panic = "abort"
-
-[profile.test]
-opt-level = 0
-debug = true
-
-[profile.bench]
-opt-level = 3
-debug = false
-lto = "thin"
-
-# Workspace-Einstellungen
-[workspace]
-# Alle Crates teilen sich den Target-Ordner
-target-dir = "target"
-
-# Netzwerk/Performance
+# Network settings
 [net]
 retry = 3
 git-fetch-with-cli = true
@@ -43,3 +12,27 @@ protocol = "sparse"
 
 [future-incompat-report]
 frequency = 'always'
+
+# --- Target-specific optimizations ---
+# Uncomment the section matching your deployment target for optimal codegen.
+# These set target-cpu flags that enable architecture-specific instructions.
+
+# x86_64-v3 (Haswell+ / modern desktop & server CPUs with AVX2, BMI2, FMA)
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# x86_64-v4 (Skylake-X+ / AVX-512 capable servers)
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=x86-64-v4"]
+
+# aarch64 generic (ARM servers: AWS Graviton, Ampere Altra, etc.)
+# [target.aarch64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=neoverse-n1"]
+
+# aarch64 native (build on the target machine for best codegen)
+# [target.aarch64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=native"]
+
+# Apple Silicon (M1/M2/M3/M4 - macOS)
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "target-cpu=apple-m1"]

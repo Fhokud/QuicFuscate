@@ -3,11 +3,11 @@
 
 #[cfg(target_arch = "aarch64")]
 use crate::optimize::telemetry::CONGESTION_NEON_BATCHES;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 use crate::optimize::telemetry::{CONGESTION_AVX2_BATCHES, CONGESTION_VNNI_BATCHES};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 use crate::optimize::CpuProfile;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 use crate::optimize::CpuProfile;
 use crate::optimize::FeatureDetector;
 use crate::transport::Stats;
@@ -349,119 +349,9 @@ unsafe fn sum_u32_vnni(values: &[u32]) -> u64 {
     total
 }
 
-/// Ultra-fast ACK range search with AVX2 - 3x faster
-#[inline(always)]
-pub fn ack_range_search(ranges: &[(u64, u64)], packet_num: u64) -> bool {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { ack_range_search_avx2(ranges, packet_num) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::optimize::CpuProfile;
-        match _profile {
-            CpuProfile::ARM_A0
-            | CpuProfile::ARM_A1a
-            | CpuProfile::ARM_A1b
-            | CpuProfile::ARM_A1c
-            | CpuProfile::ARM_A1d
-            | CpuProfile::Apple_M
-            | CpuProfile::ARM_A2 => unsafe {
-                return ack_range_search_neon(ranges, packet_num);
-            },
-            _ => {}
-        }
-    }
-
-    // Scalar fallback
-    ranges.iter().any(|&(start, end)| packet_num >= start && packet_num <= end)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn ack_range_search_avx2(ranges: &[(u64, u64)], packet_num: u64) -> bool {
-    let pn_vec = _mm256_set1_epi64x(packet_num as i64);
-
-    for chunk in ranges.chunks(4) {
-        // Load 4 ranges at once
-        let mut starts = [0i64; 4];
-        let mut ends = [0i64; 4];
-
-        for (i, &(s, e)) in chunk.iter().enumerate() {
-            starts[i] = s as i64;
-            ends[i] = e as i64;
-        }
-
-        let start_vec = _mm256_loadu_si256(starts.as_ptr() as *const __m256i);
-        let end_vec = _mm256_loadu_si256(ends.as_ptr() as *const __m256i);
-
-        // Check if packet_num >= start && packet_num <= end
-        let ge_start = _mm256_cmpgt_epi64(pn_vec, start_vec);
-        let eq_start = _mm256_cmpeq_epi64(pn_vec, start_vec);
-        let ge_mask = _mm256_or_si256(ge_start, eq_start);
-
-        let le_end = _mm256_cmpgt_epi64(end_vec, pn_vec);
-        let eq_end = _mm256_cmpeq_epi64(end_vec, pn_vec);
-        let le_mask = _mm256_or_si256(le_end, eq_end);
-
-        let in_range = _mm256_and_si256(ge_mask, le_mask);
-
-        if _mm256_movemask_epi8(in_range) != 0 {
-            return true;
-        }
-    }
-
-    false
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn ack_range_search_neon(ranges: &[(u64, u64)], packet_num: u64) -> bool {
-    use std::arch::aarch64::*;
-    let pn = vdupq_n_u64(packet_num);
-
-    for chunk in ranges.chunks(2) {
-        let mut starts = [0u64; 2];
-        let mut ends = [0u64; 2];
-        for (i, &(s, e)) in chunk.iter().enumerate() {
-            starts[i] = s;
-            ends[i] = e;
-        }
-
-        let s_vec = vld1q_u64(starts.as_ptr());
-        let e_vec = vld1q_u64(ends.as_ptr());
-
-        // pn >= start && pn <= end
-        let ge_start = vcgeq_u64(pn, s_vec);
-        let le_end = vcleq_u64(pn, e_vec);
-        let in_range = vandq_u64(ge_start, le_end);
-
-        // Reduce lanes
-        let lanes: [u64; 2] = core::mem::transmute(in_range);
-        if lanes[0] == !0u64 || lanes[1] == !0u64 {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Bitmap operations with BMI2 - 2x faster
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn bitmap_set_range(bitmap: &mut [u64], start: usize, end: usize) {
     let _profile = FeatureDetector::instance().profile();
 
@@ -509,13 +399,13 @@ pub fn bitmap_set_range(bitmap: &mut [u64], start: usize, end: usize) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[inline(always)]
 fn mask_from_start(bit: usize) -> u64 {
     (!0u64) << bit
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[inline(always)]
 fn mask_to_end(bit: usize) -> u64 {
     if bit >= 63 {
@@ -525,13 +415,13 @@ fn mask_to_end(bit: usize) -> u64 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[inline(always)]
 fn mask_range(start_bit: usize, end_bit: usize) -> u64 {
     mask_from_start(start_bit) & mask_to_end(end_bit)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn bitmap_set_range_neon(bitmap: &mut [u64], start: usize, end: usize) {
     use std::arch::aarch64::*;
@@ -589,7 +479,7 @@ unsafe fn bitmap_set_range_neon(bitmap: &mut [u64], start: usize, end: usize) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn bitmap_set_range_sve2(bitmap: &mut [u64], start: usize, end: usize) {
     #[cfg(target_feature = "sve2")]
     {
@@ -602,7 +492,7 @@ unsafe fn bitmap_set_range_sve2(bitmap: &mut [u64], start: usize, end: usize) {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sve2")]
 unsafe fn bitmap_set_range_sve2_impl(bitmap: &mut [u64], start: usize, end: usize) {
     use std::arch::aarch64::*;
@@ -656,7 +546,7 @@ unsafe fn bitmap_set_range_sve2_impl(bitmap: &mut [u64], start: usize, end: usiz
     bitmap[end_word] |= mask_to_end(end_bit);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "bmi2")]
 unsafe fn bitmap_set_range_bmi2(bitmap: &mut [u64], start: usize, end: usize) {
     let start_word = start / 64;
@@ -684,6 +574,7 @@ unsafe fn bitmap_set_range_bmi2(bitmap: &mut [u64], start: usize, end: usize) {
 
 /// ECN counting with POPCNT - 3x faster
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn count_ecn_marks(bitmap: &[u64]) -> u32 {
     let _profile = FeatureDetector::instance().profile();
 
@@ -726,7 +617,7 @@ pub fn count_ecn_marks(bitmap: &[u64]) -> u32 {
     bitmap.iter().map(|&word| word.count_ones()).sum()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "popcnt")]
 unsafe fn count_ecn_marks_popcnt(bitmap: &[u64]) -> u32 {
     let mut count = 0u32;
@@ -749,7 +640,7 @@ unsafe fn count_ecn_marks_popcnt(bitmap: &[u64]) -> u32 {
     count
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn count_ecn_marks_neon(bitmap: &[u64]) -> u32 {
     use std::arch::aarch64::*;
@@ -779,7 +670,7 @@ unsafe fn count_ecn_marks_neon(bitmap: &[u64]) -> u32 {
     total
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[inline(always)]
 unsafe fn count_ecn_marks_sve2(bitmap: &[u64]) -> u32 {
     #[cfg(target_feature = "sve2")]
@@ -829,6 +720,7 @@ unsafe fn count_ecn_marks_sve2(bitmap: &[u64]) -> u32 {
 
 /// Fast packet number decoding with BMI2 PEXT
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn decode_packet_number(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     if pn_len == 0 {
         return expected;
@@ -876,7 +768,7 @@ pub fn decode_packet_number(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     finalize_packet_number(candidate, expected_pn, pn_bits)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "bmi2")]
 unsafe fn decode_packet_number_bmi2(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     // Use PEXT to extract packet number bits efficiently
@@ -895,6 +787,7 @@ unsafe fn decode_packet_number_bmi2(encoded: u32, expected: u64, pn_len: u8) -> 
     finalize_packet_number(candidate, expected_pn, pn_bits)
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
 #[inline(always)]
 fn finalize_packet_number(candidate: u64, expected_pn: u64, pn_bits: u32) -> u64 {
     debug_assert!(pn_bits > 0 && pn_bits <= 32);
@@ -913,7 +806,7 @@ fn finalize_packet_number(candidate: u64, expected_pn: u64, pn_bits: u32) -> u64
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn decode_packet_number_neon(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     use std::arch::aarch64::*;
@@ -934,7 +827,7 @@ unsafe fn decode_packet_number_neon(encoded: u32, expected: u64, pn_len: u8) -> 
     finalize_packet_number(candidate, expected_pn, pn_bits)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn decode_packet_number_sve2(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     #[cfg(target_feature = "sve2")]
     {
@@ -947,7 +840,7 @@ unsafe fn decode_packet_number_sve2(encoded: u32, expected: u64, pn_len: u8) -> 
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sve2")]
 unsafe fn decode_packet_number_sve2_impl(encoded: u32, expected: u64, pn_len: u8) -> u64 {
     use std::arch::aarch64::*;
@@ -969,343 +862,194 @@ unsafe fn decode_packet_number_sve2_impl(encoded: u32, expected: u64, pn_len: u8
     finalize_packet_number(candidate, expected_pn, pn_bits)
 }
 
-/// Ultra-fast stream frame parsing with AVX2
-#[inline(always)]
-pub fn parse_stream_frames(data: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { parse_stream_frames_avx2(data) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A0
-        | CpuProfile::ARM_A1a
-        | CpuProfile::ARM_A1b
-        | CpuProfile::ARM_A1c
-        | CpuProfile::ARM_A1d
-        | CpuProfile::Apple_M
-        | CpuProfile::ARM_A2 => {
-            return unsafe { parse_stream_frames_neon(data) };
-        }
-        _ => {}
-    }
-
-    // Scalar fallback
-    parse_stream_frames_scalar(data)
-}
-
-fn parse_stream_frames_scalar(data: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
-    let mut frames = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        // Parse frame type
-        let frame_type = data[pos];
-        pos += 1;
-
-        if frame_type & 0xf8 == 0x08 {
-            // Stream frame
-            let stream_id = read_varint(&data[pos..]).unwrap_or((0, 1));
-            pos += stream_id.1;
-
-            let offset = read_varint(&data[pos..]).unwrap_or((0, 1));
-            pos += offset.1;
-
-            let length = if frame_type & 0x02 != 0 {
-                let len = read_varint(&data[pos..]).unwrap_or((0, 1));
-                pos += len.1;
-                len.0 as usize
-            } else {
-                data.len() - pos
-            };
-
-            let payload = data[pos..pos + length].to_vec();
-            pos += length;
-
-            frames.push((stream_id.0, offset.0, payload));
-        } else {
-            // Skip other frame types
-            break;
-        }
-    }
-
-    frames
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn parse_stream_frames_neon(data: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
-    use std::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn copy_payload(dst: *mut u8, src: *const u8, len: usize) {
-        let mut offset = 0usize;
-        while offset + 64 <= len {
-            let v0 = vld1q_u8(src.add(offset));
-            let v1 = vld1q_u8(src.add(offset + 16));
-            let v2 = vld1q_u8(src.add(offset + 32));
-            let v3 = vld1q_u8(src.add(offset + 48));
-            vst1q_u8(dst.add(offset), v0);
-            vst1q_u8(dst.add(offset + 16), v1);
-            vst1q_u8(dst.add(offset + 32), v2);
-            vst1q_u8(dst.add(offset + 48), v3);
-            offset += 64;
-        }
-        while offset + 16 <= len {
-            let v = vld1q_u8(src.add(offset));
-            vst1q_u8(dst.add(offset), v);
-            offset += 16;
-        }
-        if offset + 8 <= len {
-            *(dst.add(offset) as *mut u64) = *(src.add(offset) as *const u64);
-            offset += 8;
-        }
-        if offset + 4 <= len {
-            *(dst.add(offset) as *mut u32) = *(src.add(offset) as *const u32);
-            offset += 4;
-        }
-        if offset + 2 <= len {
-            *(dst.add(offset) as *mut u16) = *(src.add(offset) as *const u16);
-            offset += 2;
-        }
-        if offset < len {
-            *dst.add(offset) = *src.add(offset);
-        }
-    }
-
-    let mut frames = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < data.len() {
-        let frame_type = data[pos];
-        pos += 1;
-
-        if frame_type & 0xF8 == 0x08 {
-            if pos >= data.len() {
-                break;
-            }
-
-            let (sid, sid_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-                Some(v) => v,
-                None => break,
-            };
-            pos += sid_len;
-
-            if pos >= data.len() {
-                break;
-            }
-
-            let (off, off_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-                Some(v) => v,
-                None => break,
-            };
-            pos += off_len;
-
-            let length = if frame_type & 0x02 != 0 {
-                if pos >= data.len() {
-                    break;
-                }
-                let (len_v, len_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-                    Some(v) => v,
-                    None => break,
-                };
-                pos += len_len;
-                len_v as usize
-            } else {
-                data.len().saturating_sub(pos)
-            };
-
-            if pos + length > data.len() {
-                break;
-            }
-
-            let mut payload = vec![0u8; length];
-            if length > 0 {
-                copy_payload(payload.as_mut_ptr(), data.as_ptr().add(pos), length);
-            }
-            pos += length;
-
-            frames.push((sid, off, payload));
-        } else {
-            break;
-        }
-    }
-
-    frames
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn parse_stream_frames_avx2(data: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
-    use std::arch::x86_64::*;
-
-    #[inline(always)]
-    unsafe fn copy_payload(dst: *mut u8, src: *const u8, len: usize) {
-        let mut offset = 0usize;
-        while offset + 64 <= len {
-            let a = _mm256_loadu_si256(src.add(offset) as *const __m256i);
-            let b = _mm256_loadu_si256(src.add(offset + 32) as *const __m256i);
-            _mm256_storeu_si256(dst.add(offset) as *mut __m256i, a);
-            _mm256_storeu_si256(dst.add(offset + 32) as *mut __m256i, b);
-            offset += 64;
-        }
-        if offset + 32 <= len {
-            let chunk = _mm256_loadu_si256(src.add(offset) as *const __m256i);
-            _mm256_storeu_si256(dst.add(offset) as *mut __m256i, chunk);
-            offset += 32;
-        }
-        if offset + 16 <= len {
-            let chunk = _mm_loadu_si128(src.add(offset) as *const __m128i);
-            _mm_storeu_si128(dst.add(offset) as *mut __m128i, chunk);
-            offset += 16;
-        }
-        if offset + 8 <= len {
-            *(dst.add(offset) as *mut u64) = *(src.add(offset) as *const u64);
-            offset += 8;
-        }
-        if offset + 4 <= len {
-            *(dst.add(offset) as *mut u32) = *(src.add(offset) as *const u32);
-            offset += 4;
-        }
-        if offset + 2 <= len {
-            *(dst.add(offset) as *mut u16) = *(src.add(offset) as *const u16);
-            offset += 2;
-        }
-        if offset < len {
-            *dst.add(offset) = *src.add(offset);
-        }
-    }
-
-    let mut frames = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < data.len() {
-        crate::optimize::prefetch(
-            data.as_ptr().add(pos.min(data.len() - 1)),
-            crate::optimize::PrefetchHint::T0,
-        );
-
-        let frame_type = *data.get_unchecked(pos);
-        pos += 1;
-
-        if frame_type & 0xF8 != 0x08 {
-            break;
-        }
-
-        if pos >= data.len() {
-            break;
-        }
-
-        let (sid, sid_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-            Some(v) => v,
-            None => break,
-        };
-        pos += sid_len;
-
-        if pos >= data.len() {
-            break;
-        }
-
-        let (offset, offset_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-            Some(v) => v,
-            None => break,
-        };
-        pos += offset_len;
-
-        let payload_len = if frame_type & 0x02 != 0 {
-            if pos >= data.len() {
-                break;
-            }
-            let (len_val, len_len) = match crate::simd::transport::decode_varint(&data[pos..]) {
-                Some(v) => v,
-                None => break,
-            };
-            pos += len_len;
-            len_val as usize
-        } else {
-            data.len().saturating_sub(pos)
-        };
-
-        if pos + payload_len > data.len() {
-            break;
-        }
-
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.set_len(payload_len);
-        if payload_len > 0 {
-            copy_payload(payload.as_mut_ptr(), data.as_ptr().add(pos), payload_len);
-        }
-        pos += payload_len;
-
-        frames.push((sid, offset, payload));
-    }
-
-    frames
-}
-
-fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-
-    let first = data[0];
-    let len = match first >> 6 {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => return None,
-    };
-
-    if data.len() < len {
-        return None;
-    }
-
-    let mut value = (first & 0x3f) as u64;
-    for byte in data.iter().take(len).skip(1) {
-        value = (value << 8) | (*byte as u64);
-    }
-
-    Some((value, len))
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-mod tests_stream_neon {
+#[cfg(test)]
+mod tests {
     use super::*;
-    #[test]
-    fn neon_stream_parse_matches_scalar() {
-        // Build one STREAM frame: type=0x0A (LEN set), sid=3, off=0, len=5, payload=5 bytes
-        let mut buf = Vec::new();
-        buf.push(0x0A);
-        let mut tmp = [0u8; 8];
-        // stream id
-        let n = crate::simd::transport::encode_varint(3, &mut tmp);
-        buf.extend_from_slice(&tmp[..n]);
-        // offset
-        let n = crate::simd::transport::encode_varint(0, &mut tmp);
-        buf.extend_from_slice(&tmp[..n]);
-        // length
-        let n = crate::simd::transport::encode_varint(5, &mut tmp);
-        buf.extend_from_slice(&tmp[..n]);
-        // payload
-        buf.extend_from_slice(b"hello");
 
-        let scalar = parse_stream_frames_scalar(&buf);
-        let neon = unsafe { parse_stream_frames_neon(&buf) };
-        assert_eq!(scalar, neon);
+    #[test]
+    fn test_congestion_sample_from_transport_stats() {
+        let stats = Stats {
+            cwnd: 65535,
+            bytes_in_flight: 32768,
+            delivery_rate: 1_000_000,
+            lost: 42,
+            ..Default::default()
+        };
+        let sample = CongestionSample::from_transport_stats(&stats);
+        assert_eq!(sample.cwnd, 65535);
+        assert_eq!(sample.bytes_in_flight, 32768);
+        assert_eq!(sample.delivery_rate, 1_000_000);
+        assert_eq!(sample.lost_packets, 42);
+    }
+
+    #[test]
+    fn test_congestion_sample_clamps_u32_max() {
+        let stats = Stats {
+            cwnd: usize::MAX,
+            bytes_in_flight: usize::MAX,
+            delivery_rate: u64::MAX,
+            lost: usize::MAX,
+            ..Default::default()
+        };
+        let sample = CongestionSample::from_transport_stats(&stats);
+        assert_eq!(sample.cwnd, u32::MAX);
+        assert_eq!(sample.bytes_in_flight, u32::MAX);
+        assert_eq!(sample.delivery_rate, u32::MAX);
+        assert_eq!(sample.lost_packets, u32::MAX);
+    }
+
+    #[test]
+    fn test_aggregate_congestion_empty() {
+        let summary = aggregate_congestion(&[]);
+        assert_eq!(summary.total_cwnd, 0);
+        assert_eq!(summary.total_bytes_in_flight, 0);
+        assert_eq!(summary.total_delivery_rate, 0);
+        assert_eq!(summary.total_lost_packets, 0);
+        assert_eq!(summary.congestion_score, 0);
+    }
+
+    #[test]
+    fn test_aggregate_congestion_single_sample() {
+        let samples = [CongestionSample {
+            cwnd: 1000,
+            bytes_in_flight: 500,
+            delivery_rate: 8192,
+            lost_packets: 2,
+        }];
+        let summary = aggregate_congestion(&samples);
+        assert_eq!(summary.total_cwnd, 1000);
+        assert_eq!(summary.total_bytes_in_flight, 500);
+        assert_eq!(summary.total_delivery_rate, 8192);
+        assert_eq!(summary.total_lost_packets, 2);
+        // Verify congestion score formula: inflight/1024 + lost*4096 + cwnd*64 + delivery/8192
+        let expected_score = 2 * 4096 + 1000 * 64 + 1;
+        assert_eq!(summary.congestion_score, expected_score);
+    }
+
+    #[test]
+    fn test_aggregate_congestion_multiple_samples() {
+        let samples: Vec<CongestionSample> = (0..CONGESTION_WINDOW_SIZE)
+            .map(|i| CongestionSample {
+                cwnd: 100,
+                bytes_in_flight: 50,
+                delivery_rate: 1000,
+                lost_packets: i as u32,
+            })
+            .collect();
+        let summary = aggregate_congestion(&samples);
+        assert_eq!(summary.total_cwnd, 100 * CONGESTION_WINDOW_SIZE as u64);
+        assert_eq!(
+            summary.total_bytes_in_flight,
+            50 * CONGESTION_WINDOW_SIZE as u64
+        );
+        assert_eq!(
+            summary.total_delivery_rate,
+            1000 * CONGESTION_WINDOW_SIZE as u64
+        );
+        // lost_packets: sum of 0..64 = (64*63)/2 = 2016
+        let expected_lost: u64 = (0..CONGESTION_WINDOW_SIZE as u64).sum();
+        assert_eq!(summary.total_lost_packets, expected_lost);
+    }
+
+    #[test]
+    fn test_aggregate_congestion_score_formula() {
+        // Verify the score formula is consistent across scalar and dispatch paths
+        let samples = [
+            CongestionSample {
+                cwnd: 2048,
+                bytes_in_flight: 4096,
+                delivery_rate: 16384,
+                lost_packets: 10,
+            },
+            CongestionSample {
+                cwnd: 1024,
+                bytes_in_flight: 2048,
+                delivery_rate: 8192,
+                lost_packets: 5,
+            },
+        ];
+        let summary = aggregate_congestion(&samples);
+        let scalar = aggregate_congestion_scalar(&samples);
+        assert_eq!(summary.total_cwnd, scalar.total_cwnd);
+        assert_eq!(summary.total_bytes_in_flight, scalar.total_bytes_in_flight);
+        assert_eq!(summary.total_delivery_rate, scalar.total_delivery_rate);
+        assert_eq!(summary.total_lost_packets, scalar.total_lost_packets);
+        assert_eq!(summary.congestion_score, scalar.congestion_score);
+    }
+
+    #[test]
+    fn test_aggregate_congestion_non_power_of_two_count() {
+        // Non-aligned count to exercise remainder paths in SIMD
+        let samples: Vec<CongestionSample> = (0..7)
+            .map(|_| CongestionSample {
+                cwnd: 10,
+                bytes_in_flight: 20,
+                delivery_rate: 30,
+                lost_packets: 1,
+            })
+            .collect();
+        let summary = aggregate_congestion(&samples);
+        assert_eq!(summary.total_cwnd, 70);
+        assert_eq!(summary.total_bytes_in_flight, 140);
+        assert_eq!(summary.total_delivery_rate, 210);
+        assert_eq!(summary.total_lost_packets, 7);
+    }
+
+    #[test]
+    fn test_bitmap_set_range_single_bit() {
+        let mut bitmap = [0u64; 2];
+        bitmap_set_range(&mut bitmap, 5, 5);
+        assert_eq!(bitmap[0], 1u64 << 5);
+        assert_eq!(bitmap[1], 0);
+    }
+
+    #[test]
+    fn test_bitmap_set_range_cross_word_boundary() {
+        let mut bitmap = [0u64; 4];
+        bitmap_set_range(&mut bitmap, 60, 68);
+        // Bits 60..63 in word 0, bits 0..4 in word 1
+        for bit in 60..=68 {
+            let word = bit / 64;
+            let b = bit % 64;
+            assert_ne!(bitmap[word] & (1u64 << b), 0, "bit {} should be set", bit);
+        }
+    }
+
+    #[test]
+    fn test_count_ecn_marks_empty() {
+        let bitmap: &[u64] = &[];
+        assert_eq!(count_ecn_marks(bitmap), 0);
+    }
+
+    #[test]
+    fn test_count_ecn_marks_known_values() {
+        let bitmap = [0xFFu64, 0x0101_0101_0101_0101u64];
+        let count = count_ecn_marks(&bitmap);
+        // 0xFF = 8 bits, 0x0101_0101_0101_0101 = 8 bits (one per byte)
+        assert_eq!(count, 16);
+    }
+
+    #[test]
+    fn test_decode_packet_number_1byte() {
+        // 1-byte PN encoding: 8 bits
+        let decoded = decode_packet_number(0x42, 0x40, 1);
+        // expected_pn = 0x41, mask = 0xFF
+        // candidate = (0x41 & !0xFF) | 0x42 = 0x42
+        assert_eq!(decoded, 0x42);
+    }
+
+    #[test]
+    fn test_decode_packet_number_2byte() {
+        // 2-byte PN encoding
+        let decoded = decode_packet_number(0x1234, 0x1230, 2);
+        // expected_pn = 0x1231, mask = 0xFFFF
+        // candidate = (0x1231 & !0xFFFF) | 0x1234 = 0x1234
+        assert_eq!(decoded, 0x1234);
+    }
+
+    #[test]
+    fn test_decode_packet_number_zero_len_returns_expected() {
+        let decoded = decode_packet_number(0xFF, 100, 0);
+        assert_eq!(decoded, 100);
     }
 }

@@ -5,8 +5,11 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use zstd::stream::raw::CParameter;
 
+/// Configuration parameters for the zstd compression pipeline.
 pub struct CompressionConfig {
+    /// Minimum payload size in bytes to consider for compression.
     pub min_len: usize,
+    /// Maximum zstd compression level (higher = better ratio, more CPU).
     pub max_level: i32,
 }
 
@@ -16,26 +19,40 @@ impl Default for CompressionConfig {
     }
 }
 
+/// Manages zstd compression/decompression with link-aware heuristics and SIMD entropy gating.
 pub struct CompressionManager {
     cfg: CompressionConfig,
 }
 
+/// Statistical analysis of payload byte distribution for compression decisions.
 #[derive(Clone, Debug, Default)]
 pub struct CompressionAnalysis {
+    /// Total analyzed byte count.
     pub len: usize,
+    /// Count of printable ASCII bytes (0x20..0x7E).
     pub ascii_bytes: u32,
+    /// Count of newline (0x0A) bytes.
     pub newline_bytes: u32,
+    /// Count of carriage return (0x0D) bytes.
     pub carriage_bytes: u32,
+    /// Count of tab (0x09) bytes.
     pub tab_bytes: u32,
+    /// Count of null (0x00) bytes.
     pub null_bytes: u32,
+    /// Count of high bytes (0x80..0xFF).
     pub high_bytes: u32,
+    /// Shannon entropy in bits per byte (0.0 = uniform, 8.0 = maximum).
     pub entropy_bits_per_byte: f64,
+    /// Total 64-byte chunks analyzed.
     pub chunk_total: u32,
+    /// Number of consecutive repeated chunk hashes.
     pub chunk_repeated: u32,
+    /// Highest frequency in the 8-bin chunk hash histogram.
     pub chunk_max_bin: u32,
 }
 
 impl CompressionAnalysis {
+    /// Fraction of bytes that are printable ASCII.
     pub fn ascii_ratio(&self) -> f32 {
         if self.len == 0 {
             return 0.0;
@@ -43,6 +60,7 @@ impl CompressionAnalysis {
         self.ascii_bytes as f32 / self.len as f32
     }
 
+    /// Fraction of bytes that are newline or carriage return characters.
     pub fn newline_ratio(&self) -> f32 {
         if self.len == 0 {
             return 0.0;
@@ -50,6 +68,7 @@ impl CompressionAnalysis {
         (self.newline_bytes + self.carriage_bytes) as f32 / self.len as f32
     }
 
+    /// Fraction of bytes that are null (0x00).
     pub fn null_ratio(&self) -> f32 {
         if self.len == 0 {
             return 0.0;
@@ -57,6 +76,7 @@ impl CompressionAnalysis {
         self.null_bytes as f32 / self.len as f32
     }
 
+    /// Fraction of bytes in the high range (0x80..0xFF).
     pub fn high_ratio(&self) -> f32 {
         if self.len == 0 {
             return 0.0;
@@ -64,6 +84,7 @@ impl CompressionAnalysis {
         self.high_bytes as f32 / self.len as f32
     }
 
+    /// Fraction of consecutive chunk pairs with identical hashes.
     pub fn chunk_repeat_ratio(&self) -> f32 {
         if self.chunk_total == 0 {
             return 0.0;
@@ -71,6 +92,7 @@ impl CompressionAnalysis {
         self.chunk_repeated as f32 / self.chunk_total as f32
     }
 
+    /// Ratio of the most frequent hash bin to total chunks (measures distribution skew).
     pub fn chunk_skew(&self) -> f32 {
         if self.chunk_total == 0 {
             return 0.0;
@@ -78,6 +100,7 @@ impl CompressionAnalysis {
         self.chunk_max_bin as f32 / self.chunk_total as f32
     }
 
+    /// Returns true if the byte distribution suggests text-like content (compressible).
     pub fn is_textual(&self) -> bool {
         if self.len == 0 {
             return false;
@@ -94,6 +117,7 @@ impl CompressionAnalysis {
             || (newline >= 0.01 && ascii >= 0.5 && high <= 0.4)
     }
 
+    /// Emit telemetry counters for this analysis (preprocessing statistics).
     pub fn record_telemetry(&self) {
         use crate::optimize::telemetry;
 
@@ -113,11 +137,13 @@ impl CompressionAnalysis {
         }
     }
 
+    /// Analyze up to `sample_len` bytes from the beginning of `data` (no chunk metrics).
     pub fn from_sample(data: &[u8], sample_len: usize) -> Self {
         let slice = if data.len() > sample_len { &data[..sample_len] } else { data };
         Self::from_slice(slice, false)
     }
 
+    /// Analyze the full payload including chunk repetition metrics.
     pub fn from_full(data: &[u8]) -> Self {
         Self::from_slice(data, true)
     }
@@ -149,6 +175,7 @@ impl CompressionAnalysis {
 }
 
 impl CompressionManager {
+    /// Create a new compression manager with the given configuration.
     pub fn new(cfg: CompressionConfig) -> Self {
         Self { cfg }
     }
@@ -281,15 +308,29 @@ fn tune_encoder_with_analysis(
     analysis: &CompressionAnalysis,
     max_level: i32,
 ) {
+    fn set_param_best_effort(
+        encoder: &mut zstd::stream::Encoder<'_, Vec<u8>>,
+        parameter: CParameter,
+        label: &'static str,
+    ) {
+        if let Err(e) = encoder.set_parameter(parameter) {
+            log::debug!("Zstd encoder parameter '{}' rejected: {}", label, e);
+        }
+    }
+
     let threads = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
     if threads > 1 && input_len >= 64 * 1024 {
         let workers = threads.min(8) as u32;
-        let _ = encoder.set_parameter(CParameter::NbWorkers(workers));
+        set_param_best_effort(encoder, CParameter::NbWorkers(workers), "NbWorkers");
     }
 
     let textual = analysis.is_textual();
     if input_len >= 128 * 1024 || analysis.chunk_repeat_ratio() >= 0.35 {
-        let _ = encoder.set_parameter(CParameter::EnableLongDistanceMatching(true));
+        set_param_best_effort(
+            encoder,
+            CParameter::EnableLongDistanceMatching(true),
+            "EnableLongDistanceMatching",
+        );
     }
 
     let profile = FeatureDetector::instance().profile();
@@ -302,33 +343,43 @@ fn tune_encoder_with_analysis(
         | CpuProfile::X86_P4a
         | CpuProfile::X86_P4b => {
             // Wider vectors benefit from larger target block sizes
-            let _ = encoder.set_parameter(CParameter::TargetLength(8192));
+            set_param_best_effort(encoder, CParameter::TargetLength(8192), "TargetLength");
         }
         CpuProfile::X86_P2a | CpuProfile::X86_P2b => {
             let target = if textual { 4096 } else { 6144 };
-            let _ = encoder.set_parameter(CParameter::TargetLength(target));
+            set_param_best_effort(encoder, CParameter::TargetLength(target), "TargetLength");
         }
         CpuProfile::ARM_A2 | CpuProfile::Apple_M => {
             let target = if textual { 3072 } else { 4096 };
-            let _ = encoder.set_parameter(CParameter::TargetLength(target));
+            set_param_best_effort(encoder, CParameter::TargetLength(target), "TargetLength");
         }
         _ => {
             let target = if textual { 2048 } else { 3072 };
-            let _ = encoder.set_parameter(CParameter::TargetLength(target));
+            set_param_best_effort(encoder, CParameter::TargetLength(target), "TargetLength");
         }
     }
 
     if textual && analysis.null_ratio() < 0.01 {
-        let _ = encoder.set_parameter(CParameter::CompressionLevel(max_level.max(6)));
+        set_param_best_effort(
+            encoder,
+            CParameter::CompressionLevel(max_level.max(6)),
+            "CompressionLevel",
+        );
     }
 }
 
+/// Policy controlling which payloads are compressed and at what level.
 #[derive(Clone, Debug)]
 pub struct CompressionPolicy {
+    /// Master switch for compression.
     pub enabled: bool,
+    /// Minimum payload size to attempt compression.
     pub min_len: usize,
+    /// Zstd compression level.
     pub level: i32,
+    /// MIME type patterns allowed for compression (e.g. "text/*").
     pub allow: Vec<String>,
+    /// MIME type patterns denied from compression (e.g. "image/*").
     pub deny: Vec<String>,
 }
 
@@ -351,6 +402,7 @@ impl Default for CompressionPolicy {
 
 static GLOBAL_POLICY: OnceLock<Mutex<CompressionPolicy>> = OnceLock::new();
 
+/// Return the global compression policy (lazily initialized from environment).
 pub fn global_policy() -> CompressionPolicy {
     GLOBAL_POLICY
         .get_or_init(|| Mutex::new(CompressionPolicy::from_env()))
@@ -362,17 +414,19 @@ pub fn global_policy() -> CompressionPolicy {
         .clone()
 }
 
+/// Replace the global compression policy at runtime.
 pub fn set_global_policy(pol: CompressionPolicy) {
     if let Some(m) = GLOBAL_POLICY.get() {
         if let Ok(mut g) = m.lock() {
             *g = pol;
         }
-    } else {
-        let _ = GLOBAL_POLICY.set(Mutex::new(pol));
+    } else if GLOBAL_POLICY.set(Mutex::new(pol)).is_err() {
+        log::debug!("Global compression policy already initialized");
     }
 }
 
 impl CompressionPolicy {
+    /// Build a compression policy from QUICFUSCATE_COMPRESS_* environment variables.
     pub fn from_env() -> Self {
         let mut p = CompressionPolicy::default();
         if let Ok(v) = std::env::var("QUICFUSCATE_COMPRESS") {
@@ -420,12 +474,18 @@ impl CompressionPolicy {
 
 // -------------------- Persona + ContentClass Mapping --------------------
 
+/// Broad content classification for dictionary-based compression tuning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContentClass {
+    /// JSON payloads.
     Json,
+    /// HTML documents.
     Html,
+    /// CSS stylesheets.
     Css,
+    /// JavaScript code.
     Js,
+    /// Generic text content.
     Text,
 }
 
@@ -436,6 +496,7 @@ struct PersonaState {
 
 static PERSONA: OnceLock<Mutex<PersonaState>> = OnceLock::new();
 
+/// Set the active stealth persona for dictionary selection.
 pub fn set_current_persona(name: &str) {
     load_all_dicts_from_dir();
     if let Some(m) = PERSONA.get() {
@@ -445,7 +506,9 @@ pub fn set_current_persona(name: &str) {
             return;
         }
     }
-    let _ = PERSONA.set(Mutex::new(PersonaState { name: name.to_owned() }));
+    if PERSONA.set(Mutex::new(PersonaState { name: name.to_owned() })).is_err() {
+        log::debug!("Persona state already initialized");
+    }
 }
 
 fn current_persona() -> String {
@@ -456,6 +519,7 @@ fn current_persona() -> String {
         .unwrap_or_else(|_| "default".into())
 }
 
+/// Map a Content-Type header string to a broad content classification.
 pub fn classify_content_type(ct: &str) -> ContentClass {
     let lc = ct.to_ascii_lowercase();
     if lc.contains("application/json") {
@@ -495,6 +559,7 @@ fn dict_index() -> std::sync::MutexGuard<'static, HashMap<DictId, Vec<u8>>> {
     DICT_INDEX.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Submit a payload sample for dictionary training (capped at 4096 bytes per sample).
 pub fn submit_sample(ct: &str, data: &[u8]) {
     let class = classify_content_type(ct);
     let persona = current_persona();
@@ -509,6 +574,7 @@ pub fn submit_sample(ct: &str, data: &[u8]) {
     }
 }
 
+/// Train a zstd dictionary from collected samples if the reservoir threshold is met.
 pub fn maybe_train(ct: &str) {
     let class = classify_content_type(ct);
     let persona = current_persona();
@@ -532,7 +598,9 @@ pub fn maybe_train(ct: &str) {
                 e.dict = Some(bytes.clone());
                 e.version = e.version.wrapping_add(1);
                 dict_index().insert((hash, e.version as u16), bytes.clone());
-                let _ = persist_dict(&current_persona(), class, e.version, &bytes, hash);
+                if let Err(err) = persist_dict(&current_persona(), class, e.version, &bytes, hash) {
+                    log::debug!("Failed to persist trained dictionary: {}", err);
+                }
                 e.samples.clear();
             }
             Err(_) => { /* Training failed; retry later. */ }
@@ -540,6 +608,7 @@ pub fn maybe_train(ct: &str) {
     }
 }
 
+/// Retrieve the trained dictionary and version for the given content type, if available.
 pub fn get_dict(ct: &str) -> Option<(Vec<u8>, u32)> {
     let class = classify_content_type(ct);
     let persona = current_persona();
@@ -547,6 +616,7 @@ pub fn get_dict(ct: &str) -> Option<(Vec<u8>, u32)> {
     reg.get(&(persona, class)).and_then(|e| e.dict.as_ref().map(|d| (d.clone(), e.version)))
 }
 
+/// Look up a dictionary by its (hash, version) identifier pair.
 pub fn get_dict_by_id(hash: u16, version: u16) -> Option<Vec<u8>> {
     dict_index().get(&(hash, version)).cloned()
 }
@@ -613,6 +683,7 @@ fn compute_chunk_metrics(data: &[u8]) -> (u32, u32, u32) {
 
 // -------------------- Zstd with dictionary --------------------
 
+/// Compress payload using a pre-trained zstd dictionary into a pooled buffer.
 pub fn compress_with_dict(
     _pool: &Arc<MemoryPool>,
     data: &[u8],
@@ -658,6 +729,7 @@ pub fn compress_with_dict(
     Some((out, 9 + n))
 }
 
+/// Decompress a dictionary-compressed buffer (magic 0x5D) into a pooled buffer.
 pub fn decompress_with_dict(
     _pool: &Arc<MemoryPool>,
     data: &[u8],
@@ -683,6 +755,7 @@ pub fn decompress_with_dict(
 // -------------------- Large Body Pool --------------------
 
 static BODY_POOL: OnceLock<Arc<MemoryPool>> = OnceLock::new();
+/// Return the global large-body memory pool for compression buffers.
 pub fn body_pool() -> Arc<MemoryPool> {
     BODY_POOL
         .get_or_init(|| {
@@ -746,7 +819,7 @@ fn persist_dict(
 
 static DICT_LOADED: OnceLock<()> = OnceLock::new();
 fn load_all_dicts_from_dir() {
-    let _ = DICT_LOADED.get_or_init(|| {
+    DICT_LOADED.get_or_init(|| {
         use std::fs;
         let dir = dict_dir();
         if let Ok(rd) = fs::read_dir(&dir) {
@@ -792,6 +865,7 @@ fn parse_ver_hash(name: &str) -> Option<(u16, u16)> {
     }
 }
 
+/// Check if a MIME type `value` matches a `pattern` (supports wildcard subtypes).
 #[inline]
 pub fn mime_matches(pattern: &str, value: &str) -> bool {
     if let Some(pos) = pattern.find('/') {
@@ -818,14 +892,87 @@ mod tests {
 
     #[test]
     fn entropy_gating_text_vs_binary() {
-        // Text: ASCII-heavy
         let text = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\nHello World!";
         assert!(CompressionManager::looks_textual(text));
-        // Binary: pseudo-random
         let mut bin = [0u8; 256];
         for (i, byte) in bin.iter_mut().enumerate() {
             *byte = (i as u8).wrapping_mul(37).rotate_left(1);
         }
         assert!(!CompressionManager::looks_textual(&bin));
+    }
+
+    #[test]
+    fn config_default_values() {
+        let cfg = CompressionConfig::default();
+        assert_eq!(cfg.min_len, 256);
+        assert_eq!(cfg.max_level, 5);
+    }
+
+    #[test]
+    fn analysis_ratios_empty_data() {
+        let a = CompressionAnalysis::default();
+        assert_eq!(a.ascii_ratio(), 0.0);
+        assert_eq!(a.newline_ratio(), 0.0);
+        assert_eq!(a.null_ratio(), 0.0);
+        assert_eq!(a.high_ratio(), 0.0);
+        assert_eq!(a.chunk_repeat_ratio(), 0.0);
+        assert_eq!(a.chunk_skew(), 0.0);
+        assert!(!a.is_textual());
+    }
+
+    #[test]
+    fn analysis_ascii_text_is_textual() {
+        let a = CompressionAnalysis {
+            len: 100,
+            ascii_bytes: 80,
+            newline_bytes: 5,
+            carriage_bytes: 0,
+            tab_bytes: 0,
+            null_bytes: 0,
+            high_bytes: 5,
+            entropy_bits_per_byte: 5.0,
+            chunk_total: 0,
+            chunk_repeated: 0,
+            chunk_max_bin: 0,
+        };
+        assert!(a.ascii_ratio() >= 0.75);
+        assert!(a.is_textual());
+    }
+
+    #[test]
+    fn analysis_binary_not_textual() {
+        let a = CompressionAnalysis {
+            len: 100,
+            ascii_bytes: 10,
+            newline_bytes: 0,
+            carriage_bytes: 0,
+            tab_bytes: 0,
+            null_bytes: 30,
+            high_bytes: 60,
+            entropy_bits_per_byte: 7.9,
+            chunk_total: 0,
+            chunk_repeated: 0,
+            chunk_max_bin: 0,
+        };
+        assert!(!a.is_textual());
+    }
+
+    #[test]
+    fn analysis_chunk_ratios() {
+        let a = CompressionAnalysis {
+            len: 640,
+            ascii_bytes: 0,
+            newline_bytes: 0,
+            carriage_bytes: 0,
+            tab_bytes: 0,
+            null_bytes: 0,
+            high_bytes: 0,
+            entropy_bits_per_byte: 0.0,
+            chunk_total: 10,
+            chunk_repeated: 3,
+            chunk_max_bin: 5,
+        };
+        assert!((a.chunk_repeat_ratio() - 0.3).abs() < 0.01);
+        assert!((a.chunk_skew() - 0.5).abs() < 0.01);
     }
 }

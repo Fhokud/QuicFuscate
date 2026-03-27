@@ -7,20 +7,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
-[[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
+source "$SCRIPT_DIR/../tests/lib/lib-common.sh" || { echo "ERROR: lib-common.sh not found at $SCRIPT_DIR/../tests/lib/lib-common.sh" >&2; exit 1; }
 
-OUTPUT_DIR=""; FAST=0
+OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
-    --fast) FAST=1;;
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [options]"; echo "Quality check"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -38,7 +35,7 @@ run_cargo build --release
 
 info "[INFO] Running unit tests..."
 # Release-quality gate: validate the shipping test surface.
-run cargo test --release --quiet
+run_cargo test --release --quiet
 
 if command -v cargo-clippy &> /dev/null; then
   info "[INFO] Running clippy analysis..."
@@ -60,7 +57,7 @@ else
 fi
 
 info "[INFO] Performance smoke test..."
-run_cargo test --release --lib test_fec_zero_cpu_mode --quiet || true
+run_cargo test --release --lib test_product_fec_default_is_auto --quiet || true
 
 if command -v cargo-audit &> /dev/null; then
   info "[INFO] Security audit..."

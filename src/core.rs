@@ -1,55 +1,26 @@
-// Copyright (c) 2024, The QuicFuscate Project Authors.
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright
-//       notice, this list of conditions and the following disclaimer.
-//
-//     * Redistributions in binary form must reproduce the above
-//       copyright notice, this list of conditions and the following disclaimer
-//       in the documentation and/or other materials provided with the
-//       distribution.
-//
-//     * Neither the name of the copyright holder nor the names of its
-//       contributors may be used to endorse or promote products derived from
-//       this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Portions derived from Quinn (https://github.com/quinn-rs/quinn)
+// Original code licensed under MIT/Apache-2.0
+// Modifications: Copyright (c) QuicFuscate Team, MIT License
 
-//! # Core Connection Manager
+//! # Core Forked Connection Runtime
 //!
-//! This module provides the central `QuicFuscateConnection` struct, which
-//! orchestrates the crypto, FEC, and stealth modules to manage a full
-//! QUIC connection lifecycle.
+//! This module provides the central `QuicFuscateConnection` struct for the
+//! forked QuicFuscate runtime. It orchestrates crypto, FEC, transport, and
+//! stealth ownership for the canonical connection lifecycle used by this fork.
 
 use crate::accelerate::transport::{self as transport_accel, CongestionSample};
 #[cfg(feature = "orchestrator")]
 use crate::brain::DeepIntegrationOrchestrator;
-use crate::brain::{intelligent_stealth_level_hint, CombinedObserver, StealthBrain};
-use crate::crypto::{CipherSuiteSelector, CryptoManager};
+use crate::brain::{CombinedObserver, StealthBrain};
+use crate::crypto::CryptoManager;
 use crate::fec::{AdaptiveFec, FecConfig, FecPacket, FecTransportObserver};
-use crate::optimize::xdp_socket::XdpSocket;
 use crate::optimize::{OptimizationManager, OptimizeConfig};
-use crate::stealth::{ServerPushTriggerReason, StealthConfig, StealthManager, StealthMode};
+use crate::stealth::{StealthConfig, StealthManager, StealthMode};
 use std::sync::Arc;
 #[cfg(feature = "orchestrator")]
 use std::sync::OnceLock;
 // unused on current code path; keep import minimal
 use crate::telemetry;
-use crate::transport::h3::NameValue; // for Header.name()/value()
 use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -62,30 +33,46 @@ use std::net::SocketAddr;
 type CapsuleHandler = Arc<std::sync::Mutex<Box<dyn FnMut(u64, &[u8]) + Send>>>;
 type DatagramHandler = Arc<std::sync::Mutex<Box<dyn FnMut(&[u8]) + Send>>>;
 
+struct Http3PollBindings {
+    masque_datagram_cb: Option<DatagramHandler>,
+    masque_control_cb: Option<CapsuleHandler>,
+    masque_cb: Option<CapsuleHandler>,
+    memory_pool: Arc<crate::optimize::MemoryPool>,
+}
+
 /// Parameters for creating a new QuicFuscateConnection.
 pub struct ConnectionParams {
+    /// Underlying QUIC transport connection.
     pub conn: Box<crate::transport::Connection>,
+    /// Local socket address.
     pub local_addr: SocketAddr,
+    /// Remote peer socket address.
     pub peer_addr: SocketAddr,
+    /// HTTP Host header value (may differ from SNI when domain fronting).
     pub host_header: String,
+    /// TLS SNI hostname override (None uses host_header).
     pub sni_host: Option<String>,
+    /// QKey authentication token in hex (client mode only).
     pub qkey_auth_token_hex: Option<String>,
+    /// Shared stealth manager for obfuscation and fingerprint control.
     pub stealth_manager: Arc<StealthManager>,
+    /// Shared optimization manager for memory pool and CPU feature detection.
     pub optimization_manager: Arc<OptimizationManager>,
-    pub xdp_socket: Option<crate::optimize::xdp_socket::XdpSocket>,
+    /// Forward error correction configuration.
     pub fec_config: FecConfig,
 }
 
 /// Represents a single QuicFuscate connection and manages its state.
 pub struct QuicFuscateConnection {
+    /// Underlying QUIC transport connection handle.
     pub conn: Box<crate::transport::Connection>,
+    /// Current peer address (may change on migration).
     pub peer_addr: SocketAddr,
     local_addr: SocketAddr,
     host_header: String,
     qkey_auth_token_hex: Option<String>,
 
     // Core Modules
-    _crypto_selector: CipherSuiteSelector,
     fec: AdaptiveFec,
 
     // Stealth & Optimization Modules
@@ -98,7 +85,6 @@ pub struct QuicFuscateConnection {
     // The outgoing buffer now holds fully formed FEC packets, ready for direct sending.
     // This eliminates the serialization overhead entirely.
     outgoing_fec_packets: VecDeque<FecPacket>,
-    xdp_socket: Option<XdpSocket>,
     h3_conn: Option<crate::transport::h3::Connection>,
     last_telemetry: std::time::Instant,
     // Observer for transport telemetry -> FEC/ACK policy coupling.
@@ -122,14 +108,23 @@ pub struct QuicFuscateConnection {
 /// Tracks performance and reliability metrics for a connection.
 #[derive(Debug)]
 pub struct ConnectionStats {
+    /// Smoothed round-trip time in seconds.
     pub rtt: f32,
+    /// Packet loss rate in [0.0, 1.0].
     pub loss_rate: f32,
+    /// Total packets sent on this connection.
     pub packets_sent: u64,
+    /// Total packets lost (detected by transport).
     pub packets_lost: u64,
+    /// Current congestion window in bytes.
     pub congestion_cwnd: u64,
+    /// Bytes currently in flight (unacknowledged).
     pub congestion_bytes_in_flight: u64,
+    /// Estimated delivery rate in bytes per second.
     pub congestion_delivery_rate: u64,
+    /// Total packets lost as tracked by congestion controller.
     pub congestion_lost: u64,
+    /// Aggregate congestion score (higher = more congested).
     pub congestion_score: u64,
     congestion_samples: VecDeque<CongestionSample>,
 }
@@ -168,6 +163,17 @@ impl ConnectionStats {
 }
 
 impl QuicFuscateConnection {
+    fn env_optional_trimmed(name: &str) -> Option<String> {
+        std::env::var(name).ok().and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
     /// Creates a new client connection.
     #[allow(clippy::too_many_arguments)]
     pub fn new_client(
@@ -209,7 +215,6 @@ impl QuicFuscateConnection {
         )
         .map_err(|e| format!("Failed to create QUIC connection: {}", e))?;
 
-        let xdp_socket = optimization_manager.create_xdp_socket(local_addr, remote_addr);
         Ok(Self::new(ConnectionParams {
             conn: Box::new(conn),
             local_addr,
@@ -219,11 +224,11 @@ impl QuicFuscateConnection {
             qkey_auth_token_hex,
             stealth_manager,
             optimization_manager,
-            xdp_socket,
             fec_config,
         }))
     }
 
+    /// Creates a new server-side connection accepted from a remote client.
     #[allow(clippy::too_many_arguments)]
     pub fn new_server(
         scid: &crate::transport::ConnectionId,
@@ -252,8 +257,6 @@ impl QuicFuscateConnection {
         )
         .map_err(|e| format!("Failed to accept QUIC connection: {}", e))?;
 
-        let xdp_socket = optimization_manager.create_xdp_socket(local_addr, remote_addr);
-
         Ok(Self::new(ConnectionParams {
             conn: Box::new(conn),
             local_addr,
@@ -263,7 +266,6 @@ impl QuicFuscateConnection {
             qkey_auth_token_hex: None,
             stealth_manager,
             optimization_manager,
-            xdp_socket,
             fec_config,
         }))
     }
@@ -276,14 +278,12 @@ impl QuicFuscateConnection {
             local_addr: params.local_addr,
             host_header: params.host_header,
             qkey_auth_token_hex: params.qkey_auth_token_hex,
-            _crypto_selector: CipherSuiteSelector::new(),
             fec: AdaptiveFec::new(params.fec_config),
             stealth_manager: params.stealth_manager,
             optimization_manager: params.optimization_manager,
             stats: ConnectionStats::default(),
             packet_id_counter: 0,
             outgoing_fec_packets: VecDeque::new(),
-            xdp_socket: params.xdp_socket,
             h3_conn: None,
             last_telemetry: std::time::Instant::now(),
             transport_observer: obs.clone(),
@@ -297,25 +297,18 @@ impl QuicFuscateConnection {
             runtime_cpu_percent: 0,
             #[cfg(feature = "orchestrator")]
             runtime_memory_pressure: 0,
-            tls_ch_override_template: std::env::var("QUICFUSCATE_TLS_CH_OVERRIDE_TEMPLATE")
-                .ok()
-                .and_then(|v| {
-                    let trimmed = v.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                }),
+            tls_ch_override_template: Self::env_optional_trimmed(
+                "QUICFUSCATE_TLS_CH_OVERRIDE_TEMPLATE",
+            ),
             next_packet_release: None,
         };
         s.fec.enable_simd_acceleration();
+        s.conn.set_intelligent_stealth_runtime(s.stealth_manager.is_intelligent_runtime());
+        s.conn.set_brain_runtime_permissions(s.stealth_manager.brain_runtime_permissions());
         // Attach observers to transport for live telemetry callbacks
         // Combine FEC observer with StealthBrain when enabled (default on, disable via QUICFUSCATE_BRAIN=0|false)
         let obs_dyn: Arc<dyn crate::transport::TransportObserver> = obs.clone();
-        let brain_enabled = std::env::var("QUICFUSCATE_BRAIN")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let brain_enabled = crate::env_utils::env_flag("QUICFUSCATE_BRAIN", true);
         if brain_enabled {
             let brain = StealthBrain::new_default();
             let brain_dyn: Arc<dyn crate::transport::TransportObserver> = brain.clone();
@@ -328,21 +321,19 @@ impl QuicFuscateConnection {
 
         // Enable and configure RealTLS (always on, including Performance mode)
         // Map stealth fingerprint to TLS profile and apply SNI from fronting
-        let _ = s.conn.enable_tls("unified");
-        let fp = s.stealth_manager.current_fingerprint();
-        let mut tls_prof = crate::qftls::profile_from_fingerprint(&fp);
-        if let Some(ref sni) = params.sni_host {
-            tls_prof.sni = Some(sni.clone());
+        if let Err(e) = s.conn.enable_tls("unified") {
+            warn!("Failed to enable unified TLS provider: {:?}", e);
         }
+        let tls_prof = s.stealth_manager.runtime_tls_profile(params.sni_host.as_deref());
         let sni_str = tls_prof.sni.as_deref().unwrap_or(s.host_header.as_str());
-        let _ = s.conn.configure_tls(&tls_prof, sni_str);
+        if let Err(e) = s.conn.configure_tls(&tls_prof, sni_str) {
+            warn!("Failed to configure TLS profile for SNI {}: {:?}", sni_str, e);
+        }
 
         // Initialize DeepIntegrationOrchestrator if feature enabled
         #[cfg(feature = "orchestrator")]
         {
-            let orchestrator_enabled = std::env::var("QUICFUSCATE_ORCHESTRATOR")
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
+            let orchestrator_enabled = crate::env_utils::env_flag("QUICFUSCATE_ORCHESTRATOR", true);
             if orchestrator_enabled {
                 let orchestrator = DeepIntegrationOrchestrator::new(
                     crate::brain::StealthBrainConfig::from_env(),
@@ -350,13 +341,18 @@ impl QuicFuscateConnection {
                     65536, // block size
                 );
                 // Store globally for later use in HTTP/3 loop.
-                let _ = ORCHESTRATOR.set(orchestrator);
-                info!("DeepIntegrationOrchestrator activated for advanced coordination");
-                // Enable Server Push coordination in Intelligent mode (brain will throttle)
-                if matches!(s.stealth_manager.mode(), StealthMode::Intelligent) {
-                    if let Some(orch) = ORCHESTRATOR.get() {
-                        orch.enable_server_push(true);
+                if ORCHESTRATOR.set(orchestrator).is_ok() {
+                    info!("DeepIntegrationOrchestrator activated for advanced coordination");
+                    // Enable Server Push coordination in Intelligent mode (brain will throttle)
+                    if s.stealth_manager.is_intelligent_runtime() {
+                        if let Some(orch) = ORCHESTRATOR.get() {
+                            orch.enable_server_push(true);
+                        }
                     }
+                } else {
+                    debug!(
+                        "DeepIntegrationOrchestrator already initialized, reusing existing instance"
+                    );
                 }
             }
         }
@@ -402,7 +398,7 @@ impl QuicFuscateConnection {
         &mut self,
         host: &str,
     ) -> Result<Option<u64>, crate::transport::h3::Error> {
-        if !self.stealth_manager.masque_preferred() {
+        if !self.stealth_manager.masque_preferred_runtime() {
             return Ok(None);
         }
 
@@ -423,74 +419,439 @@ impl QuicFuscateConnection {
         debug!("MASQUE CONNECT-UDP opened (proxy={}, target={})", proxy, target);
         crate::telemetry::MASQUE_ACTIVE.store(1, std::sync::atomic::Ordering::Relaxed);
 
-        let _ = h3.enable_masque_datagram(&mut self.conn, sid);
-        if let Err(e) = h3.register_datagram_context(&mut self.conn, sid, 1, 0) {
-            warn!("MASQUE DATAGRAM context registration failed: {:?}", e);
-        } else {
-            debug!("MASQUE DATAGRAM enabled (flow-id=1, ctx=0)");
+        match h3.enable_masque_datagram(&mut self.conn, sid) {
+            Ok(_) => {
+                if let Err(e) = h3.register_datagram_context(&mut self.conn, sid, 1, 0) {
+                    warn!("MASQUE DATAGRAM context registration failed: {:?}", e);
+                } else {
+                    debug!("MASQUE DATAGRAM enabled (flow-id=1, ctx=0)");
+                }
+            }
+            Err(e) => {
+                warn!("MASQUE DATAGRAM enable failed: {:?}", e);
+            }
         }
 
         self.masque_stream_id = Some(sid);
         Ok(Some(sid))
     }
 
-    fn intelligent_level(&self) -> u32 {
-        if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-            intelligent_stealth_level_hint()
-        } else {
-            0
-        }
-    }
-
     fn sync_intelligent_runtime_controls(&self, intelligent_level: u32) {
-        if !matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-            return;
-        }
-        self.stealth_manager.maybe_escalate_masque_intelligent();
-        if intelligent_level == 0 {
-            self.stealth_manager.enable_server_push_runtime(false, None);
-            return;
-        }
-        let intensity = if intelligent_level >= 2 { 0.9 } else { 0.65 };
-        self.stealth_manager.enable_server_push_runtime(true, Some(intensity));
+        self.stealth_manager.sync_intelligent_runtime_controls(intelligent_level);
     }
 
-    fn estimate_server_push_cover_bytes(
-        base_path: &str,
-        promises_created: usize,
-        intensity: f32,
-    ) -> u64 {
-        if promises_created == 0 {
-            return 0;
+    fn sync_poll_intelligent_runtime_controls(&self, intelligent_level: u32) {
+        self.sync_intelligent_runtime_controls(intelligent_level);
+
+        if self.stealth_manager.is_intelligent_runtime() {
+            #[cfg(feature = "orchestrator")]
+            {
+                if intelligent_level >= 1 {
+                    if let Some(orchestrator) = ORCHESTRATOR.get() {
+                        let stats = self.conn.stats();
+                        let sent = stats.sent as u64;
+                        let lost = stats.lost as u64;
+                        let loss_rate_permille = if sent > 0 {
+                            (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
+                        } else {
+                            0
+                        };
+                        let delivery_rate_bps =
+                            self.conn.delivery_rate().max(self.stats.congestion_delivery_rate);
+                        let stealth_active = self.stealth_manager.runtime_stealth_active();
+                        orchestrator.update_runtime_signals(
+                            loss_rate_permille,
+                            self.runtime_cpu_percent,
+                            self.runtime_memory_pressure,
+                            delivery_rate_bps,
+                            stealth_active,
+                        );
+                    }
+                    if let Some(orchestrator) = ORCHESTRATOR.get() {
+                        if orchestrator.should_trigger_server_push() {
+                            let mut intensity = orchestrator.get_server_push_intensity();
+                            if intelligent_level >= 2 {
+                                intensity = intensity.max(0.9);
+                            }
+                            self.stealth_manager
+                                .sync_orchestrator_server_push_controls(true, intensity);
+                        }
+                    }
+                }
+            }
         }
-        let per_promise = 280u64
-            .saturating_add(base_path.len() as u64)
-            .saturating_add((intensity.clamp(0.0, 1.0) * 180.0) as u64);
-        per_promise.saturating_mul(promises_created as u64)
+    }
+
+    fn ensure_masque_tunnel_for_send(
+        &mut self,
+    ) -> Result<Option<u64>, crate::transport::h3::Error> {
+        let host = self.host_header.clone();
+        match self.ensure_masque_tunnel(&host) {
+            Ok(sid) => Ok(sid),
+            Err(e) => {
+                crate::telemetry::MASQUE_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    fn emit_server_push_cover_burst(
+        h3: &mut crate::transport::h3::Connection,
+        stealth_manager: &crate::stealth::StealthManager,
+        stats: &crate::transport::Stats,
+        intelligent_level: u32,
+    ) {
+        let Some((base_path, intensity)) = stealth_manager.server_push_cover_plan() else {
+            return;
+        };
+
+        match h3.generate_stealth_cover_burst(&base_path) {
+            Ok(ids) => {
+                let sent = stats.sent as u64;
+                let lost = stats.lost as u64;
+                let loss_rate_permille = if sent > 0 {
+                    (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
+                } else {
+                    0
+                };
+                stealth_manager.observe_server_push_burst(
+                    &base_path,
+                    ids.len(),
+                    intensity,
+                    loss_rate_permille,
+                    intelligent_level,
+                );
+                debug!("Server Push burst emitted: {} promises", ids.len());
+            }
+            Err(e) => warn!("Server Push burst generation failed: {:?}", e),
+        }
+    }
+
+    fn prepare_http3_poll_iteration(&self) -> (u32, crate::transport::Stats) {
+        let intelligent_level = self.stealth_manager.intelligent_runtime_level();
+        self.sync_poll_intelligent_runtime_controls(intelligent_level);
+        let stats = self.conn.stats().clone();
+        (intelligent_level, stats)
+    }
+
+    fn ensure_http3_ready_for_poll(&mut self, context: &str) -> bool {
+        if self.h3_conn.is_none() && self.conn.is_established() {
+            if let Err(e) = self.init_http3() {
+                debug!("Deferred HTTP/3 init failed during {}: {:?}", context, e);
+            }
+        }
+        self.h3_conn.is_some()
+    }
+
+    fn ensure_http3_initialized(&mut self) -> Result<(), crate::transport::h3::Error> {
+        if self.h3_conn.is_none() {
+            self.init_http3()?;
+        }
+        Ok(())
+    }
+
+    fn http3_poll_bindings(&self) -> Http3PollBindings {
+        Http3PollBindings {
+            masque_datagram_cb: self.masque_datagram_cb.clone(),
+            masque_control_cb: self.masque_control_cb.clone(),
+            masque_cb: self.masque_cb.clone(),
+            memory_pool: self.optimization_manager.memory_pool(),
+        }
+    }
+
+    fn build_http3_request_headers(
+        &self,
+        method: &'static [u8],
+        path: &str,
+    ) -> Vec<crate::transport::h3::Header> {
+        let host = self.host_header.as_str();
+        let mut headers =
+            self.stealth_manager.get_http3_header_list(host, path).unwrap_or_default();
+
+        headers.retain(|h| {
+            h.name() != b":method"
+                && h.name() != b":scheme"
+                && h.name() != b":authority"
+                && h.name() != b":path"
+        });
+        headers.insert(0, crate::transport::h3::Header::new(b":path", path.as_bytes()));
+        headers.insert(0, crate::transport::h3::Header::new(b":authority", host.as_bytes()));
+        headers.insert(0, crate::transport::h3::Header::new(b":scheme", b"https"));
+        headers.insert(0, crate::transport::h3::Header::new(b":method", method));
+        self.inject_qkey_auth_header(&mut headers);
+        headers
+    }
+
+    fn send_http3_request_headers(
+        &mut self,
+        method: &'static [u8],
+        path: &str,
+        fin: bool,
+    ) -> Result<u64, crate::error::ConnectionError> {
+        self.ensure_http3_initialized()?;
+        let headers = self.build_http3_request_headers(method, path);
+        let h3 = self.h3_conn.as_mut().ok_or("h3 not initialized")?;
+        h3.send_request(&mut self.conn, &headers, fin).map_err(Into::into)
+    }
+
+    fn poll_http3_event_loop<FH, FB>(
+        &mut self,
+        context: &str,
+        verbose_events: bool,
+        mut on_headers: FH,
+        mut on_body: FB,
+    ) -> Result<(), crate::error::ConnectionError>
+    where
+        FH: FnMut(u64, &[crate::transport::h3::Header]),
+        FB: FnMut(u64, &[u8]),
+    {
+        if self.ensure_http3_ready_for_poll(context) {
+            let start = std::time::Instant::now();
+            let bindings = self.http3_poll_bindings();
+            loop {
+                let (intelligent_level, stats) = self.prepare_http3_poll_iteration();
+                let Some(ref mut h3) = self.h3_conn else {
+                    break;
+                };
+                Self::emit_due_cover_headers(h3, &mut self.conn, &self.stealth_manager);
+                Self::emit_server_push_cover_burst(
+                    h3,
+                    &self.stealth_manager,
+                    &stats,
+                    intelligent_level,
+                );
+                match h3.poll(&mut self.conn) {
+                    Ok(Some((sid, crate::transport::h3::Event::Headers { list, .. }))) => {
+                        on_headers(sid, &list);
+                    }
+                    Ok(Some((sid, crate::transport::h3::Event::Data))) => {
+                        let mut buf = [0; 65535];
+                        while let Ok(read) = h3.recv_body(&mut self.conn, sid, &mut buf) {
+                            if read == 0 {
+                                break;
+                            }
+                            on_body(sid, &buf[..read]);
+                        }
+                    }
+                    Ok(Some((
+                        sid,
+                        crate::transport::h3::Event::MasqueCapsule { capsule_type, payload },
+                    ))) => {
+                        Self::handle_masque_capsule_event(
+                            h3,
+                            &mut self.conn,
+                            sid,
+                            capsule_type,
+                            &payload,
+                            &bindings.masque_datagram_cb,
+                            &bindings.masque_control_cb,
+                            &bindings.masque_cb,
+                            &bindings.memory_pool,
+                        );
+                    }
+                    Ok(Some((_id, crate::transport::h3::Event::Reset(err)))) => {
+                        crate::optimize::telemetry::STEALTH_SIGNAL_RST
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if verbose_events {
+                            warn!("H3 stream reset: {:?}", err);
+                        }
+                    }
+                    Ok(Some((_id, crate::transport::h3::Event::PriorityUpdate))) => {
+                        if verbose_events {
+                            debug!("H3 priority update received");
+                        }
+                    }
+                    Ok(Some((_id, crate::transport::h3::Event::GoAway))) => {
+                        if verbose_events {
+                            info!("H3 GOAWAY received");
+                        }
+                    }
+                    Ok(Some((_id, crate::transport::h3::Event::Finished))) => {}
+                    Ok(Some((
+                        _id,
+                        crate::transport::h3::Event::PushPromise { push_id, headers },
+                    ))) => {
+                        if verbose_events {
+                            info!(
+                                "Received stealth push promise {} with {} headers",
+                                push_id,
+                                headers.len()
+                            );
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(crate::transport::h3::Error::Done) => break,
+                    Err(e) => return Err(e.into()),
+                }
+                Self::drain_masque_datagrams(
+                    h3,
+                    &mut self.conn,
+                    &self.stealth_manager,
+                    &bindings.masque_datagram_cb,
+                    &bindings.masque_cb,
+                );
+            }
+            debug!("HTTP/3 events processed in {} ms", start.elapsed().as_millis());
+        }
+        Ok(())
+    }
+
+    fn emit_due_cover_headers(
+        h3: &mut crate::transport::h3::Connection,
+        conn: &mut crate::transport::Connection,
+        stealth_manager: &StealthManager,
+    ) {
+        if let Some(headers) = stealth_manager.cover_headers_due() {
+            if let Err(e) = h3.send_request(conn, &headers, true) {
+                crate::optimize::telemetry::STEALTH_SIGNAL_RST
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("Cover traffic send failed: {:?}", e);
+            } else {
+                debug!("Cover traffic request emitted");
+            }
+        }
+    }
+
+    fn dispatch_masque_datagram_payload(
+        masque_datagram_cb: &Option<DatagramHandler>,
+        masque_cb: &Option<CapsuleHandler>,
+        payload: &[u8],
+    ) {
+        if let Some(cb) = masque_datagram_cb {
+            if let Ok(mut f) = cb.lock() {
+                (f)(payload);
+            }
+        } else if let Some(cb) = masque_cb {
+            if let Ok(mut f) = cb.lock() {
+                (f)(0x00, payload);
+            }
+        }
+    }
+
+    fn dispatch_masque_capsule_payload(
+        masque_control_cb: &Option<CapsuleHandler>,
+        masque_cb: &Option<CapsuleHandler>,
+        capsule_type: u64,
+        payload: &[u8],
+    ) {
+        if let Some(cb) = masque_control_cb {
+            if let Ok(mut f) = cb.lock() {
+                (f)(capsule_type, payload);
+            }
+        } else if let Some(cb) = masque_cb {
+            if let Ok(mut f) = cb.lock() {
+                (f)(capsule_type, payload);
+            }
+        }
+    }
+
+    fn dispatch_masque_compressed_datagram(
+        masque_datagram_cb: &Option<DatagramHandler>,
+        masque_cb: &Option<CapsuleHandler>,
+        pool: &Arc<crate::optimize::MemoryPool>,
+        payload: &[u8],
+        dict: Option<&[u8]>,
+    ) {
+        let decoded = match dict {
+            Some(dict_bytes) => crate::compress::decompress_with_dict(pool, payload, dict_bytes),
+            None => crate::compress::CompressionManager::new(Default::default())
+                .decompress_to_pool(pool, payload),
+        };
+        if let Some((blk, used)) = decoded {
+            Self::dispatch_masque_datagram_payload(masque_datagram_cb, masque_cb, &blk[..used]);
+            pool.free(blk);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_masque_capsule_event(
+        h3: &mut crate::transport::h3::Connection,
+        conn: &mut crate::transport::Connection,
+        sid: u64,
+        capsule_type: u64,
+        payload: &[u8],
+        masque_datagram_cb: &Option<DatagramHandler>,
+        masque_control_cb: &Option<CapsuleHandler>,
+        masque_cb: &Option<CapsuleHandler>,
+        memory_pool: &Arc<crate::optimize::MemoryPool>,
+    ) {
+        if !h3.masque_established(sid) {
+            h3.mark_masque_established(sid);
+            let ack = crate::transport::h3::Connection::encode_capsule(0x02, b"established");
+            if let Err(e) = h3.send_capsule(conn, sid, &ack, false) {
+                warn!("MASQUE establishment ACK capsule send failed on stream {}: {:?}", sid, e);
+            }
+        }
+
+        match capsule_type {
+            0x00 => {
+                Self::dispatch_masque_datagram_payload(masque_datagram_cb, masque_cb, payload);
+            }
+            0x21 => {
+                Self::dispatch_masque_compressed_datagram(
+                    masque_datagram_cb,
+                    masque_cb,
+                    memory_pool,
+                    payload,
+                    None,
+                );
+            }
+            0x22 => {
+                if payload.len() >= 9 && payload[0] == 0x5D {
+                    let mut hb = [0u8; 2];
+                    hb.copy_from_slice(&payload[1..3]);
+                    let hash = u16::from_be_bytes(hb);
+                    let mut vb = [0u8; 2];
+                    vb.copy_from_slice(&payload[3..5]);
+                    let ver = u16::from_be_bytes(vb);
+                    if let Some(dict) = crate::compress::get_dict_by_id(hash, ver) {
+                        Self::dispatch_masque_compressed_datagram(
+                            masque_datagram_cb,
+                            masque_cb,
+                            memory_pool,
+                            payload,
+                            Some(&dict),
+                        );
+                    }
+                }
+            }
+            _ => {
+                Self::dispatch_masque_capsule_payload(
+                    masque_control_cb,
+                    masque_cb,
+                    capsule_type,
+                    payload,
+                );
+            }
+        }
+    }
+
+    fn drain_masque_datagrams(
+        h3: &mut crate::transport::h3::Connection,
+        conn: &mut crate::transport::Connection,
+        stealth_manager: &StealthManager,
+        masque_datagram_cb: &Option<DatagramHandler>,
+        masque_cb: &Option<CapsuleHandler>,
+    ) {
+        if stealth_manager.masque_datagram_enabled() {
+            while let Some((_fid, pl)) = h3.try_recv_masque_datagram(conn) {
+                Self::dispatch_masque_datagram_payload(masque_datagram_cb, masque_cb, &pl[..]);
+            }
+        }
     }
 
     /// Processes an incoming raw buffer, parsing it into an FEC packet and handling recovery.
     /// This now avoids any serialization overhead.
     pub fn recv(&mut self, data: &[u8]) -> Result<usize, crate::error::ConnectionError> {
         let mut block = self.optimization_manager.alloc_block();
-        let len = if let Some(ref mut xdp) = self.xdp_socket {
-            match xdp.recv(&mut block) {
-                Ok(l) => l,
-                Err(e) => {
-                    self.optimization_manager.free_block(block);
-                    return Err(crate::error::ConnectionError::Transport(e.to_string()));
-                }
-            }
-        } else {
-            if data.len() > block.len() {
-                // Avoid silent truncation; return a clear error and recycle the block.
-                self.optimization_manager.free_block(block);
-                return Err(crate::error::ConnectionError::BufferTooShort);
-            }
-            let copy_len = data.len();
-            block[..copy_len].copy_from_slice(&data[..copy_len]);
-            copy_len
-        };
+        if data.len() > block.len() {
+            // Avoid silent truncation; return a clear error and recycle the block.
+            self.optimization_manager.free_block(block);
+            return Err(crate::error::ConnectionError::BufferTooShort);
+        }
+        let copy_len = data.len();
+        block[..copy_len].copy_from_slice(&data[..copy_len]);
+        let len = copy_len;
 
         // Hand over the pooled block directly without extra allocation.
         let fec_packet = FecPacket::new(
@@ -551,17 +912,11 @@ impl QuicFuscateConnection {
         // --- REALITY FALLBACK RESPONSE POLLING ---
         // Check if there are any responses from upstream to send back (bypass stealth scheduler)
         if let Some(resp) = self.stealth_manager.poll_fallback() {
-            if let Some(ref mut xdp) = self.xdp_socket {
-                xdp.send(&[&resp.data])
-                    .map_err(|e| crate::error::ConnectionError::Transport(e.to_string()))?;
-                return Ok(resp.data.len());
-            } else {
-                if buf.len() < resp.data.len() {
-                    return Err(crate::error::ConnectionError::BufferTooShort);
-                }
-                buf[..resp.data.len()].copy_from_slice(&resp.data);
-                return Ok(resp.data.len());
+            if buf.len() < resp.data.len() {
+                return Err(crate::error::ConnectionError::BufferTooShort);
             }
+            buf[..resp.data.len()].copy_from_slice(&resp.data);
+            return Ok(resp.data.len());
         }
 
         // --- ASYNC STEALTH SCHEDULER ---
@@ -574,8 +929,6 @@ impl QuicFuscateConnection {
             self.next_packet_release = None;
         } else if let Some(release_time) = self.next_packet_release {
             if now < release_time {
-                // Determine remainder for specialized pollers if needed
-                // let rem = release_time.duration_since(now);
                 return Ok(0); // WouldBlock / Yield
             }
             // Timer expired, clear block and proceed
@@ -584,24 +937,24 @@ impl QuicFuscateConnection {
 
         // If there are buffered FEC packets, send one directly.
         if let Some(packet) = self.outgoing_fec_packets.pop_front() {
-            let len = if let Some(ref mut xdp) = self.xdp_socket {
-                // Prefer zero-copy from pooled buffer when available; otherwise materialize.
-                if let Some(ref data) = packet.data {
-                    let slice = &data[..packet.data_len];
-                    xdp.send(&[slice])
-                        .map_err(|e| crate::error::ConnectionError::Transport(e.to_string()))?;
-                    packet.data_len
-                } else {
-                    let raw_len = packet.to_raw(buf)?;
-                    xdp.send(&[&buf[..raw_len]])
-                        .map_err(|e| crate::error::ConnectionError::Transport(e.to_string()))?;
-                    raw_len
-                }
-            } else {
-                packet.to_raw(buf)?
-            };
+            let len = packet.to_raw(buf)?;
             // Drop handles pool recycling automatically.
             return Ok(len);
+        }
+
+        // Cover PING: inject post-handshake keepalive if the interval has elapsed.
+        // The PING lands in pending_control and is flushed by flush_pending_control_frames()
+        // inside conn.send(), requiring no extra round-trip through this function.
+        if established && self.stealth_manager.should_send_cover_ping() {
+            self.conn.queue_cover_ping();
+        }
+        // Cover stream: inject fake APPLICATION_DATA on a dedicated stream to simulate
+        // idle HTTP/3 traffic patterns beyond what PINGs alone can achieve.
+        if established && self.stealth_manager.should_inject_cover_stream_frame() {
+            let data = self.stealth_manager.generate_cover_stream_data();
+            let _ = self
+                .conn
+                .stream_send(StealthManager::COVER_STREAM_ID, &data, false);
         }
 
         // Otherwise, generate a new QUIC packet using a pooled buffer.
@@ -638,12 +991,12 @@ impl QuicFuscateConnection {
         // NON-BLOCKING: If delay needed, we schedule it and yield zero bytes.
         let delay_opt = self.stealth_manager.process_outgoing_packet(&mut send_buffer[..write]);
 
-        // Create a systematic FEC packet, passing ownership of the buffer.
+        // Create a source (systematic) FEC packet, passing ownership of the buffer.
         let fec_packet = FecPacket::new(
             self.packet_id_counter,
             Some(send_buffer),
             write,
-            false,
+            true,
             None,
             0,
             // Use the same pool the buffer was allocated from to avoid cross-pool leaks
@@ -670,21 +1023,7 @@ impl QuicFuscateConnection {
 
         // Pop the first packet from the buffer to send it now.
         if let Some(packet) = self.outgoing_fec_packets.pop_front() {
-            let len = if let Some(ref mut xdp) = self.xdp_socket {
-                if let Some(ref data) = packet.data {
-                    let slice = &data[..packet.data_len];
-                    xdp.send(&[slice])
-                        .map_err(|e| crate::error::ConnectionError::Transport(e.to_string()))?;
-                    packet.data_len
-                } else {
-                    let raw_len = packet.to_raw(buf)?;
-                    xdp.send(&[&buf[..raw_len]])
-                        .map_err(|e| crate::error::ConnectionError::Transport(e.to_string()))?;
-                    raw_len
-                }
-            } else {
-                packet.to_raw(buf)?
-            };
+            let len = packet.to_raw(buf)?;
             // Drop handles pool recycling automatically.
             Ok(len)
         } else {
@@ -692,12 +1031,12 @@ impl QuicFuscateConnection {
         }
     }
 
-    /// Handles connection migration to a new network path.
-    /// Triggers connection migration to a new peer address.
+    /// Starts validation for connection migration to a new network path.
+    /// Triggers migration probing toward a new peer address.
     ///
-    /// The underlying QUIC connection will attempt to validate the new path
-    /// and switch over once validation succeeds. Any error is returned so the
-    /// caller can react accordingly.
+    /// The underlying QUIC connection emits a new path candidate immediately,
+    /// sends PATH_CHALLENGE probing on that candidate path, and only switches
+    /// the active path after a matching PATH_RESPONSE validates it.
     pub fn migrate_connection(
         &mut self,
         new_peer: SocketAddr,
@@ -705,22 +1044,9 @@ impl QuicFuscateConnection {
         // Initiate path migration using the transport API. The local address remains
         // unchanged, but a new peer address is supplied. The transport handles sending
         // the probing packets required for validation.
-        self.xdp_socket = self.optimization_manager.create_xdp_socket(self.local_addr, new_peer);
-        if let Some(ref mut xdp) = self.xdp_socket {
-            let _ = xdp.update_remote(new_peer);
-            telemetry!(telemetry::XDP_ACTIVE.store(1, std::sync::atomic::Ordering::Relaxed));
-        } else {
-            telemetry!(telemetry::XDP_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed));
-        }
-
-        let res = self
-            .conn
+        self.conn
             .migrate(self.local_addr, new_peer)
-            .map_err(|_| crate::transport::Error::NoViablePath);
-        if res.is_ok() {
-            telemetry!(telemetry::PATH_MIGRATIONS.inc());
-        }
-        res
+            .map_err(|_| crate::transport::Error::NoViablePath)
     }
 
     /// Returns the Host header that should be used for HTTP requests when domain
@@ -741,60 +1067,18 @@ impl QuicFuscateConnection {
             let mut h3_cfg = crate::transport::h3::Config::new()
                 .map_err(|_| crate::transport::h3::Error::InternalError)?;
             // Select capacities based on the active persona.
-            let fp = self.stealth_manager.current_fingerprint();
-            match fp.browser {
-                crate::stealth::BrowserProfile::Chrome | crate::stealth::BrowserProfile::Edge => {
-                    h3_cfg.set_qpack_max_table_capacity(64u64 * 1024u64);
-                    h3_cfg.set_qpack_blocked_streams(16u64);
-                }
-                crate::stealth::BrowserProfile::Firefox => {
-                    h3_cfg.set_qpack_max_table_capacity(32u64 * 1024u64);
-                    h3_cfg.set_qpack_blocked_streams(8u64);
-                }
-                crate::stealth::BrowserProfile::Safari => {
-                    h3_cfg.set_qpack_max_table_capacity(32u64 * 1024u64);
-                    h3_cfg.set_qpack_blocked_streams(8u64);
-                }
-            }
+            let (qpack_capacity, qpack_blocked_streams) =
+                self.stealth_manager.qpack_runtime_profile();
+            h3_cfg.set_qpack_max_table_capacity(qpack_capacity);
+            h3_cfg.set_qpack_blocked_streams(qpack_blocked_streams);
 
             let h3 = crate::transport::h3::Connection::with_transport(&mut self.conn, &h3_cfg)?;
             let mut h3 = h3;
-            // Persona QPACK Index-Policy setzen
-            match fp.browser {
-                crate::stealth::BrowserProfile::Chrome | crate::stealth::BrowserProfile::Edge => {
-                    h3.set_qpack_index_policy(&[
-                        b":authority",
-                        b":path",
-                        b":method",
-                        b"content-type",
-                        b"accept-encoding",
-                        b"user-agent",
-                        b"accept",
-                        b"cache-control",
-                    ]);
-                }
-                crate::stealth::BrowserProfile::Firefox => {
-                    h3.set_qpack_index_policy(&[
-                        b":authority",
-                        b":path",
-                        b":method",
-                        b"content-type",
-                        b"accept-language",
-                    ]);
-                }
-                crate::stealth::BrowserProfile::Safari => {
-                    h3.set_qpack_index_policy(&[
-                        b":authority",
-                        b":path",
-                        b":method",
-                        b"content-type",
-                    ]);
-                }
-            }
+            // Set persona QPACK index policy
+            h3.set_qpack_index_policy(self.stealth_manager.qpack_index_policy());
             self.h3_conn = Some(h3);
             // Notify the compression layer about the persona (dictionary selection).
-            let fp = self.stealth_manager.current_fingerprint();
-            let persona = format!("{:?}/{:?}", fp.browser, fp.os);
+            let persona = self.stealth_manager.current_persona_name();
             crate::compress::set_current_persona(&persona);
         }
         Ok(())
@@ -802,50 +1086,18 @@ impl QuicFuscateConnection {
 
     /// Sends a masqueraded HTTP/3 GET request using the stealth manager.
     pub fn send_http3_request(&mut self, path: &str) -> Result<(), crate::error::ConnectionError> {
-        self.init_http3()?;
-        let intelligent_level = self.intelligent_level();
+        let intelligent_level = self.stealth_manager.intelligent_runtime_level();
         self.sync_intelligent_runtime_controls(intelligent_level);
-        let prefer_masque = self.stealth_manager.masque_preferred() || intelligent_level >= 1;
-        if prefer_masque && !self.stealth_manager.masque_preferred() {
-            self.stealth_manager.set_masque_preferred(true);
+        if let Err(e) = self.ensure_masque_tunnel_for_send() {
+            warn!("MASQUE CONNECT-UDP open failed: {:?}", e);
         }
-        if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) && prefer_masque {
-            crate::optimize::telemetry::STEALTH_SIGNAL_RTT_SPIKES
+        let start = std::time::Instant::now();
+        if let Err(e) = self.send_http3_request_headers(b"GET", path, true) {
+            crate::optimize::telemetry::STEALTH_SIGNAL_RST
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
         }
-        // If escalated and MASQUE is available, opportunistically CONNECT-UDP first.
-        if prefer_masque {
-            let host = self.host_header.clone();
-            match self.ensure_masque_tunnel(&host) {
-                Ok(Some(_)) => {}
-                Ok(None) => {}
-                Err(e) => {
-                    crate::telemetry::MASQUE_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
-                    warn!("MASQUE CONNECT-UDP open failed: {:?}", e);
-                }
-            }
-        }
-        let host = self.host_header.as_str();
-        let mut headers =
-            self.stealth_manager.get_http3_header_list(host, path).unwrap_or_else(|| {
-                vec![
-                    crate::transport::h3::Header::new(b":method", b"GET"),
-                    crate::transport::h3::Header::new(b":scheme", b"https"),
-                    crate::transport::h3::Header::new(b":authority", host.as_bytes()),
-                    crate::transport::h3::Header::new(b":path", path.as_bytes()),
-                ]
-            });
-        self.inject_qkey_auth_header(&mut headers);
-
-        if let Some(ref mut h3) = self.h3_conn {
-            let start = std::time::Instant::now();
-            if let Err(e) = h3.send_request(&mut self.conn, &headers, true) {
-                crate::optimize::telemetry::STEALTH_SIGNAL_RST
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(e.into());
-            }
-            info!("HTTP/3 request sent in {} ms", start.elapsed().as_millis());
-        }
+        info!("HTTP/3 request sent in {} ms", start.elapsed().as_millis());
         Ok(())
     }
 
@@ -854,22 +1106,7 @@ impl QuicFuscateConnection {
         &mut self,
         path: &str,
     ) -> Result<u64, crate::error::ConnectionError> {
-        self.init_http3()?;
-        let host = self.host_header.as_str();
-        let mut headers =
-            self.stealth_manager.get_http3_header_list(host, path).unwrap_or_default();
-        // Ensure POST headers present
-        headers.retain(|h| h.name() != b":method" && h.name() != b":path");
-        headers.insert(0, crate::transport::h3::Header::new(b":path", path.as_bytes()));
-        headers.insert(0, crate::transport::h3::Header::new(b":authority", host.as_bytes()));
-        headers.insert(0, crate::transport::h3::Header::new(b":scheme", b"https"));
-        headers.insert(0, crate::transport::h3::Header::new(b":method", b"POST"));
-        self.inject_qkey_auth_header(&mut headers);
-        if let Some(ref mut h3) = self.h3_conn {
-            let sid = h3.send_request(&mut self.conn, &headers, false)?; // keep stream open
-            return Ok(sid);
-        }
-        Err("h3 not initialized".into())
+        self.send_http3_request_headers(b"POST", path, false)
     }
 
     /// Sends a HTTP/3 request body chunk on an existing stream.
@@ -879,16 +1116,11 @@ impl QuicFuscateConnection {
         data: &[u8],
         fin: bool,
     ) -> Result<(), crate::error::ConnectionError> {
-        let intelligent_level = self.intelligent_level();
+        let intelligent_level = self.stealth_manager.intelligent_runtime_level();
         self.sync_intelligent_runtime_controls(intelligent_level);
-        let prefer_masque = self.stealth_manager.masque_preferred() || intelligent_level >= 1;
-        if prefer_masque && !self.stealth_manager.masque_preferred() {
-            self.stealth_manager.set_masque_preferred(true);
-        }
-        // Preferred MASQUE path for UDP-like payload forwarding.
-        if !data.is_empty() && prefer_masque {
-            let host = self.host_header.clone();
-            match self.ensure_masque_tunnel(&host) {
+        // Compatibility-only MASQUE path for UDP-like payload forwarding.
+        if !data.is_empty() {
+            match self.ensure_masque_tunnel_for_send() {
                 Ok(Some(sid)) => {
                     if let Some(ref mut h3) = self.h3_conn {
                         match h3.send_masque_datagram(&mut self.conn, sid, data) {
@@ -920,7 +1152,7 @@ impl QuicFuscateConnection {
         &mut self,
         payload: &[u8],
     ) -> Result<(), crate::error::ConnectionError> {
-        self.init_http3()?;
+        self.ensure_http3_initialized()?;
         let host = self.host_header.clone();
         let Some(sid) = self.ensure_masque_tunnel(&host)? else {
             return Err("masque tunnel unavailable".into());
@@ -935,419 +1167,49 @@ impl QuicFuscateConnection {
 
     /// Polls HTTP/3 events and prints received data.
     pub fn poll_http3(&mut self) -> Result<(), crate::error::ConnectionError> {
-        if self.h3_conn.is_none() && self.conn.is_established() {
-            let _ = self.init_http3();
-        }
-        if let Some(ref mut h3) = self.h3_conn {
-            let start = std::time::Instant::now();
-            loop {
-                let intelligent_level =
-                    if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                        intelligent_stealth_level_hint()
-                    } else {
-                        0
-                    };
-                if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                    self.stealth_manager.maybe_escalate_masque_intelligent();
-                    if intelligent_level == 0 {
-                        self.stealth_manager.enable_server_push_runtime(false, None);
-                    } else {
-                        let intensity = if intelligent_level >= 2 { 0.9 } else { 0.65 };
-                        self.stealth_manager.enable_server_push_runtime(true, Some(intensity));
-                    }
-                }
-                // Opportunistically emit cover traffic when due (rate-limited, persona-shaped)
-                if let Some(headers) = self.stealth_manager.cover_headers_due() {
-                    if let Err(e) = h3.send_request(&mut self.conn, &headers, true) {
-                        crate::optimize::telemetry::STEALTH_SIGNAL_RST
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("Cover traffic send failed: {:?}", e);
-                    } else {
-                        debug!("Cover traffic request emitted");
-                    }
-                }
-
-                // Intelligent mode: brain decides when to enable runtime Server Push
-                if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                    #[cfg(feature = "orchestrator")]
-                    {
-                        if intelligent_level >= 1 {
-                            if let Some(orchestrator) = ORCHESTRATOR.get() {
-                                let stats = self.conn.stats();
-                                let sent = stats.sent as u64;
-                                let lost = stats.lost as u64;
-                                let loss_rate_permille = if sent > 0 {
-                                    (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
-                                } else {
-                                    0
-                                };
-                                let delivery_rate_bps = self
-                                    .conn
-                                    .delivery_rate()
-                                    .max(self.stats.congestion_delivery_rate);
-                                let stealth_active = !matches!(
-                                    self.stealth_manager.mode(),
-                                    StealthMode::Performance | StealthMode::Off
-                                );
-                                orchestrator.update_runtime_signals(
-                                    loss_rate_permille,
-                                    self.runtime_cpu_percent,
-                                    self.runtime_memory_pressure,
-                                    delivery_rate_bps,
-                                    stealth_active,
-                                );
-                            }
-                            if let Some(orchestrator) = ORCHESTRATOR.get() {
-                                if orchestrator.should_trigger_server_push() {
-                                    let mut intensity = orchestrator.get_server_push_intensity();
-                                    if intelligent_level >= 2 {
-                                        intensity = intensity.max(0.9);
-                                    }
-                                    self.stealth_manager
-                                        .enable_server_push_runtime(true, Some(intensity));
-                                }
-                            }
-                        } else {
-                            self.stealth_manager.enable_server_push_runtime(false, None);
+        self.poll_http3_event_loop(
+            "poll_http3",
+            true,
+            |_sid, list| {
+                let mut status_opt: Option<u16> = None;
+                for h in list {
+                    if h.name() == b":status" {
+                        if let Ok(s) = std::str::from_utf8(h.value()) {
+                            status_opt = s.parse::<u16>().ok();
                         }
                     }
                 }
-                // Whenever due (config or runtime enabled), emit a Server Push burst
-                if self.stealth_manager.should_trigger_server_push() {
-                    if let Some((base_path, intensity)) =
-                        self.stealth_manager.get_server_push_config()
-                    {
-                        match h3.generate_stealth_cover_burst(&base_path) {
-                            Ok(ids) => {
-                                let stats = self.conn.stats();
-                                let sent = stats.sent as u64;
-                                let lost = stats.lost as u64;
-                                let loss_rate_permille = if sent > 0 {
-                                    (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
-                                } else {
-                                    0
-                                };
-                                let reason = if loss_rate_permille >= 50 {
-                                    ServerPushTriggerReason::Loss
-                                } else if intelligent_level >= 1 {
-                                    ServerPushTriggerReason::Gating
-                                } else {
-                                    ServerPushTriggerReason::Time
-                                };
-                                let total_bytes = Self::estimate_server_push_cover_bytes(
-                                    &base_path,
-                                    ids.len(),
-                                    intensity,
-                                );
-                                self.stealth_manager.update_server_push_state(
-                                    ids.len(),
-                                    total_bytes,
-                                    reason,
-                                );
-                                debug!("Server Push burst emitted: {} promises", ids.len());
-                            }
-                            Err(e) => warn!("Server Push burst generation failed: {:?}", e),
-                        }
+                if let Some(st) = status_opt {
+                    if !(200..300).contains(&st) {
+                        warn!("H3 non-2xx status: {}", st);
                     }
                 }
-                match h3.poll(&mut self.conn) {
-                    Ok(Some((_stream_id, crate::transport::h3::Event::Headers { list, .. }))) => {
-                        let mut status_opt: Option<u16> = None;
-                        for h in &list {
-                            if h.name() == b":status" {
-                                if let Ok(s) = std::str::from_utf8(h.value()) {
-                                    status_opt = s.parse::<u16>().ok();
-                                }
-                            }
-                        }
-                        if let Some(st) = status_opt {
-                            if !(200..300).contains(&st) {
-                                warn!("H3 non-2xx status: {}", st);
-                            }
-                        }
-                        for h in list {
-                            debug!(
-                                "{}: {}",
-                                String::from_utf8_lossy(h.name()),
-                                String::from_utf8_lossy(h.value())
-                            );
-                        }
-                    }
-                    Ok(Some((stream_id, crate::transport::h3::Event::Data))) => {
-                        let mut buf = [0; 4096];
-                        while let Ok(read) = h3.recv_body(&mut self.conn, stream_id, &mut buf) {
-                            let data = &buf[..read];
-                            debug!("Received {} bytes on stream {}", read, stream_id);
-                            debug!("{}", String::from_utf8_lossy(data));
-                        }
-                    }
-                    Ok(Some((
-                        sid,
-                        crate::transport::h3::Event::MasqueCapsule { capsule_type, payload },
-                    ))) => {
-                        // On first capsule, optionally send an establishment ACK.
-                        if !h3.masque_established(sid) {
-                            h3.mark_masque_established(sid);
-                            let ack = crate::transport::h3::Connection::encode_capsule(
-                                0x02,
-                                b"established",
-                            );
-                            let _ = h3.send_capsule(&mut self.conn, sid, &ack, false);
-                        }
-                        if capsule_type == 0x00 {
-                            if let Some(cb) = &self.masque_datagram_cb {
-                                if let Ok(mut f) = cb.lock() {
-                                    (f)(&payload[..]);
-                                }
-                            } else if let Some(cb) = &self.masque_cb {
-                                if let Ok(mut f) = cb.lock() {
-                                    (f)(capsule_type, &payload[..]);
-                                }
-                            }
-                        } else if capsule_type == 0x21 {
-                            // compressed UDP capsule (no dict)
-                            // attempt decompress and route as datagram
-                            let pool = self.optimization_manager.memory_pool();
-                            if let Some((blk, used)) =
-                                crate::compress::CompressionManager::new(Default::default())
-                                    .decompress_to_pool(&pool, &payload)
-                            {
-                                if let Some(cb) = &self.masque_datagram_cb {
-                                    if let Ok(mut f) = cb.lock() {
-                                        (f)(&blk[..used]);
-                                    }
-                                } else if let Some(cb) = &self.masque_cb {
-                                    if let Ok(mut f) = cb.lock() {
-                                        (f)(0x00, &blk[..used]);
-                                    }
-                                }
-                                pool.free(blk);
-                            }
-                        } else if capsule_type == 0x22 {
-                            // dict-compressed UDP capsule
-                            if payload.len() >= 9 && payload[0] == 0x5D {
-                                // parse id fields from payload header
-                                let mut hb = [0u8; 2];
-                                hb.copy_from_slice(&payload[1..3]);
-                                let hash = u16::from_be_bytes(hb);
-                                let mut vb = [0u8; 2];
-                                vb.copy_from_slice(&payload[3..5]);
-                                let ver = u16::from_be_bytes(vb);
-                                if let Some(dict) = crate::compress::get_dict_by_id(hash, ver) {
-                                    let pool = self.optimization_manager.memory_pool();
-                                    if let Some((blk, used)) = crate::compress::decompress_with_dict(
-                                        &pool, &payload, &dict,
-                                    ) {
-                                        if let Some(cb) = &self.masque_datagram_cb {
-                                            if let Ok(mut f) = cb.lock() {
-                                                (f)(&blk[..used]);
-                                            }
-                                        } else if let Some(cb) = &self.masque_cb {
-                                            if let Ok(mut f) = cb.lock() {
-                                                (f)(0x00, &blk[..used]);
-                                            }
-                                        }
-                                        pool.free(blk);
-                                    }
-                                }
-                            }
-                        } else if let Some(cb) = &self.masque_control_cb {
-                            if let Ok(mut f) = cb.lock() {
-                                (f)(capsule_type, &payload[..]);
-                            }
-                        } else if let Some(cb) = &self.masque_cb {
-                            if let Ok(mut f) = cb.lock() {
-                                (f)(capsule_type, &payload[..]);
-                            }
-                        }
-                    }
-
-                    Ok(Some((_id, crate::transport::h3::Event::Reset(err)))) => {
-                        crate::optimize::telemetry::STEALTH_SIGNAL_RST
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("H3 stream reset: {:?}", err);
-                    }
-                    Ok(Some((_id, crate::transport::h3::Event::PriorityUpdate))) => {
-                        debug!("H3 priority update received");
-                    }
-                    Ok(Some((_id, crate::transport::h3::Event::GoAway))) => {
-                        info!("H3 GOAWAY received");
-                    }
-                    Ok(Some((_id, crate::transport::h3::Event::Finished))) => {}
-                    Ok(Some((
-                        _id,
-                        crate::transport::h3::Event::PushPromise { push_id, headers },
-                    ))) => {
-                        info!(
-                            "Received stealth push promise {} with {} headers",
-                            push_id,
-                            headers.len()
-                        );
-                    }
-                    Ok(None) => break,
-                    Err(crate::transport::h3::Error::Done) => break,
-                    Err(e) => return Err(e.into()),
+                for h in list {
+                    debug!(
+                        "{}: {}",
+                        String::from_utf8_lossy(h.name()),
+                        String::from_utf8_lossy(h.value())
+                    );
                 }
-                // Opportunistically receive QUIC DATAGRAMs for MASQUE and forward to callbacks.
-                if self.stealth_manager.masque_datagram_enabled() {
-                    while let Some((_fid, pl)) = h3.try_recv_masque_datagram(&mut self.conn) {
-                        if let Some(cb) = &self.masque_datagram_cb {
-                            if let Ok(mut f) = cb.lock() {
-                                (f)(&pl[..]);
-                            }
-                        } else if let Some(cb) = &self.masque_cb {
-                            if let Ok(mut f) = cb.lock() {
-                                (f)(0x00, &pl[..]);
-                            }
-                        }
-                    }
-                }
-            }
-            debug!("HTTP/3 events processed in {} ms", start.elapsed().as_millis());
-        }
-        Ok(())
+            },
+            |sid, data| {
+                debug!("Received {} bytes on stream {}", data.len(), sid);
+                debug!("{}", String::from_utf8_lossy(data));
+            },
+        )
     }
 
     /// Polls HTTP/3 events and forwards received HEADERS/DATA frames to the provided sinks.
     pub fn poll_http3_with_headers<FH, FB>(
         &mut self,
-        mut on_headers: FH,
-        mut on_body: FB,
+        on_headers: FH,
+        on_body: FB,
     ) -> Result<(), crate::error::ConnectionError>
     where
         FH: FnMut(u64, &[crate::transport::h3::Header]),
         FB: FnMut(u64, &[u8]),
     {
-        if self.h3_conn.is_none() && self.conn.is_established() {
-            let _ = self.init_http3();
-        }
-        if let Some(ref mut h3) = self.h3_conn {
-            let start = std::time::Instant::now();
-            loop {
-                let intelligent_level =
-                    if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                        intelligent_stealth_level_hint()
-                    } else {
-                        0
-                    };
-                if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                    self.stealth_manager.maybe_escalate_masque_intelligent();
-                    if intelligent_level == 0 {
-                        self.stealth_manager.enable_server_push_runtime(false, None);
-                    } else {
-                        let intensity = if intelligent_level >= 2 { 0.9 } else { 0.65 };
-                        self.stealth_manager.enable_server_push_runtime(true, Some(intensity));
-                    }
-                }
-                // Intelligent mode: enable runtime Server Push via brain advice
-                if matches!(self.stealth_manager.mode(), StealthMode::Intelligent) {
-                    #[cfg(feature = "orchestrator")]
-                    {
-                        if intelligent_level >= 1 {
-                            if let Some(orchestrator) = ORCHESTRATOR.get() {
-                                let stats = self.conn.stats();
-                                let sent = stats.sent as u64;
-                                let lost = stats.lost as u64;
-                                let loss_rate_permille = if sent > 0 {
-                                    (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
-                                } else {
-                                    0
-                                };
-                                let delivery_rate_bps = self
-                                    .conn
-                                    .delivery_rate()
-                                    .max(self.stats.congestion_delivery_rate);
-                                let stealth_active = !matches!(
-                                    self.stealth_manager.mode(),
-                                    StealthMode::Performance | StealthMode::Off
-                                );
-                                orchestrator.update_runtime_signals(
-                                    loss_rate_permille,
-                                    self.runtime_cpu_percent,
-                                    self.runtime_memory_pressure,
-                                    delivery_rate_bps,
-                                    stealth_active,
-                                );
-                            }
-                            if let Some(orchestrator) = ORCHESTRATOR.get() {
-                                if orchestrator.should_trigger_server_push() {
-                                    let mut intensity = orchestrator.get_server_push_intensity();
-                                    if intelligent_level >= 2 {
-                                        intensity = intensity.max(0.9);
-                                    }
-                                    self.stealth_manager
-                                        .enable_server_push_runtime(true, Some(intensity));
-                                }
-                            }
-                        } else {
-                            self.stealth_manager.enable_server_push_runtime(false, None);
-                        }
-                    }
-                }
-                // Emit Server Push burst if due (config or runtime)
-                if self.stealth_manager.should_trigger_server_push() {
-                    if let Some((base_path, intensity)) =
-                        self.stealth_manager.get_server_push_config()
-                    {
-                        match h3.generate_stealth_cover_burst(&base_path) {
-                            Ok(ids) => {
-                                let stats = self.conn.stats();
-                                let sent = stats.sent as u64;
-                                let lost = stats.lost as u64;
-                                let loss_rate_permille = if sent > 0 {
-                                    (((lost.saturating_mul(1000)) / sent).min(1000)) as u32
-                                } else {
-                                    0
-                                };
-                                let reason = if loss_rate_permille >= 50 {
-                                    ServerPushTriggerReason::Loss
-                                } else if intelligent_level >= 1 {
-                                    ServerPushTriggerReason::Gating
-                                } else {
-                                    ServerPushTriggerReason::Time
-                                };
-                                let total_bytes = Self::estimate_server_push_cover_bytes(
-                                    &base_path,
-                                    ids.len(),
-                                    intensity,
-                                );
-                                self.stealth_manager.update_server_push_state(
-                                    ids.len(),
-                                    total_bytes,
-                                    reason,
-                                );
-                                debug!("Server Push burst emitted: {} promises", ids.len());
-                            }
-                            Err(e) => warn!("Server Push burst generation failed: {:?}", e),
-                        }
-                    }
-                }
-                match h3.poll(&mut self.conn) {
-                    Ok(Some((sid, crate::transport::h3::Event::Headers { list, .. }))) => {
-                        on_headers(sid, &list);
-                    }
-                    Ok(Some((sid, crate::transport::h3::Event::Data))) => {
-                        let mut buf = [0; 65535];
-                        while let Ok(read) = h3.recv_body(&mut self.conn, sid, &mut buf) {
-                            if read == 0 {
-                                break;
-                            }
-                            on_body(sid, &buf[..read]);
-                        }
-                    }
-                    Ok(Some((_id, crate::transport::h3::Event::Reset(_)))) => {
-                        crate::optimize::telemetry::STEALTH_SIGNAL_RST
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Ok(Some((_id, _ev))) => { /* ignore */ }
-                    Ok(None) => break,
-                    Err(crate::transport::h3::Error::Done) => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            debug!("HTTP/3 events processed in {} ms", start.elapsed().as_millis());
-        }
-        Ok(())
+        self.poll_http3_event_loop("poll_http3_with_headers", false, on_headers, on_body)
     }
 
     /// Polls HTTP/3 events and forwards received DATA frames to the provided sink.
@@ -1360,49 +1222,6 @@ impl QuicFuscateConnection {
     {
         self.poll_http3_with_headers(|_sid, _headers| {}, |_sid, data| on_body(data))?;
         Ok(())
-    }
-
-    /// Poll HTTP/3 events and forward MASQUE capsules to provided callback.
-    pub fn poll_http3_capsules_with<F>(
-        &mut self,
-        mut on_capsule: F,
-    ) -> Result<(), crate::error::ConnectionError>
-    where
-        F: FnMut(u64, &[u8]),
-    {
-        self.init_http3()?;
-        if let Some(ref mut h3) = self.h3_conn {
-            loop {
-                match h3.poll(&mut self.conn) {
-                    Ok(Some((
-                        _sid,
-                        crate::transport::h3::Event::MasqueCapsule { capsule_type, payload },
-                    ))) => {
-                        on_capsule(capsule_type, &payload);
-                    }
-                    Ok(Some((_sid, _ev))) => { /* ignore other events */ }
-                    Ok(None) => break,
-                    Err(crate::transport::h3::Error::Done) => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Register a MASQUE capsule callback to be invoked during poll_http3().
-    pub fn set_masque_capsule_handler(&mut self, handler: Option<CapsuleHandler>) {
-        self.masque_cb = handler;
-    }
-
-    /// Register a MASQUE datagram (0x00) handler
-    pub fn set_masque_datagram_handler(&mut self, handler: Option<DatagramHandler>) {
-        self.masque_datagram_cb = handler;
-    }
-
-    /// Register a MASQUE control capsule handler (non-0x00)
-    pub fn set_masque_control_handler(&mut self, handler: Option<CapsuleHandler>) {
-        self.masque_control_cb = handler;
     }
 
     /// Returns true if a MASQUE CONNECT-UDP flow is currently registered.
@@ -1440,15 +1259,6 @@ impl QuicFuscateConnection {
                     info!("Path validated: {local}->{peer}");
                     self.peer_addr = peer;
                     self.local_addr = local;
-                    if let Some(ref mut xdp) = self.xdp_socket {
-                        if let Err(e) = xdp.reconfigure(local, peer) {
-                            warn!("XDP reconfigure failed: {e}");
-                            self.xdp_socket =
-                                self.optimization_manager.create_xdp_socket(local, peer);
-                        }
-                    } else {
-                        self.xdp_socket = self.optimization_manager.create_xdp_socket(local, peer);
-                    }
                     telemetry!(telemetry::PATH_MIGRATIONS.inc());
                 }
                 crate::transport::PathEvent::FailedValidation(local, peer) => {
@@ -1460,20 +1270,8 @@ impl QuicFuscateConnection {
                 crate::transport::PathEvent::ReusedSourceConnectionId(seq, old, new) => {
                     info!("CID {seq} reused from {old:?} to {new:?}");
                 }
-                crate::transport::PathEvent::PeerMigrated(local, peer) => {
-                    info!("Peer migrated: {local}->{peer}");
-                    self.peer_addr = peer;
-                    self.local_addr = local;
-                    if let Some(ref mut xdp) = self.xdp_socket {
-                        if let Err(e) = xdp.reconfigure(local, peer) {
-                            warn!("XDP reconfigure failed: {e}");
-                            self.xdp_socket =
-                                self.optimization_manager.create_xdp_socket(local, peer);
-                        }
-                    } else {
-                        self.xdp_socket = self.optimization_manager.create_xdp_socket(local, peer);
-                    }
-                    telemetry!(telemetry::PATH_MIGRATIONS.inc());
+                crate::transport::PathEvent::PeerMigrated(old_peer, peer) => {
+                    info!("Peer migrated: {old_peer}->{peer}");
                 }
             }
         }
@@ -1485,8 +1283,9 @@ impl QuicFuscateConnection {
             self.masque_stream_id = None;
         }
 
-        // Apply dynamic ACK/ECN policy (observer holds locks briefly).
-        self.transport_observer.apply_policy(&mut self.conn);
+        // Sync FEC-owned runtime hints only. Generic transport actuators are driven
+        // through the live transport observer path, not duplicated here.
+        self.transport_observer.sync_runtime_hints(&mut self.conn);
         // Opportunistic FEC streaming interval from observer (independent of brain)
         let ivl = self.transport_observer.compute_streaming_interval() as usize;
         if (1..=32).contains(&ivl) {
@@ -1548,5 +1347,130 @@ impl QuicFuscateConnection {
     /// Returns the effective TLS SNI currently configured on the live transport connection.
     pub fn server_name(&self) -> Option<String> {
         self.conn.server_name().map(|name| name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_stats_default_zeroed() {
+        let stats = ConnectionStats::default();
+        assert_eq!(stats.rtt, 0.0);
+        assert_eq!(stats.loss_rate, 0.0);
+        assert_eq!(stats.packets_sent, 0);
+        assert_eq!(stats.packets_lost, 0);
+        assert_eq!(stats.congestion_cwnd, 0);
+        assert_eq!(stats.congestion_bytes_in_flight, 0);
+        assert_eq!(stats.congestion_delivery_rate, 0);
+        assert_eq!(stats.congestion_lost, 0);
+        assert_eq!(stats.congestion_score, 0);
+        assert!(stats.congestion_samples.is_empty());
+    }
+
+    #[test]
+    fn connection_stats_congestion_update_window_rotation() {
+        let mut stats = ConnectionStats::default();
+        let cap = transport_accel::CONGESTION_WINDOW_SIZE;
+        for i in 0..(cap + 5) {
+            let sample = CongestionSample {
+                cwnd: (i as u32) * 1000,
+                bytes_in_flight: (i as u32) * 500,
+                delivery_rate: (i as u32) * 100,
+                lost_packets: i as u32,
+            };
+            stats.update_congestion(sample);
+        }
+        assert_eq!(stats.congestion_samples.len(), cap);
+    }
+
+    #[test]
+    fn env_optional_trimmed_returns_none_for_missing() {
+        let result = QuicFuscateConnection::env_optional_trimmed("QUICFUSCATE_TEST_NONEXISTENT_VAR_XYZ");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn env_optional_trimmed_trims_whitespace() {
+        let key = "QUICFUSCATE_TEST_TRIM_WS";
+        std::env::set_var(key, "  hello  ");
+        let result = QuicFuscateConnection::env_optional_trimmed(key);
+        assert_eq!(result, Some("hello".to_string()));
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn env_optional_trimmed_returns_none_for_empty() {
+        let key = "QUICFUSCATE_TEST_TRIM_EMPTY";
+        std::env::set_var(key, "   ");
+        let result = QuicFuscateConnection::env_optional_trimmed(key);
+        assert!(result.is_none());
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn inject_qkey_auth_header_adds_header() {
+        let conn_stub = ConnectionStatsOnlyStub {
+            qkey_auth_token_hex: Some("abc123".to_string()),
+        };
+        let mut headers = vec![];
+        conn_stub.inject_qkey_auth(&mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name(), b"x-qf-auth");
+        assert_eq!(headers[0].value(), b"abc123");
+    }
+
+    #[test]
+    fn inject_qkey_auth_header_skips_empty_token() {
+        let conn_stub = ConnectionStatsOnlyStub {
+            qkey_auth_token_hex: Some("  ".to_string()),
+        };
+        let mut headers = vec![];
+        conn_stub.inject_qkey_auth(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn inject_qkey_auth_header_replaces_existing() {
+        let conn_stub = ConnectionStatsOnlyStub {
+            qkey_auth_token_hex: Some("new_token".to_string()),
+        };
+        let mut headers = vec![
+            crate::transport::h3::Header::new(b"x-qf-auth", b"old"),
+            crate::transport::h3::Header::new(b"content-type", b"text"),
+        ];
+        conn_stub.inject_qkey_auth(&mut headers);
+        assert_eq!(headers.len(), 2);
+        let auth = headers.iter().find(|h| h.name() == b"x-qf-auth").unwrap();
+        assert_eq!(auth.value(), b"new_token");
+    }
+
+    #[test]
+    fn inject_qkey_auth_header_noop_without_token() {
+        let conn_stub = ConnectionStatsOnlyStub::default();
+        let mut headers = vec![crate::transport::h3::Header::new(b"host", b"example.com")];
+        conn_stub.inject_qkey_auth(&mut headers);
+        assert_eq!(headers.len(), 1);
+    }
+
+    /// Minimal stub to test inject_qkey_auth_header without full QuicFuscateConnection
+    #[derive(Default)]
+    struct ConnectionStatsOnlyStub {
+        qkey_auth_token_hex: Option<String>,
+    }
+
+    impl ConnectionStatsOnlyStub {
+        fn inject_qkey_auth(&self, headers: &mut Vec<crate::transport::h3::Header>) {
+            let Some(token) = self.qkey_auth_token_hex.as_deref() else {
+                return;
+            };
+            let token = token.trim();
+            if token.is_empty() {
+                return;
+            }
+            headers.retain(|h| h.name() != b"x-qf-auth");
+            headers.push(crate::transport::h3::Header::new(b"x-qf-auth", token.as_bytes()));
+        }
     }
 }

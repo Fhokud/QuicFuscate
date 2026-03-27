@@ -1,18 +1,24 @@
+//! Rust parity/test-only batch shim.
+//!
+//! This module is not part of the normal runtime transport surface.
+
 use crate::accelerate::transport_io as accelerate;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(test, feature = "rust-tests")))]
 use crate::optimize::SimdDispatch;
+#[cfg(any(test, feature = "rust-tests"))]
 use crate::simd::planner::AccelerationPlanner;
-use std::net::{SocketAddr, UdpSocket};
+#[cfg(any(test, feature = "rust-tests"))]
+use std::net::SocketAddr;
+use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
+#[cfg(any(test, feature = "rust-tests"))]
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "rust-tests")))]
 use std::os::unix::io::FromRawFd;
-
-use super::{MAX_BATCH_SIZE, OPTIMAL_BATCH_SIZE};
 
 #[cfg(target_os = "linux")]
 static BATCH_SENDS: AtomicUsize = AtomicUsize::new(0);
@@ -20,108 +26,113 @@ static BATCH_SENDS: AtomicUsize = AtomicUsize::new(0);
 static BATCH_RECVS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static PACKETS_BATCHED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "rust-tests"))]
+#[allow(dead_code)]
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_536;
 
-/// Ultra-fast batch packet processor with network acceleration
+/// Test/support batch packet processor with network acceleration helpers.
+#[cfg(any(test, feature = "rust-tests"))]
+#[allow(dead_code)]
 pub struct BatchProcessor {
     /// Preallocated buffers for zero-copy batch operations
-    send_buffers: Vec<Vec<u8>>,
     recv_buffers: Vec<Vec<u8>>,
     /// IO vectors for sendmmsg/recvmmsg
     #[cfg(target_os = "linux")]
-    send_msgs: Vec<libc::mmsghdr>,
-    #[cfg(target_os = "linux")]
     recv_msgs: Vec<libc::mmsghdr>,
+    #[cfg(target_os = "linux")]
+    recv_iovecs: Vec<libc::iovec>,
+    #[cfg(target_os = "linux")]
+    recv_addrs: Vec<libc::sockaddr_storage>,
     /// Batch size based on CPU features
     batch_size: usize,
-    /// Network acceleration features
-    gso_config: Option<accelerate::UdpGsoConfig>,
-    zero_copy: Option<accelerate::ZeroCopySocket>,
-    busy_poll: Option<accelerate::BusyPollSocket>,
+    #[cfg(feature = "rust-tests")]
+    force_batch_send_fallback: bool,
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
+#[allow(dead_code)]
 impl Default for BatchProcessor {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
+#[allow(dead_code)]
 impl BatchProcessor {
     pub fn new() -> Self {
         let plans = AccelerationPlanner::global();
 
         // Determine optimal batch size based on CPU
-        let batch_size = if plans.transport.has_avx512f {
-            MAX_BATCH_SIZE // 64 packets with AVX-512
-        } else if plans.transport.has_avx2 {
-            OPTIMAL_BATCH_SIZE // 32 packets with AVX2
-        } else {
-            16 // Conservative for older CPUs
-        };
+        let batch_size = plans.transport_batch_size();
 
         log::info!("BatchProcessor: {} packet batches", batch_size);
 
         // Preallocate buffers
-        let mut send_buffers = Vec::with_capacity(batch_size);
         let mut recv_buffers = Vec::with_capacity(batch_size);
 
         for _ in 0..batch_size {
-            send_buffers.push(vec![0u8; 1500]); // MTU size
-            recv_buffers.push(vec![0u8; 1500]);
+            recv_buffers.push(vec![0u8; MAX_UDP_DATAGRAM_SIZE]);
         }
 
         #[cfg(target_os = "linux")]
-        let (send_msgs, recv_msgs) = Self::init_mmsg_headers(batch_size);
+        let recv_msgs = Self::init_mmsg_headers(batch_size);
+        #[cfg(target_os = "linux")]
+        // SAFETY: `libc::iovec` is a C struct containing only raw pointers and a length.
+        // Zero-initializing it is valid because we reinitialize every field before any
+        // syscall reads it (see `batch_recv`). All-zeros is a defined C representation
+        // for this struct (null pointer + zero length is a no-op iovec).
+        let recv_iovecs =
+            (0..batch_size).map(|_| unsafe { std::mem::zeroed::<libc::iovec>() }).collect();
+        #[cfg(target_os = "linux")]
+        // SAFETY: `libc::sockaddr_storage` is a fixed-size opaque buffer used by the
+        // kernel to write back the peer address. Zero-initializing it provides a valid
+        // starting state; the kernel overwrites the buffer on each successful recvmmsg.
+        // The struct contains no types for which zero is an invalid bit pattern.
+        let recv_addrs = (0..batch_size)
+            .map(|_| unsafe { std::mem::zeroed::<libc::sockaddr_storage>() })
+            .collect();
 
         Self {
-            send_buffers,
             recv_buffers,
             #[cfg(target_os = "linux")]
-            send_msgs,
-            #[cfg(target_os = "linux")]
             recv_msgs,
+            #[cfg(target_os = "linux")]
+            recv_iovecs,
+            #[cfg(target_os = "linux")]
+            recv_addrs,
             batch_size,
-            gso_config: None,
-            zero_copy: None,
-            busy_poll: None,
+            #[cfg(feature = "rust-tests")]
+            force_batch_send_fallback: false,
         }
+    }
+
+    #[cfg(feature = "rust-tests")]
+    pub fn force_batch_send_fallback(&mut self, force: bool) {
+        self.force_batch_send_fallback = force;
     }
 
     #[cfg(target_os = "linux")]
-    fn init_mmsg_headers(batch_size: usize) -> (Vec<libc::mmsghdr>, Vec<libc::mmsghdr>) {
-        let mut send_msgs = Vec::with_capacity(batch_size);
+    fn init_mmsg_headers(batch_size: usize) -> Vec<libc::mmsghdr> {
         let mut recv_msgs = Vec::with_capacity(batch_size);
 
         for _ in 0..batch_size {
-            send_msgs.push(unsafe { std::mem::zeroed() });
+            // SAFETY: `libc::mmsghdr` is a C struct whose fields are all reinitialized in
+            // `batch_recv` before the kernel reads them. Zero-initializing provides a safe
+            // scratch state; the struct contains no Rust types that require non-zero init.
             recv_msgs.push(unsafe { std::mem::zeroed() });
         }
 
-        (send_msgs, recv_msgs)
+        recv_msgs
     }
 
-    /// Initialize network acceleration for a socket
+    /// Best-effort socket capability setup for batch transport paths.
+    ///
+    /// This preserves the public API used by tests/integration while avoiding
+    /// hidden state in `BatchProcessor`. Socket-level options are applied
+    /// directly to the provided descriptor when supported by the OS/kernel.
     pub fn init_acceleration(&mut self, socket: &UdpSocket) -> std::io::Result<()> {
-        // Try to enable GSO
-        self.gso_config = accelerate::UdpGsoConfig::enable(socket).ok();
-
-        // Try to enable zero-copy
-        if let Ok(sock_clone) = socket.try_clone() {
-            self.zero_copy = accelerate::ZeroCopySocket::new(sock_clone).ok();
-        }
-
-        // Enable busy polling for low latency if configured
-        if std::env::var("QUICFUSCATE_BUSY_POLL").is_ok() {
-            if let Ok(sock_clone) = socket.try_clone() {
-                self.busy_poll = accelerate::BusyPollSocket::new(sock_clone, 50).ok();
-            }
-        }
-
-        log::info!("Network acceleration initialized:");
-        log::info!("  GSO: {}", self.gso_config.as_ref().is_some_and(|g| g.enabled));
-        log::info!("  Zero-copy: {}", self.zero_copy.is_some());
-        log::info!("  Busy-poll: {}", self.busy_poll.is_some());
-
-        Ok(())
+        crate::transport::init_socket_acceleration(socket)
     }
 
     /// Batch send packets with sendmmsg and acceleration (Linux)
@@ -132,10 +143,13 @@ impl BatchProcessor {
         packets: &[(&[u8], SocketAddr)],
     ) -> std::io::Result<usize> {
         // Try accelerated batch send first
+        #[cfg(not(feature = "rust-tests"))]
         {
-            crate::optimize::telemetry::ZEROCOPY_SEND_CALLS.fetch_add(1, Ordering::Relaxed);
             // Create a temporary UdpSocket from raw fd for accelerate API
             use std::os::unix::io::{FromRawFd, IntoRawFd};
+            // SAFETY: `socket` is a valid, open UDP socket fd provided by the caller.
+            // We immediately call `into_raw_fd()` after use so the fd is not closed when
+            // `sock` is dropped; the caller retains ownership of the descriptor.
             let sock = unsafe { UdpSocket::from_raw_fd(socket) };
 
             // Use sendmmsg through accelerate
@@ -147,91 +161,69 @@ impl BatchProcessor {
             if let Ok(sent) = result {
                 BATCH_SENDS.fetch_add(1, Ordering::Relaxed);
                 PACKETS_BATCHED.fetch_add(sent, Ordering::Relaxed);
-                crate::optimize::telemetry::ZERO_COPY_SENDS.inc_by(sent as u64);
                 return Ok(sent);
             }
         }
 
-        crate::optimize::telemetry::ZEROCOPY_SEND_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "rust-tests")]
+        if !self.force_batch_send_fallback {
+            // Create a temporary UdpSocket from raw fd for accelerate API
+            use std::os::unix::io::{FromRawFd, IntoRawFd};
+            // SAFETY: `socket` is a valid, open UDP socket fd provided by the caller.
+            // We immediately call `into_raw_fd()` after use so the fd is not closed when
+            // `sock` is dropped; the caller retains ownership of the descriptor.
+            let sock = unsafe { UdpSocket::from_raw_fd(socket) };
 
-        // Fallback to manual sendmmsg preparation
-        use std::mem;
-        use std::ptr;
+            // Use sendmmsg through accelerate
+            let result = accelerate::send_batch(&sock, packets);
 
-        let batch_count = packets.len().min(self.batch_size);
+            // Release socket without closing fd
+            let _ = sock.into_raw_fd();
+
+            if let Ok(sent) = result {
+                BATCH_SENDS.fetch_add(1, Ordering::Relaxed);
+                PACKETS_BATCHED.fetch_add(sent, Ordering::Relaxed);
+                return Ok(sent);
+            }
+        }
+
+        // Conservative fallback: per-packet send_to without payload rewriting/truncation.
+        // This avoids silent truncation for payloads larger than preallocated scratch buffers.
+        let batch_count = packets.len();
         if batch_count == 0 {
             return Ok(0);
         }
 
-        // Prepare messages with SIMD copy
-        for (i, (data, addr)) in packets.iter().take(batch_count).enumerate() {
-            // Use SIMD memcpy for packet data
-            let len = data.len().min(self.send_buffers[i].len());
-            SimdDispatch::memcpy_fast(&mut self.send_buffers[i][..len], data);
-
-            // Setup message header
-            let mut sa: libc::sockaddr_storage = unsafe { mem::zeroed() };
-            let sa_len = match addr {
-                SocketAddr::V4(v4) => {
-                    let sa4 = &mut sa as *mut _ as *mut libc::sockaddr_in;
-                    unsafe {
-                        (*sa4).sin_family = libc::AF_INET as u16;
-                        (*sa4).sin_port = v4.port().to_be();
-                        (*sa4).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-                    }
-                    mem::size_of::<libc::sockaddr_in>()
+        use std::os::unix::io::IntoRawFd;
+        // SAFETY: `socket` is a valid, open UDP socket fd provided by the caller.
+        // `into_raw_fd()` is called on all exit paths (both early returns and the normal
+        // path at line end) so the fd is never double-closed or prematurely dropped.
+        let sock = unsafe { UdpSocket::from_raw_fd(socket) };
+        let mut sent = 0usize;
+        for (data, addr) in packets.iter().take(batch_count) {
+            match sock.send_to(data, addr) {
+                Ok(_) => {
+                    sent += 1;
                 }
-                SocketAddr::V6(v6) => {
-                    let sa6 = &mut sa as *mut _ as *mut libc::sockaddr_in6;
-                    unsafe {
-                        (*sa6).sin6_family = libc::AF_INET6 as u16;
-                        (*sa6).sin6_port = v6.port().to_be();
-                        (*sa6).sin6_addr.s6_addr = v6.ip().octets();
-                        (*sa6).sin6_flowinfo = v6.flowinfo();
-                        (*sa6).sin6_scope_id = v6.scope_id();
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if sent == 0 {
+                        let _ = sock.into_raw_fd();
+                        return Err(err);
                     }
-                    mem::size_of::<libc::sockaddr_in6>()
+                    break;
                 }
-            };
-
-            // Setup iovec
-            let mut iov =
-                libc::iovec { iov_base: self.send_buffers[i].as_mut_ptr() as *mut _, iov_len: len };
-
-            // Setup mmsghdr
-            self.send_msgs[i] = libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &mut sa as *mut _ as *mut _,
-                    msg_namelen: sa_len as u32,
-                    msg_iov: &mut iov,
-                    msg_iovlen: 1,
-                    msg_control: ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            };
+                Err(err) => {
+                    let _ = sock.into_raw_fd();
+                    return Err(err);
+                }
+            }
         }
-
-        // Send all packets in one syscall (non-blocking)!
-        let sent = unsafe {
-            libc::sendmmsg(
-                socket,
-                self.send_msgs.as_mut_ptr(),
-                batch_count as u32,
-                libc::MSG_DONTWAIT,
-            )
-        };
-
-        if sent < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let _ = sock.into_raw_fd();
 
         BATCH_SENDS.fetch_add(1, Ordering::Relaxed);
-        PACKETS_BATCHED.fetch_add(sent as usize, Ordering::Relaxed);
-        crate::optimize::telemetry::ZERO_COPY_SENDS.inc_by(sent as u64);
+        PACKETS_BATCHED.fetch_add(sent, Ordering::Relaxed);
 
-        Ok(sent as usize)
+        Ok(sent)
     }
 
     /// Batch receive packets with recvmmsg (Linux)
@@ -253,18 +245,20 @@ impl BatchProcessor {
 
         // Setup receive messages
         for i in 0..self.batch_size {
-            let mut sa: libc::sockaddr_storage = unsafe { mem::zeroed() };
-
-            let mut iov = libc::iovec {
+            // SAFETY: `sockaddr_storage` is an opaque C buffer; zero is a valid bit
+            // pattern for it. We reset it here before each batch so stale address data
+            // from a previous call cannot leak into the current receive results.
+            self.recv_addrs[i] = unsafe { mem::zeroed() };
+            self.recv_iovecs[i] = libc::iovec {
                 iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
                 iov_len: self.recv_buffers[i].len(),
             };
 
             self.recv_msgs[i] = libc::mmsghdr {
                 msg_hdr: libc::msghdr {
-                    msg_name: &mut sa as *mut _ as *mut _,
+                    msg_name: &mut self.recv_addrs[i] as *mut _ as *mut _,
                     msg_namelen: mem::size_of::<libc::sockaddr_storage>() as u32,
-                    msg_iov: &mut iov,
+                    msg_iov: &mut self.recv_iovecs[i] as *mut libc::iovec,
                     msg_iovlen: 1,
                     msg_control: std::ptr::null_mut(),
                     msg_controllen: 0,
@@ -275,6 +269,15 @@ impl BatchProcessor {
         }
 
         // Receive all packets in one syscall!
+        // SAFETY: All preconditions for recvmmsg are satisfied:
+        // - `socket` is a valid open UDP socket fd supplied by the caller.
+        // - `recv_msgs` has `batch_size` initialized entries, each with `msg_iov` pointing
+        //   into `recv_iovecs` and `msg_name` pointing into `recv_addrs` - both live for
+        //   the duration of this call.
+        // - Each `iov_base` in `recv_iovecs` points to a uniquely-owned `Vec<u8>` buffer
+        //   of length `MAX_UDP_DATAGRAM_SIZE`; no aliasing exists between buffers.
+        // - The timeout pointer, if non-null, points to a valid `libc::timespec` on the
+        //   stack above. We pass null when no timeout is requested.
         let received = unsafe {
             libc::recvmmsg(
                 socket,
@@ -298,12 +301,18 @@ impl BatchProcessor {
             let len = self.recv_msgs[i].msg_len as usize;
             if len > 0 {
                 let mut data = vec![0u8; len];
-                // Use SIMD copy
-                SimdDispatch::memcpy_fast(&mut data, &self.recv_buffers[i][..len]);
+                data.copy_from_slice(&self.recv_buffers[i][..len]);
 
                 // Parse address
+                // SAFETY: `recv_addrs[i]` was written by the kernel during recvmmsg for
+                // all `i < received`. We check `ss_family` before casting so we only
+                // dereference the union variant (sockaddr_in / sockaddr_in6) that the
+                // kernel actually filled in. Misalignment is not possible because
+                // `sockaddr_storage` is defined with maximum alignment for all sockaddr
+                // subtypes. If the family is neither AF_INET nor AF_INET6 we skip the
+                // packet (`continue`), so no invalid memory access can occur.
                 let addr = unsafe {
-                    let sa = self.recv_msgs[i].msg_hdr.msg_name as *const libc::sockaddr_storage;
+                    let sa = &self.recv_addrs[i] as *const libc::sockaddr_storage;
                     match (*sa).ss_family as i32 {
                         libc::AF_INET => {
                             let sa4 = sa as *const libc::sockaddr_in;
@@ -348,6 +357,9 @@ impl BatchProcessor {
         }
 
         use std::os::unix::io::IntoRawFd;
+        // SAFETY: `socket` is a valid, open UDP socket fd provided by the caller.
+        // `into_raw_fd()` is called immediately after the send so the fd is not closed
+        // when `sock` is dropped; the caller retains ownership of the descriptor.
         let sock = unsafe { UdpSocket::from_raw_fd(socket) };
         let result = accelerate::send_batch(&sock, packets);
         let _ = sock.into_raw_fd();
@@ -369,6 +381,9 @@ impl BatchProcessor {
         packets: &[(&[u8], SocketAddr)],
     ) -> std::io::Result<usize> {
         use std::os::unix::io::IntoRawFd;
+        // SAFETY: `socket` is a valid, open UDP socket fd provided by the caller.
+        // `into_raw_fd()` is called at the end of the function so the fd is not closed
+        // when `sock` is dropped; the caller retains ownership of the descriptor.
         let sock = unsafe { UdpSocket::from_raw_fd(socket) };
         let mut sent = 0usize;
         for (data, addr) in packets {
@@ -389,6 +404,10 @@ impl BatchProcessor {
         use std::os::windows::io::FromRawSocket;
         use std::os::windows::io::IntoRawSocket;
         use windows_sys::Win32::Networking::WinSock::SOCKET;
+        // SAFETY: `socket` is a valid, open SOCKET handle provided by the caller, cast
+        // to the platform-native `SOCKET` type. `into_raw_socket()` is called on all
+        // exit paths so the handle is not closed when `sock` is dropped; the caller
+        // retains ownership of the socket handle.
         let sock = unsafe { UdpSocket::from_raw_socket(socket as SOCKET) };
         let mut sent = 0usize;
         for (data, addr) in packets {
@@ -407,7 +426,78 @@ impl BatchProcessor {
     ) -> std::io::Result<Vec<(Vec<u8>, SocketAddr)>> {
         // Fallback to individual receives
         log::debug!("Batch recv not available on this platform");
-        let _ = (self.send_buffers.len(), self.recv_buffers.len(), self.batch_size);
+        let _ = (self.recv_buffers.len(), self.batch_size);
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_processor_construction() {
+        let bp = BatchProcessor::new();
+        assert!(bp.batch_size > 0, "batch_size must be positive");
+        assert_eq!(bp.recv_buffers.len(), bp.batch_size);
+        for buf in &bp.recv_buffers {
+            assert_eq!(buf.len(), MAX_UDP_DATAGRAM_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_batch_processor_default() {
+        let bp = BatchProcessor::default();
+        assert!(bp.batch_size > 0);
+        assert_eq!(bp.recv_buffers.len(), bp.batch_size);
+    }
+
+    #[test]
+    fn test_batch_processor_recv_buffers_preallocated() {
+        let bp = BatchProcessor::new();
+        // Every buffer should be exactly MAX_UDP_DATAGRAM_SIZE and zeroed
+        for buf in &bp.recv_buffers {
+            assert_eq!(buf.len(), MAX_UDP_DATAGRAM_SIZE);
+            assert!(buf.iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn test_batch_processor_batch_size_positive() {
+        // AccelerationPlanner should always yield a reasonable batch size
+        let plans = AccelerationPlanner::global();
+        let size = plans.transport_batch_size();
+        assert!(size >= 1, "transport_batch_size must be >= 1, got {size}");
+        assert!(size <= 1024, "transport_batch_size should be reasonable, got {size}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_batch_processor_linux_mmsg_headers() {
+        let bp = BatchProcessor::new();
+        assert_eq!(bp.recv_msgs.len(), bp.batch_size);
+        assert_eq!(bp.recv_iovecs.len(), bp.batch_size);
+        assert_eq!(bp.recv_addrs.len(), bp.batch_size);
+    }
+
+    #[test]
+    fn test_non_linux_batch_recv_returns_empty() {
+        // On non-Linux, batch_recv is a no-op that returns empty Vec
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut bp = BatchProcessor::new();
+            let result = bp.batch_recv(-1, Some(Duration::from_millis(10)));
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_init_acceleration_with_real_socket() {
+        // Bind a real UDP socket and verify init_acceleration does not panic
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let mut bp = BatchProcessor::new();
+        // init_acceleration may fail on some platforms but should not panic
+        let _ = bp.init_acceleration(&socket);
     }
 }

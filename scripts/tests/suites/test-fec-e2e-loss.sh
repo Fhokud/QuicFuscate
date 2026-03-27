@@ -9,8 +9,6 @@ cd "$PROJECT_ROOT"
 
 OUTPUT_DIR=""
 FAST=0
-DRY_RUN=""
-RUSTFLAGS_EXTRA=""
 CARGO_FEATURES=""
 JOBS=""
 SIZE=1200
@@ -23,11 +21,9 @@ while [[ $# -gt 0 ]]; do
     --fast) FAST=1;;
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --size) SIZE="$2"; shift;;
     --k) K="$2"; shift;;
     --base-seed) BASE_SEED="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h)
       echo "Usage: $(basename "$0") [options]"

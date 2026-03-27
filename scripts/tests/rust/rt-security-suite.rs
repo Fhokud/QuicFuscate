@@ -7,10 +7,11 @@ use std::sync::{
 
 use crossbeam_channel::bounded;
 
-use quicfuscate::accelerate::random;
-use quicfuscate::crypto::aead_legacy::{AeadOpen, AeadSeal};
-use quicfuscate::crypto::chacha20poly1305::ChaCha20Poly1305;
+use quicfuscate::crypto::aead::{AeadOpen, AeadSeal};
+use quicfuscate::crypto::ChaCha20Poly1305;
 use quicfuscate::crypto::CryptoManager;
+use quicfuscate::crypto::{install_data_aead_config, select_data_aead, Aegis128LAead};
+use quicfuscate::engine::{AeadPreference, CryptoConfig};
 use quicfuscate::error::ConnectionError;
 use quicfuscate::fec::{Encoder8, FecDecoder8, FecPacket};
 use quicfuscate::optimize::{ConstPacketPool, MemoryPool};
@@ -19,8 +20,9 @@ use quicfuscate::transport::varint::{
     read_varint, varint_len, write_varint, write_varint_with_len,
 };
 use quicfuscate::transport::{Frame, PacketType};
+use std::borrow::Cow;
 
-fn encode_frame(frame: &Frame, pkt: PacketType) -> Vec<u8> {
+fn encode_frame(frame: &Frame<'_>, pkt: PacketType) -> Vec<u8> {
     let len = wire_len(frame);
     let mut buf = vec![0u8; len];
     let used = to_bytes(frame, &mut buf).expect("to_bytes");
@@ -140,7 +142,7 @@ fn timing_attack_tag_mismatch_rejected() {
     buf[79] ^= 0x01;
     let open = ChaCha20Poly1305::new(&key, &nonce);
     let err = open.open_with_u64_counter(0, b"aad", &mut buf).expect_err("tamper must fail");
-    assert!(matches!(err, ConnectionError::CryptoFail));
+    assert!(matches!(err, ConnectionError::CryptoError(_)));
 }
 
 #[test]
@@ -159,8 +161,14 @@ fn key_material_generated_is_nonzero() {
 fn prng_quality_two_draws_differ() {
     let mut a = [0u8; 32];
     let mut b = [0u8; 32];
-    random::random_bytes_secure(&mut a);
-    random::random_bytes_secure(&mut b);
+    quicfuscate::rng::fill_secure_or_abort(
+        &mut a,
+        "rt-security-suite::prng_quality_two_draws_differ:a",
+    );
+    quicfuscate::rng::fill_secure_or_abort(
+        &mut b,
+        "rt-security-suite::prng_quality_two_draws_differ:b",
+    );
     assert!(a.iter().any(|v| *v != 0));
     assert!(b.iter().any(|v| *v != 0));
     assert_ne!(a, b);
@@ -181,6 +189,70 @@ fn crypto_properties_roundtrip() {
     assert_eq!(sealed_len, plaintext.len() + 16);
     assert_eq!(opened_len, plaintext.len());
     assert_eq!(&buf[..opened_len], plaintext);
+}
+
+fn seal_and_open_via_selected_aead(force_aead: &str, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+    let mut cfg = CryptoConfig { aead_preference: AeadPreference::Auto, ..Default::default() };
+    cfg.force_aead = force_aead.to_string();
+    install_data_aead_config(&cfg);
+
+    let key = [0x42u8; 16];
+    let iv = [0x24u8; 12];
+    let (seal, open) = select_data_aead(&key, &iv);
+    let mut buf = vec![0u8; plaintext.len() + 16];
+    buf[..plaintext.len()].copy_from_slice(plaintext);
+    let sealed = seal.seal_with_u64_counter(9, aad, &mut buf, plaintext.len(), None).expect("seal");
+    let opened = open.open_with_u64_counter(9, aad, &mut buf).expect("open");
+    assert_eq!(sealed, plaintext.len() + 16);
+    assert_eq!(opened, plaintext.len());
+    buf[..opened].to_vec()
+}
+
+#[test]
+fn data_aead_public_aliases_match_aegis128l_roundtrip() {
+    let plaintext = b"quicfuscate-public-aead-alias-roundtrip";
+    let aad = b"alias-ad";
+
+    let baseline = seal_and_open_via_selected_aead("aegis-128l", plaintext, aad);
+    assert_eq!(baseline, plaintext);
+
+    for alias in ["aegis", "aegis-128x4", "aegis-128x8"] {
+        let opened = seal_and_open_via_selected_aead(alias, plaintext, aad);
+        assert_eq!(opened, baseline, "alias {alias} diverged from Aegis128L contract");
+    }
+}
+
+#[test]
+fn data_aead_aliases_handle_unaligned_tail_payloads() {
+    let key = [0x33u8; 16];
+    let iv = [0x55u8; 12];
+    let aad = b"unaligned-tail-ad";
+    let payload = b"tail-heavy-payload-with-nonmultiple-length";
+
+    let direct = Aegis128LAead::new(&key, &iv);
+    let mut baseline_buf = vec![0u8; payload.len() + 16];
+    baseline_buf[..payload.len()].copy_from_slice(payload);
+    let baseline_len = direct
+        .seal_with_u64_counter(11, aad, &mut baseline_buf, payload.len(), None)
+        .expect("baseline seal");
+    let opened_len =
+        direct.open_with_u64_counter(11, aad, &mut baseline_buf).expect("baseline open");
+    assert_eq!(baseline_len, payload.len() + 16);
+    assert_eq!(&baseline_buf[..opened_len], payload);
+
+    for alias in ["aegis-128x4", "aegis-128x8"] {
+        let opened = seal_and_open_via_selected_aead(alias, payload, aad);
+        assert_eq!(opened, payload, "alias {alias} failed on unaligned tail payload");
+    }
+}
+
+#[test]
+fn data_aead_force_morus_roundtrip() {
+    let plaintext = b"quicfuscate-public-morus-roundtrip";
+    let aad = b"morus-ad";
+
+    let opened = seal_and_open_via_selected_aead("morus", plaintext, aad);
+    assert_eq!(opened, plaintext);
 }
 
 #[test]
@@ -225,7 +297,12 @@ fn amplification_attack_datagram_length_rejected() {
 
 #[test]
 fn transport_invariants_frame_roundtrip() {
-    let frame = Frame::Stream { stream_id: 4, offset: 0, data: b"payload".to_vec(), fin: false };
+    let frame = Frame::Stream {
+        stream_id: 4,
+        offset: 0,
+        data: Cow::Owned(b"payload".to_vec()),
+        fin: false,
+    };
     let _ = encode_frame(&frame, PacketType::Short);
 }
 

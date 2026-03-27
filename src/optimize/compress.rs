@@ -312,3 +312,181 @@ unsafe fn classify_neon(bytes: &[u8]) -> PayloadCounters {
 
     counters
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_empty() {
+        let c = classify(&[]);
+        assert_eq!(c.len, 0);
+        assert_eq!(c.ascii_printable, 0);
+        assert_eq!(c.newline, 0);
+        assert_eq!(c.carriage_return, 0);
+        assert_eq!(c.tab, 0);
+        assert_eq!(c.nulls, 0);
+        assert_eq!(c.high_bytes, 0);
+    }
+
+    #[test]
+    fn test_classify_ascii_printable() {
+        let input = b"Hello World";
+        let c = classify(input);
+        assert_eq!(c.len, 11);
+        // All 11 bytes are in 0x20..=0x7E (letters + space)
+        assert_eq!(c.ascii_printable, 11);
+        assert_eq!(c.newline, 0);
+        assert_eq!(c.carriage_return, 0);
+        assert_eq!(c.tab, 0);
+        assert_eq!(c.nulls, 0);
+        assert_eq!(c.high_bytes, 0);
+    }
+
+    #[test]
+    fn test_classify_whitespace() {
+        // 3 newlines, 2 carriage returns, 4 tabs
+        let input = b"\n\n\n\r\r\t\t\t\t";
+        let c = classify(input);
+        assert_eq!(c.len, 9);
+        assert_eq!(c.newline, 3);
+        assert_eq!(c.carriage_return, 2);
+        assert_eq!(c.tab, 4);
+        assert_eq!(c.ascii_printable, 0);
+        assert_eq!(c.nulls, 0);
+        assert_eq!(c.high_bytes, 0);
+    }
+
+    #[test]
+    fn test_classify_null_bytes() {
+        let input = [0u8; 5];
+        let c = classify(&input);
+        assert_eq!(c.len, 5);
+        assert_eq!(c.nulls, 5);
+        assert_eq!(c.ascii_printable, 0);
+        assert_eq!(c.high_bytes, 0);
+    }
+
+    #[test]
+    fn test_classify_high_bytes() {
+        let input: Vec<u8> = (0x80..=0xFF).collect();
+        let c = classify(&input);
+        assert_eq!(c.len, 128);
+        assert_eq!(c.high_bytes, 128);
+        assert_eq!(c.ascii_printable, 0);
+        assert_eq!(c.newline, 0);
+        assert_eq!(c.carriage_return, 0);
+        assert_eq!(c.tab, 0);
+        assert_eq!(c.nulls, 0);
+    }
+
+    #[test]
+    fn test_classify_mixed_content() {
+        // Construct a known mix: "AB\n\r\t" + [0x00, 0xFF]
+        let input: &[u8] = &[b'A', b'B', b'\n', b'\r', b'\t', 0x00, 0xFF];
+        let c = classify(input);
+        assert_eq!(c.len, 7);
+        assert_eq!(c.ascii_printable, 2); // 'A', 'B'
+        assert_eq!(c.newline, 1);
+        assert_eq!(c.carriage_return, 1);
+        assert_eq!(c.tab, 1);
+        assert_eq!(c.nulls, 1);
+        assert_eq!(c.high_bytes, 1); // 0xFF
+    }
+
+    #[test]
+    fn test_classify_len_matches_input() {
+        for size in [0, 1, 7, 16, 17, 31, 32, 33, 63, 64, 65, 128, 255, 1000] {
+            let input = vec![b'x'; size];
+            let c = classify(&input);
+            assert_eq!(c.len, size, "len mismatch for input size {size}");
+        }
+    }
+
+    #[test]
+    fn test_classify_all_256_values() {
+        // Each byte value 0..=255 must be classified into exactly one bucket
+        // (or zero buckets for "other" control chars like 0x01-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F).
+        for b in 0u8..=255 {
+            let c = classify(&[b]);
+            assert_eq!(c.len, 1, "byte {b:#04X}: len must be 1");
+
+            let is_printable = (0x20..=0x7E).contains(&b);
+            let is_newline = b == b'\n';
+            let is_cr = b == b'\r';
+            let is_tab = b == b'\t';
+            let is_null = b == 0;
+            let is_high = b & 0x80 != 0;
+
+            assert_eq!(c.ascii_printable, u32::from(is_printable), "byte {b:#04X}: ascii_printable");
+            assert_eq!(c.newline, u32::from(is_newline), "byte {b:#04X}: newline");
+            assert_eq!(c.carriage_return, u32::from(is_cr), "byte {b:#04X}: carriage_return");
+            assert_eq!(c.tab, u32::from(is_tab), "byte {b:#04X}: tab");
+            assert_eq!(c.nulls, u32::from(is_null), "byte {b:#04X}: nulls");
+            assert_eq!(c.high_bytes, u32::from(is_high), "byte {b:#04X}: high_bytes");
+
+            // Verify mutual exclusivity: at most one of the primary categories fires
+            let primary_count = u32::from(is_printable)
+                + u32::from(is_newline)
+                + u32::from(is_cr)
+                + u32::from(is_tab)
+                + u32::from(is_null)
+                + u32::from(is_high);
+            assert!(primary_count <= 1, "byte {b:#04X}: classified into {primary_count} categories");
+        }
+    }
+
+    #[test]
+    fn test_merge_sums_fields() {
+        let mut a = PayloadCounters {
+            len: 10,
+            ascii_printable: 5,
+            newline: 2,
+            carriage_return: 1,
+            tab: 1,
+            nulls: 0,
+            high_bytes: 1,
+        };
+        let b = PayloadCounters {
+            len: 20,
+            ascii_printable: 8,
+            newline: 3,
+            carriage_return: 2,
+            tab: 4,
+            nulls: 1,
+            high_bytes: 2,
+        };
+        a.merge(&b);
+        assert_eq!(a.len, 30);
+        assert_eq!(a.ascii_printable, 13);
+        assert_eq!(a.newline, 5);
+        assert_eq!(a.carriage_return, 3);
+        assert_eq!(a.tab, 5);
+        assert_eq!(a.nulls, 1);
+        assert_eq!(a.high_bytes, 3);
+    }
+
+    #[test]
+    fn test_classify_large_payload() {
+        // 4096 bytes exercises SIMD paths (NEON=16-byte lanes, SSE2=16, AVX2=32, AVX512=64)
+        // Pattern: repeating cycle of 8 byte types to cover all categories
+        let pattern: &[u8] = &[b'A', b'\n', b'\r', b'\t', 0x00, 0xFF, 0x01, b'~'];
+        let input: Vec<u8> = pattern.iter().copied().cycle().take(4096).collect();
+        let c = classify(&input);
+
+        assert_eq!(c.len, 4096);
+        let repeats = 4096 / 8; // = 512 full cycles
+        assert_eq!(c.ascii_printable, repeats as u32 * 2); // 'A' + '~'
+        assert_eq!(c.newline, repeats as u32);
+        assert_eq!(c.carriage_return, repeats as u32);
+        assert_eq!(c.tab, repeats as u32);
+        assert_eq!(c.nulls, repeats as u32);
+        assert_eq!(c.high_bytes, repeats as u32); // 0xFF
+        // 0x01 is "other" - not counted in any bucket
+
+        // Verify totals: counted categories + uncounted "other" = total length
+        let counted = c.ascii_printable + c.newline + c.carriage_return + c.tab + c.nulls + c.high_bytes;
+        let uncounted = 4096 - counted as usize; // 0x01 bytes
+        assert_eq!(uncounted, repeats); // 512 bytes of 0x01
+    }
+}

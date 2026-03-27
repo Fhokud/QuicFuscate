@@ -2,8 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use quicfuscate::crypto::aead_legacy::{AeadOpen, AeadSeal};
-use quicfuscate::crypto::chacha20poly1305::ChaCha20Poly1305;
+use quicfuscate::crypto::aead::{AeadOpen, AeadSeal};
+use quicfuscate::crypto::{install_data_aead_config, select_data_aead, ChaCha20Poly1305};
+use quicfuscate::engine::{AeadPreference, CryptoConfig};
 use quicfuscate::error::ConnectionError;
 
 fuzz_target!(|data: &[u8]| {
@@ -26,6 +27,30 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(opened) = ChaCha20Poly1305::new(&key, &nonce).open_with_u64_counter(1, b"ad", &mut buf) {
         let _ = opened;
     } else {
-        let _ = ConnectionError::CryptoFail;
+        let _ = ConnectionError::CryptoError("crypto failure".into());
     }
+
+    let force = match data[0] % 5 {
+        0 => "aegis-128l",
+        1 => "aegis",
+        2 => "aegis-128x4",
+        3 => "aegis-128x8",
+        _ => "morus",
+    };
+    let mut cfg = CryptoConfig { aead_preference: AeadPreference::Auto, ..Default::default() };
+    cfg.force_aead = force.to_string();
+    install_data_aead_config(&cfg);
+
+    let key16: [u8; 16] = data[..16].try_into().expect("key16");
+    let iv: [u8; 12] = data[32..44].try_into().expect("iv");
+    let (seal, open) = select_data_aead(&key16, &iv);
+    let mut data_aead_buf = vec![0u8; payload_len + 16];
+    data_aead_buf[..payload_len].copy_from_slice(&data[44..44 + payload_len]);
+    if seal
+        .seal_with_u64_counter(7, b"fuzz-ad", &mut data_aead_buf, payload_len, None)
+        .is_err()
+    {
+        return;
+    }
+    let _ = open.open_with_u64_counter(7, b"fuzz-ad", &mut data_aead_buf);
 });

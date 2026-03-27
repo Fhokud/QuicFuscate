@@ -25,7 +25,7 @@ impl TunDevice for DummyTun {
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut data = self.read_buf.lock().expect("lock read buf");
+        let mut data = self.read_buf.lock().unwrap_or_else(|e| e.into_inner());
         if data.is_empty() {
             return Ok(0);
         }
@@ -36,7 +36,7 @@ impl TunDevice for DummyTun {
     }
 
     fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let mut writes = self.writes.lock().expect("lock writes");
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         writes.push(buf.to_vec());
         Ok(buf.len())
     }
@@ -61,7 +61,7 @@ fn app_config_parses_canonical_quicfuscate_toml() {
     cfg.validate().expect("validate canonical config");
 
     assert_eq!(cfg.fec.initial_mode, FecMode::Normal);
-    assert_eq!(cfg.stealth.mode, StealthMode::Stealth);
+    assert_eq!(cfg.stealth.mode, StealthMode::Auto);
     assert!(cfg.stealth.use_tls_cover);
     assert!(cfg.optimize.pool_capacity > 0);
     assert!(cfg.optimize.block_size > 0);
@@ -104,7 +104,7 @@ fn tun_factory_roundtrip_reads_and_writes() {
 
     let written = tun.write(b"ping").expect("write");
     assert_eq!(written, 4);
-    let recorded = writes.lock().expect("lock writes");
+    let recorded = writes.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0], b"ping");
 }

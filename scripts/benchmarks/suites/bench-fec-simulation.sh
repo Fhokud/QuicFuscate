@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 [[ -f "$SCRIPT_DIR/../../tests/lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../../tests/lib/lib-common.sh"
 
-OUTPUT_DIR=""; FAST=1; RUSTFLAGS_EXTRA=""; CARGO_FEATURES=""; JOBS=""
+OUTPUT_DIR=""; FAST=0; RUSTFLAGS_EXTRA=""; CARGO_FEATURES=""; JOBS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
@@ -16,12 +16,13 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [options]"; echo "FEC Simulation Benchmarks"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
+
+export CARGO_FEATURES JOBS
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BASE_NAME="$(basename "$0" .sh)"
@@ -29,7 +30,7 @@ BASE_NAME="$(basename "$0" .sh)"
 mkdir -p "$OUTPUT_DIR"; LOG_FILE="$OUTPUT_DIR/${BASE_NAME}.log"
 
 echo "===============================================================" | tee -a "$LOG_FILE"
-echo "  FEC Simulation Benchmark Suite" | tee -a "$LOG_FILE"
+echo "  FEC Internal Machine-Room Simulation Benchmark Suite" | tee -a "$LOG_FILE"
 echo "===============================================================" | tee -a "$LOG_FILE"
 print_system_banner | tee -a "$LOG_FILE"
 
@@ -46,7 +47,7 @@ if (( FAST )); then MODES=(normal streaming); LOSSES=(0.0 0.20); THREADS=(4); fi
 RESULTS_JSON="$OUTPUT_DIR/bench_results.json"; json_begin "$RESULTS_JSON" "bench_fec_simulation"; FIRST=true
 TOTAL=0
 
-export -f run_cargo
+export -f run run_cargo
 run_cargo_logged() {
   local envs="$1"; shift
   if [[ -n "$envs" ]]; then
@@ -68,6 +69,8 @@ bench_one() {
   # Timed run of a tight subset to approximate performance
   run_cargo_logged "${envs[*]} RUSTFLAGS=${RUSTFLAGS_EXTRA:-}" test --release --lib \
     'fec::test_auto_mode_streaming_selection' \
+    -- --nocapture >>"$LOG_FILE" 2>&1 || true
+  run_cargo_logged "${envs[*]} RUSTFLAGS=${RUSTFLAGS_EXTRA:-}" test --release --lib \
     'fec::test_batch_normal_par_counts' \
     -- --nocapture >>"$LOG_FILE" 2>&1 || true
   local end=$(date +%s); local dur=$((end-start))

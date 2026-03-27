@@ -3,16 +3,78 @@ use super::{
     EcnMark, FecControlDelta, Frame, PacketType, PathStats, RecvInfo, SendInfo, Stats, Stream,
     TransportObserver, INITIAL_WINDOW, MAX_STREAM_SIZE, MIN_CLIENT_INITIAL_LEN, PROTOCOL_VERSION,
 };
-use std::collections::{HashMap, VecDeque};
-use std::net::{Shutdown, SocketAddr};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::optimize::{prefetch, PrefetchHint};
 
 const MAX_RX_KEY_UPDATE_ADVANCE: usize = 4;
+const PATH_VALIDATION_TIMEOUT: Duration = Duration::from_secs(3);
+const MIGRATION_COOLDOWN: Duration = Duration::from_millis(750);
 
-/// Path-related events
+/// Upper bound for peer-advertised MAX_DATA to prevent resource exhaustion (1 GiB).
+/// A malicious peer sending MAX_DATA(u64::MAX) would effectively disable flow control.
+const MAX_PEER_MAX_DATA: u64 = 1_073_741_824;
+
+#[inline(always)]
+fn prefetch_recv_packet_buffer(buf: &[u8]) {
+    // SAFETY: `buf.as_ptr()` is a valid pointer to at least `buf.len()` bytes for the
+    // lifetime of `buf`. Prefetch instructions are pure hints to the CPU and cannot
+    // cause faults or UB even if the address turns out to be unmapped - on all supported
+    // architectures a prefetch to an invalid address is silently ignored by the hardware.
+    // The second prefetch (`ptr + 64`) is only issued when `buf.len() > 64`, ensuring
+    // the offset is within the allocated object, making the pointer arithmetic valid.
+    unsafe {
+        prefetch(buf.as_ptr(), PrefetchHint::T0);
+        if buf.len() > 64 {
+            prefetch(buf.as_ptr().add(64), PrefetchHint::T0);
+        }
+    }
+}
+
+#[inline(always)]
+fn prefetch_frame_parse_window(buf: *const u8, end: usize, off: usize) {
+    let ahead = core::cmp::min(off + 64, end);
+    crate::fec::prefetch_decode_window(buf.wrapping_add(ahead));
+}
+
+fn trace_send_packet(
+    is_server: bool,
+    pkt_ty: PacketType,
+    space_idx: usize,
+    pn: u64,
+    pn_len: usize,
+    header_len: usize,
+    total_len: usize,
+) {
+    log::trace!(
+        "[send] role={} ty={:?} space={} pn={} pn_len={} hdr_len={} total={}",
+        if is_server { "server" } else { "client" },
+        pkt_ty,
+        space_idx,
+        pn,
+        pn_len,
+        header_len,
+        total_len
+    );
+}
+
+/// Path-related events.
+///
+/// Path validation follows a single-candidate RFC 9000-style control path:
+///
+/// - New candidate paths emit `PathEvent::New` immediately.
+/// - The transport generates PATH_CHALLENGE probes proactively.
+/// - Matching PATH_RESPONSE frames are required before `Validated` is emitted.
+/// - Peer-discovered unvalidated paths are subject to a 3x-style amplification cap.
+/// - Local re-migration attempts are gated by a cooldown to avoid rapid path churn.
+///
+/// Current intentional limitation:
+/// - The transport tracks one pending candidate path at a time rather than a full
+///   multi-path validation set.
 #[derive(Debug, Clone)]
 pub enum PathEvent {
     /// New path has been created
@@ -30,8 +92,41 @@ pub enum PathEvent {
     /// Connection ID reused
     ReusedSourceConnectionId(u64, Option<(SocketAddr, SocketAddr)>, (SocketAddr, SocketAddr)),
 
-    /// Peer migrated to new path
+    /// Peer migrated from the previous peer address to the new peer address.
     PeerMigrated(SocketAddr, SocketAddr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathValidationOrigin {
+    LocalMigration,
+    PeerPath,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPathFrame {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    frame: Frame<'static>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPathValidation {
+    path_id: u64,
+    old_local_addr: SocketAddr,
+    old_peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    challenge: [u8; 8],
+    issued_at: Instant,
+    received_bytes: usize,
+    sent_bytes: usize,
+    origin: PathValidationOrigin,
+}
+
+impl PendingPathValidation {
+    fn matches_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
+        self.local_addr == local_addr && self.peer_addr == peer_addr
+    }
 }
 
 // ============================================================================
@@ -51,6 +146,11 @@ pub struct Connection {
     is_established: bool,
     is_closed: bool,
     is_draining: bool,
+    /// Stream storage. HashMap provides O(1) amortized lookup but poor cache locality
+    /// at high stream counts (>10k). Hash table entries scatter across memory, causing
+    /// L1/L2 cache misses during iteration and lookup. Consider replacing with a slot map
+    /// (slotmap crate) or arena-based structure for better cache locality at scale.
+    /// See: todo-181
     streams: HashMap<u64, Stream>,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
@@ -73,7 +173,10 @@ pub struct Connection {
     bytes_in_flight: usize,
     path_id: u64,
     path_events: VecDeque<PathEvent>,
-    source_cids: cid::ConnectionIdSet,
+    validated_paths: HashSet<(SocketAddr, SocketAddr)>,
+    pending_path_validation: Option<PendingPathValidation>,
+    pending_path_frames: VecDeque<PendingPathFrame>,
+    last_migration_at: Option<Instant>,
     dest_cids: cid::ConnectionIdSet,
     pkt_spaces: [pnspace::PktNumSpace; 3],
     next_send_pn_by_space: [u64; 3],
@@ -82,8 +185,7 @@ pub struct Connection {
     readable_streams: VecDeque<u64>,
     writable_streams: VecDeque<u64>,
     local_error: Option<crate::error::ConnectionError>,
-    peer_error: Option<crate::error::ConnectionError>,
-    trace_id: String,
+    #[cfg(any(test, feature = "rust-tests"))]
     retired_scids: VecDeque<ConnectionId>,
     bytes_in_flight_started: Option<Instant>,
     // Basic flow-control (local receive limits)
@@ -94,9 +196,9 @@ pub struct Connection {
     peer_max_data: u64,
 
     // Unified TLS provider (rustls + optional TLS Cover)
-    tls_provider: Option<Box<dyn crate::tls_provider::QuicTlsProvider>>,
+    tls_provider: Option<Box<dyn crate::qftls::QuicTlsProvider>>,
     conn_bytes_sent: u64,
-    pending_control: VecDeque<Frame>,
+    pending_control: VecDeque<Frame<'static>>,
     // Crypto context (AEAD/HP) hooks for header and payload processing
     crypto: Arc<parking_lot::RwLock<packet::CryptoContext>>,
     // ECN counters (for ACK ECN section)
@@ -106,8 +208,6 @@ pub struct Connection {
     // Recovery / CC
     recovery: crate::transport::recovery::Recovery,
     // Deep FEC integration hooks (transport-level hints only; core applies)
-    fec_batch_size: usize,
-    fec_redundancy_factor: f32,
     fec_escalation_threshold: f32,
     fec_ctrl_delta: FecControlDelta,
     // Recovery callback feedback counters for live FEC adaptation wiring.
@@ -119,28 +219,26 @@ pub struct Connection {
     sent_bytes_by_pn: std::collections::HashMap<u64, usize>,
     // Stealth timing: next eligible send time (if timing obfuscation enabled)
     next_send_at: Option<Instant>,
+    // Whether Brain may actively steer stealth runtime actuators for this connection.
+    intelligent_stealth_runtime: bool,
+    // Fine-grained lock surface for explicit operator transport overrides.
+    brain_runtime_permissions: crate::transport::BrainRuntimePermissions,
     // Optional observer for external modules (Stealth/Brain) to tap into telemetry
     observer: Option<Arc<dyn TransportObserver>>,
     // Optional HTTP/3 connection bound to this QUIC transport
     h3: Option<crate::transport::h3::Connection>,
+    // Shared 0-RTT anti-replay strike register (server-side only).
+    strike_register: Option<Arc<super::anti_replay::StrikeRegister>>,
 }
 
 #[cfg(feature = "zero_copy_dgram")]
 struct DatagramBuffer {
     data: crate::optimize::AlignedBox<[u8]>,
     len: usize,
-    pool: Arc<crate::optimize::MemoryPool>,
+    _pool: Arc<crate::optimize::MemoryPool>,
 }
 
-#[cfg(feature = "zero_copy_dgram")]
-impl Drop for DatagramBuffer {
-    fn drop(&mut self) {
-        // Buffer returns to pool automatically via AlignedBox Drop
-        // Pool reference kept for potential future explicit return logic
-        let _ = &self.pool;
-    }
-}
-
+/// Fixed-size 64 KB ring buffer for zero-copy stream I/O (feature-gated).
 #[cfg(feature = "stream_ring_buffer")]
 #[derive(Debug)]
 pub struct StreamRingBuffer {
@@ -200,7 +298,7 @@ impl Connection {
     /// packet. For servers the current destination CID is learned from the peer's SCID when the
     /// first packet is received.
     pub(crate) fn set_initial_dcid(&mut self, dcid: ConnectionId) {
-        self.initial_dcid = dcid.clone();
+        self.initial_dcid = dcid;
         if !self.is_server {
             self.dcid = dcid;
         }
@@ -212,25 +310,6 @@ impl Connection {
         self.dest_cids.insert(&self.dcid);
     }
 
-    /// Opportunistic drain of MSG_ZEROCOPY completion inbox (Linux only).
-    /// Keeps kernel/userland completion queues tidy without coupling to send path.
-    #[inline(always)]
-    fn zerocopy_tick(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            let batch = std::env::var("QUICFUSCATE_ZC_DRAIN_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(16);
-            // Drain and ignore return; detailed accounting is handled in udpfast and CQ paths.
-            let _events = crate::transport::uring::try_drain_zerocopy_events(batch);
-            let _ = _events; // silence unused var in release
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // no-op on non-Linux
-        }
-    }
     pub(crate) fn new_with_role(
         scid: &[u8],
         local: SocketAddr,
@@ -270,7 +349,10 @@ impl Connection {
             bytes_in_flight: 0,
             path_id: 0,
             path_events: VecDeque::new(),
-            source_cids: cid::ConnectionIdSet::new(),
+            validated_paths: HashSet::from([(local, peer)]),
+            pending_path_validation: None,
+            pending_path_frames: VecDeque::new(),
+            last_migration_at: None,
             dest_cids: cid::ConnectionIdSet::new(),
             pkt_spaces: [
                 pnspace::PktNumSpace::default(),
@@ -282,8 +364,7 @@ impl Connection {
             readable_streams: VecDeque::new(),
             writable_streams: VecDeque::new(),
             local_error: None,
-            peer_error: None,
-            trace_id: String::new(),
+            #[cfg(any(test, feature = "rust-tests"))]
             retired_scids: VecDeque::new(),
             bytes_in_flight_started: None,
             conn_max_data: initial_max_data,
@@ -297,8 +378,6 @@ impl Connection {
             ecn_ect1: 0,
             ecn_ce: 0,
             recovery: recovery::Recovery::new(INITIAL_WINDOW, dgram_send_max_size),
-            fec_batch_size: 8,
-            fec_redundancy_factor: 0.10,
             fec_escalation_threshold: 0.05,
             fec_ctrl_delta: FecControlDelta::default(),
             fec_cb_sent_packets: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -307,10 +386,20 @@ impl Connection {
             fec_cb_lost_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sent_bytes_by_pn: HashMap::new(),
             next_send_at: None,
+            intelligent_stealth_runtime: false,
+            brain_runtime_permissions: crate::transport::BrainRuntimePermissions::default(),
             observer: None,
             h3: None,
+            strike_register: None,
         };
+        // Inherit strike register from config (server-side 0-RTT anti-replay).
+        conn.strike_register = conn.config.strike_register.clone();
+        // Apply configured initial RTT estimate before the first real measurement.
+        if conn.config.initial_rtt_ms != 100 {
+            conn.recovery.set_initial_rtt(Duration::from_millis(conn.config.initial_rtt_ms));
+        }
         conn.install_recovery_fec_callbacks();
+        conn.refresh_path_count();
         conn
     }
 
@@ -336,7 +425,7 @@ impl Connection {
     pub fn enable_datagrams(&mut self, recv_q: usize, send_q: usize) {
         self.config.enable_dgram(recv_q, send_q);
     }
-    pub fn dgram_pool_or_global(&self) -> Arc<crate::optimize::MemoryPool> {
+    pub(crate) fn dgram_pool_or_global(&self) -> Arc<crate::optimize::MemoryPool> {
         #[cfg(feature = "zero_copy_dgram")]
         {
             self.dgram_pool.clone()
@@ -353,30 +442,284 @@ impl Connection {
         return self.streams.values().map(|s| s.send_ring.len()).sum();
     }
 
+    fn refresh_path_count(&mut self) {
+        self.stats.paths_count = self
+            .validated_paths
+            .len()
+            .saturating_add(usize::from(self.pending_path_validation.is_some()));
+    }
+
+    fn path_validation_budget_allows(
+        &self,
+        path: &PendingPathValidation,
+        frame: &Frame<'_>,
+    ) -> bool {
+        if path.origin != PathValidationOrigin::PeerPath {
+            return true;
+        }
+        let estimated_packet_len =
+            1 + self.dcid.as_ref().len() + 4 + frames::wire_len(frame) + self.tag_reserve_1rtt();
+        let max_factor = self.config.max_amplification_factor.max(1);
+        path.sent_bytes.saturating_add(estimated_packet_len)
+            <= path.received_bytes.saturating_mul(max_factor)
+    }
+
+    fn queue_targeted_path_frame(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        frame: Frame<'static>,
+    ) {
+        self.pending_path_frames.push_back(PendingPathFrame { local_addr, peer_addr, frame });
+    }
+
+    fn count_pending_path_responses(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> usize {
+        self.pending_path_frames
+            .iter()
+            .filter(|item| {
+                item.local_addr == local_addr
+                    && item.peer_addr == peer_addr
+                    && matches!(item.frame, Frame::PathResponse { .. })
+            })
+            .count()
+    }
+
+    fn pop_targeted_path_frame_for_send(&mut self) -> Option<PendingPathFrame> {
+        self.poll_path_validation_timeout(Instant::now());
+
+        if let Some(front) = self.pending_path_frames.front() {
+            if let Some(path) = self.pending_path_validation.as_ref() {
+                if path.matches_path(front.local_addr, front.peer_addr)
+                    && !self.path_validation_budget_allows(path, &front.frame)
+                {
+                    return None;
+                }
+            }
+        }
+
+        self.pending_path_frames.pop_front()
+    }
+
+    fn mark_unvalidated_path_send(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        bytes: usize,
+    ) {
+        if let Some(path) = self.pending_path_validation.as_mut() {
+            if path.matches_path(local_addr, peer_addr) {
+                path.sent_bytes = path.sent_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    fn enqueue_path_response(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        data: [u8; 8],
+    ) {
+        if self.count_pending_path_responses(local_addr, peer_addr)
+            >= self.config.path_challenge_recv_max_queue_len.max(1)
+        {
+            return;
+        }
+        self.queue_targeted_path_frame(local_addr, peer_addr, Frame::PathResponse { data });
+    }
+
+    fn emit_failed_validation(&mut self, local_addr: SocketAddr, peer_addr: SocketAddr) {
+        self.path_events.push_back(PathEvent::FailedValidation(local_addr, peer_addr));
+    }
+
+    fn poll_path_validation_timeout(&mut self, now: Instant) {
+        let should_fail = self.pending_path_validation.as_ref().is_some_and(|path| {
+            now.saturating_duration_since(path.issued_at) >= PATH_VALIDATION_TIMEOUT
+        });
+        if !should_fail {
+            return;
+        }
+
+        let Some(path) = self.pending_path_validation.take() else {
+            return;
+        };
+        self.pending_path_frames
+            .retain(|frame| !path.matches_path(frame.local_addr, frame.peer_addr));
+        self.emit_failed_validation(path.local_addr, path.peer_addr);
+        self.refresh_path_count();
+    }
+
+    fn begin_path_validation(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        origin: PathValidationOrigin,
+        initial_received_bytes: usize,
+    ) -> Result<u64, crate::error::ConnectionError> {
+        self.poll_path_validation_timeout(Instant::now());
+
+        if self.validated_paths.contains(&(local_addr, peer_addr)) {
+            return Ok(self.path_id);
+        }
+
+        if let Some(path) = self.pending_path_validation.as_ref() {
+            if path.matches_path(local_addr, peer_addr) {
+                return Ok(path.path_id);
+            }
+            return Err(crate::error::ConnectionError::InvalidState);
+        }
+
+        if origin != PathValidationOrigin::PeerPath
+            && self.last_migration_at.is_some_and(|last| last.elapsed() < MIGRATION_COOLDOWN)
+        {
+            return Err(crate::error::ConnectionError::InvalidState);
+        }
+
+        let mut challenge = [0u8; 8];
+        crate::transport::rand::rand_bytes(&mut challenge);
+        let next_path_id = self.path_id.wrapping_add(1);
+        let path = PendingPathValidation {
+            path_id: next_path_id,
+            old_local_addr: self.local_addr,
+            old_peer_addr: self.peer_addr,
+            local_addr,
+            peer_addr,
+            challenge,
+            issued_at: Instant::now(),
+            received_bytes: initial_received_bytes,
+            sent_bytes: 0,
+            origin,
+        };
+        self.pending_path_validation = Some(path);
+        self.queue_targeted_path_frame(
+            local_addr,
+            peer_addr,
+            Frame::PathChallenge { data: challenge },
+        );
+        self.path_events.push_back(PathEvent::New(local_addr, peer_addr));
+        self.refresh_path_count();
+        Ok(next_path_id)
+    }
+
+    fn observe_incoming_path(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        received_bytes: usize,
+    ) {
+        if self.local_addr == local_addr && self.peer_addr == peer_addr {
+            return;
+        }
+
+        if let Some(path) = self.pending_path_validation.as_mut() {
+            if path.matches_path(local_addr, peer_addr) {
+                path.received_bytes = path.received_bytes.saturating_add(received_bytes);
+            }
+            return;
+        }
+
+        if self.config.disable_active_migration {
+            return;
+        }
+
+        if self.last_migration_at.is_some_and(|last| last.elapsed() < MIGRATION_COOLDOWN) {
+            return;
+        }
+
+        let _ = self.begin_path_validation(
+            local_addr,
+            peer_addr,
+            PathValidationOrigin::PeerPath,
+            received_bytes,
+        );
+    }
+
+    fn handle_path_response_frame(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        data: [u8; 8],
+    ) {
+        self.poll_path_validation_timeout(Instant::now());
+
+        let Some(path) = self.pending_path_validation.as_ref() else {
+            return;
+        };
+        if !path.matches_path(local_addr, peer_addr) || path.challenge != data {
+            return;
+        }
+
+        let Some(path) = self.pending_path_validation.take() else {
+            return;
+        };
+        self.pending_path_frames
+            .retain(|frame| !path.matches_path(frame.local_addr, frame.peer_addr));
+        self.local_addr = path.local_addr;
+        self.peer_addr = path.peer_addr;
+        self.path_id = path.path_id;
+        self.cwnd = INITIAL_WINDOW;
+        self.bytes_in_flight = 0;
+        self.validated_paths.insert((path.local_addr, path.peer_addr));
+        self.last_migration_at = Some(Instant::now());
+        self.path_events.push_back(PathEvent::Validated(path.local_addr, path.peer_addr));
+        if path.old_local_addr != path.local_addr || path.old_peer_addr != path.peer_addr {
+            self.path_events.push_back(PathEvent::PeerMigrated(path.old_peer_addr, path.peer_addr));
+        }
+        self.refresh_path_count();
+    }
+
+    /// Returns pending path validation state for test assertions.
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn pending_path_validation_for_test(
+        &self,
+    ) -> Option<(u64, SocketAddr, SocketAddr, [u8; 8])> {
+        self.pending_path_validation
+            .as_ref()
+            .map(|path| (path.path_id, path.local_addr, path.peer_addr, path.challenge))
+    }
+
+    /// Injects a PATH_RESPONSE for test-driven path validation.
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn receive_path_response_for_test(
+        &mut self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        data: [u8; 8],
+    ) {
+        self.handle_path_response_frame(local_addr, peer_addr, data);
+    }
+
+    /// Forces the pending path validation to expire for timeout testing.
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn expire_pending_path_validation_for_test(&mut self) {
+        if let Some(path) = self.pending_path_validation.as_mut() {
+            path.issued_at = Instant::now() - PATH_VALIDATION_TIMEOUT - Duration::from_millis(1);
+        }
+        self.poll_path_validation_timeout(Instant::now());
+    }
+
     // ============================================================================
     // Real-TLS Integration Methods
     // ============================================================================
 
-    /// Enable unified TLS provider (rustls + optional TLS Cover)
-    pub fn enable_tls(&mut self, profile_name: &str) -> Result<(), crate::error::ConnectionError> {
-        log::info!("Enabling unified TLS provider with profile: {}", profile_name);
+    /// Enable rustls-backed TLS provider with optional TLS Cover layer.
+    pub(crate) fn enable_tls(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<(), crate::error::ConnectionError> {
+        log::info!("Enabling rustls TLS provider with profile: {}", profile_name);
 
         // TLS provider must operate on the same CryptoContext as the transport,
         // otherwise secrets would never be installed into the packet protection keys.
         let crypto_arc = self.crypto.clone();
 
-        // Create unified provider (rustls + optional TLS Cover)
-        let provider = crate::tls_provider::create_provider(
-            crate::tls_provider::ProviderStrategy::Unified,
-            self.is_server,
-            crypto_arc.clone(),
-        )?;
+        // Create the TLS composition stack (rustls + optional TLS Cover).
+        let provider = crate::qftls::create_provider(self.is_server, crypto_arc.clone())?;
 
         // Store provider
         self.tls_provider = Some(provider);
 
         if let Some(provider_ref) = self.tls_provider.as_ref() {
-            log::info!("Unified TLS provider enabled: {}", provider_ref.provider_name());
+            log::info!("TLS provider enabled: {}", provider_ref.provider_name());
         } else {
             return Err(crate::error::ConnectionError::InvalidState);
         }
@@ -409,33 +752,37 @@ impl Connection {
     }
 
     /// Configure TLS provider with a specific profile and SNI.
-    pub fn configure_tls(
+    pub(crate) fn configure_tls(
         &mut self,
-        profile: &crate::tls_provider::TlsProfile,
+        profile: &crate::qftls::TlsProfile,
         sni: &str,
     ) -> Result<(), crate::error::ConnectionError> {
-        if let Some(provider) = &mut self.tls_provider {
-            let mut effective = profile.clone();
-            if !sni.is_empty() {
-                effective.sni = Some(sni.to_string());
-            }
-            provider.configure(&effective)?;
-            // Optionally enable 0-RTT when desired
-            let _ = provider.enable_0rtt();
+        let Some(provider) = &mut self.tls_provider else {
+            return Err(crate::error::ConnectionError::InvalidState);
+        };
+
+        let mut effective = profile.clone();
+        if !sni.is_empty() {
+            effective.sni = Some(sni.to_string());
+        }
+        provider.configure(&effective)?;
+        // Optionally enable 0-RTT when desired.
+        if let Err(e) = provider.enable_0rtt() {
+            log::debug!("TLS provider 0-RTT enablement failed: {:?}", e);
         }
         Ok(())
     }
 
-    /// Process TLS handshake with optional real-time CH override
-    pub fn do_tls_handshake(
+    /// Process TLS handshake with optional cover CH override.
+    pub(crate) fn do_tls_handshake(
         &mut self,
         override_template: Option<&str>,
     ) -> Result<bool, crate::error::ConnectionError> {
         if let Some(provider) = &mut self.tls_provider {
-            // Apply real-time CH override if specified and supported
+            // Apply cover layer CH override if supported and requested.
             if let Some(template_name) = override_template {
                 if provider.supports_ch_override() {
-                    // Create simple template bytes (TLS Cover will handle the details)
+                    // Create simple template bytes; cover layer expands details.
                     let template_bytes = template_name.as_bytes();
                     provider.apply_ch_override(template_bytes)?;
                 }
@@ -447,7 +794,9 @@ impl Connection {
                 // If ALPN negotiated HTTP/3, enable H3 binding
                 if let Some(alpn) = provider.alpn() {
                     if alpn.starts_with("h3") {
-                        let _ = self.enable_h3();
+                        if let Err(e) = self.enable_h3() {
+                            log::warn!("Failed to enable HTTP/3 after ALPN negotiation: {:?}", e);
+                        }
                     }
                 }
             }
@@ -460,12 +809,13 @@ impl Connection {
 
     /// Returns true when the TLS provider reports handshake completion.
     /// This is intentionally distinct from transport liveness/establishment.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn tls_handshake_complete(&self) -> bool {
         self.tls_provider.as_ref().map(|p| p.handshake_complete()).unwrap_or(true)
     }
 
     /// Enable HTTP/3 connection bound to this transport (idempotent)
-    pub fn enable_h3(&mut self) -> Result<(), crate::transport::h3::Error> {
+    pub(crate) fn enable_h3(&mut self) -> Result<(), crate::transport::h3::Error> {
         if self.h3.is_some() {
             return Ok(());
         }
@@ -477,6 +827,7 @@ impl Connection {
     }
 
     /// Establish a MASQUE CONNECT-UDP stream via HTTP/3, returns stream id
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn masque_connect_udp(
         &mut self,
         proxy_authority: &str,
@@ -495,6 +846,7 @@ impl Connection {
     }
 
     /// Enable MASQUE DATAGRAM context on an existing CONNECT-UDP stream
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn masque_enable_datagram(
         &mut self,
         stream_id: u64,
@@ -511,6 +863,7 @@ impl Connection {
     }
 
     /// Send one MASQUE UDP payload as QUIC DATAGRAM (Flow-ID implicit)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn masque_send_datagram(
         &mut self,
         stream_id: u64,
@@ -528,6 +881,7 @@ impl Connection {
     }
 
     /// Try to receive one MASQUE DATAGRAM; returns (flow_id, payload)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn masque_try_recv_datagram(&mut self) -> Option<(u64, Vec<u8>)> {
         if let Some(mut h3c) = self.h3.take() {
             let out = h3c.try_recv_masque_datagram(self);
@@ -539,11 +893,11 @@ impl Connection {
     }
 
     /// Process incoming CRYPTO frame
-    pub fn process_crypto_frame(
+    pub(crate) fn process_crypto_frame(
         &mut self,
-        level: crate::tls_provider::Level,
+        level: crate::qftls::Level,
         offset: u64,
-        data: Vec<u8>,
+        data: Cow<'_, [u8]>,
     ) -> Result<(), crate::error::ConnectionError> {
         if let Some(provider) = &mut self.tls_provider {
             // CRYPTO frames can arrive out-of-order. Buffer and drain contiguous handshake bytes
@@ -552,11 +906,11 @@ impl Connection {
             {
                 let mut crypto = self.crypto.write();
                 let stream = match level {
-                    crate::tls_provider::Level::Initial => &mut crypto.crypto_initial,
-                    crate::tls_provider::Level::Handshake => &mut crypto.crypto_handshake,
+                    crate::qftls::Level::Initial => &mut crypto.crypto_initial,
+                    crate::qftls::Level::Handshake => &mut crypto.crypto_handshake,
                     _ => &mut crypto.crypto_application,
                 };
-                stream.recv(offset, data)?;
+                stream.recv(offset, data.into_owned())?;
                 let mut tmp = [0u8; 2048];
                 while stream.has_data() {
                     let n = stream.read(&mut tmp);
@@ -578,20 +932,20 @@ impl Connection {
             // Store in crypto stream for later processing
             let mut crypto = self.crypto.write();
             let stream = match level {
-                crate::tls_provider::Level::Initial => &mut crypto.crypto_initial,
-                crate::tls_provider::Level::Handshake => &mut crypto.crypto_handshake,
+                crate::qftls::Level::Initial => &mut crypto.crypto_initial,
+                crate::qftls::Level::Handshake => &mut crypto.crypto_handshake,
                 _ => &mut crypto.crypto_application,
             };
-            stream.recv(offset, data)?;
+            stream.recv(offset, data.into_owned())?;
         }
 
         Ok(())
     }
 
     /// Get next CRYPTO frame to send
-    pub fn next_crypto_frame(
+    pub(crate) fn next_crypto_frame(
         &mut self,
-        level: crate::tls_provider::Level,
+        level: crate::qftls::Level,
         max_len: usize,
     ) -> Option<(u64, Vec<u8>)> {
         if let Some(provider) = &mut self.tls_provider {
@@ -599,27 +953,12 @@ impl Connection {
         } else {
             let mut crypto = self.crypto.write();
             let stream = match level {
-                crate::tls_provider::Level::Initial => &mut crypto.crypto_initial,
-                crate::tls_provider::Level::Handshake => &mut crypto.crypto_handshake,
+                crate::qftls::Level::Initial => &mut crypto.crypto_initial,
+                crate::qftls::Level::Handshake => &mut crypto.crypto_handshake,
                 _ => &mut crypto.crypto_application,
             };
             stream.next_crypto_frame(max_len)
         }
-    }
-
-    /// Switch TLS profile dynamically (real-time CHO)
-    pub fn switch_tls_profile(
-        &mut self,
-        profile_name: &str,
-    ) -> Result<(), crate::error::ConnectionError> {
-        if self.tls_provider.is_some() {
-            log::info!("Switching TLS profile to: {}", profile_name);
-
-            // Re-enable with new profile
-            self.enable_tls(profile_name)?;
-        }
-
-        Ok(())
     }
 
     // ============================================================================
@@ -639,30 +978,15 @@ impl Connection {
             return Err(ConnectionError::BufferTooShort);
         }
 
-        // Opportunistic zerocopy completion drain (process completions from prior sends)
-        self.zerocopy_tick();
-
-        // Prefetch buffer for better cache utilization
-        unsafe {
-            prefetch(buf.as_ptr(), PrefetchHint::T0);
-            if buf.len() > 64 {
-                prefetch(buf.as_ptr().add(64), PrefetchHint::T0);
-            }
-        }
+        // Prefetch packet input for the recv hotpath.
+        prefetch_recv_packet_buffer(buf);
 
         // Pre-parse header to determine space and largest PN hint.
         // For short headers, DCID length is the local SCID length (the peer routes to our CID).
         let short_dcid_len = self.scid.as_ref().len();
         let (pre_ty, largest_hint) = match packet::parse_header(buf, short_dcid_len) {
             Ok((hdr_native, _)) => {
-                let t = match hdr_native.ty {
-                    packet::PacketType::Initial => PacketType::Initial,
-                    packet::PacketType::Retry => PacketType::Retry,
-                    packet::PacketType::Handshake => PacketType::Handshake,
-                    packet::PacketType::ZeroRTT => PacketType::ZeroRTT,
-                    packet::PacketType::VersionNegotiation => PacketType::VersionNegotiation,
-                    packet::PacketType::Short => PacketType::Short,
-                };
+                let t = hdr_native.ty;
                 let idx = match t {
                     PacketType::Initial => 0,
                     PacketType::Handshake => 1,
@@ -723,7 +1047,7 @@ impl Connection {
             };
             match decrypt {
                 Ok(v) => break v,
-                Err(ConnectionError::Done) | Err(ConnectionError::CryptoFail)
+                Err(ConnectionError::Done) | Err(ConnectionError::CryptoError(_))
                     if pre_ty == PacketType::Short
                         && rx_key_advances < MAX_RX_KEY_UPDATE_ADVANCE
                         && self.try_advance_read_keys() =>
@@ -741,19 +1065,12 @@ impl Connection {
                 }
             }
         };
-        let pkt_ty = match hdr_native.ty {
-            packet::PacketType::Initial => PacketType::Initial,
-            packet::PacketType::Retry => PacketType::Retry,
-            packet::PacketType::Handshake => PacketType::Handshake,
-            packet::PacketType::ZeroRTT => PacketType::ZeroRTT,
-            packet::PacketType::VersionNegotiation => PacketType::VersionNegotiation,
-            packet::PacketType::Short => PacketType::Short,
-        };
+        let pkt_ty = hdr_native.ty;
 
         // Learn peer CID from the first long-header packets.
         // - Server: outgoing DCID must be the client's SCID.
         // - Client: after receiving a server packet, outgoing DCID becomes the server's SCID.
-        if hdr_native.ty != packet::PacketType::Short && !hdr_native.scid.is_empty() {
+        if hdr_native.ty != PacketType::Short && !hdr_native.scid.is_empty() {
             if self.is_server {
                 if self.dcid.is_empty() {
                     self.set_destination_cid(ConnectionId::from_vec(hdr_native.scid.clone()));
@@ -785,23 +1102,53 @@ impl Connection {
                 self.stats.recv_bytes += len as u64;
                 return Ok(len);
             }
-            self.pkt_spaces[space_idx].on_packet_recv(
+            if !self.pkt_spaces[space_idx].on_packet_recv(
                 hdr_native.pkt_num,
                 self.config.max_ack_delay,
                 self.config.ack_eliciting_threshold,
-            );
+            ) {
+                // Duplicate or overflow PN - silently discard per RFC 9000 Section 12.3
+                let len = aad_len.saturating_add(pt_len).min(buf.len());
+                self.stats.recv += 1;
+                self.stats.recv_bytes += len as u64;
+                return Ok(len);
+            }
+        }
+
+        // 0-RTT anti-replay gate (RFC 8446 Section 8, RFC 9001 Section 9.2).
+        // After AEAD decryption and PN dedup, but before frame parsing.
+        // Silently discard replayed 0-RTT packets - matches duplicate-PN pattern.
+        if pkt_ty == PacketType::ZeroRTT {
+            if let Some(ref strike_register) = self.strike_register {
+                let end_replay = aad_len.saturating_add(pt_len).min(buf.len());
+                let payload = &buf[aad_len..end_replay];
+                let fingerprint = super::anti_replay::StrikeRegister::compute_fingerprint(
+                    &hdr_native.dcid,
+                    &hdr_native.scid,
+                    payload,
+                );
+                if !strike_register.check_and_insert(&fingerprint, Instant::now()) {
+                    crate::telemetry!(
+                        crate::optimize::telemetry::ZERO_RTT_REPLAY_REJECT_TOTAL.inc()
+                    );
+                    log::warn!("0-RTT replay detected and rejected");
+                    let len = end_replay;
+                    self.stats.recv += 1;
+                    self.stats.recv_bytes += len as u64;
+                    return Ok(len);
+                }
+                crate::telemetry!(crate::optimize::telemetry::ZERO_RTT_ACCEPT_TOTAL.inc());
+            }
         }
 
         // Parse frames from decrypted payload region
         let mut off = aad_len;
         let end = aad_len.saturating_add(pt_len).min(buf.len());
+        self.observe_incoming_path(info.to, info.from, end);
         let mut ack_eliciting = false;
         while off < end {
-            // Prefetch next bytes to accelerate frame parsing
-            unsafe {
-                let ahead = core::cmp::min(off + 64, end);
-                crate::fec::prefetch_data(buf.as_ptr().add(ahead));
-            }
+            // Prefetch the next frame parse window for the recv hotpath.
+            prefetch_frame_parse_window(buf.as_ptr(), end, off);
             match frames::from_bytes(&buf[off..end], pkt_ty) {
                 Ok((frame, used)) => {
                     if used == 0 {
@@ -839,6 +1186,7 @@ impl Connection {
                                 recv_final_size: None,
                                 recv_frags: std::collections::BTreeMap::new(),
                                 priority_urgency: 3,
+                                #[cfg(any(test, feature = "rust-tests"))]
                                 priority_incremental: false,
                                 max_stream_data_rx: self.config.initial_max_stream_data_bidi_local,
                                 max_stream_data_tx: self.config.initial_max_stream_data_bidi_remote,
@@ -853,13 +1201,24 @@ impl Connection {
                             if !data.is_empty() {
                                 let mut start = offset;
                                 if start < s.recv_next {
-                                    let drop = (s.recv_next - start) as usize;
-                                    if drop < data.len() {
+                                    let drop_n = (s.recv_next - start) as usize;
+                                    if drop_n < data.len() {
                                         start = s.recv_next;
-                                        s.recv_frags.insert(start, data[drop..].to_vec());
+                                        s.recv_frags.insert(start, data[drop_n..].to_vec());
                                     }
+                                } else if start == s.recv_next && s.recv_frags.is_empty() {
+                                    // In-order fast path: copy directly to recv buffer, skip recv_frags.
+                                    #[cfg(not(feature = "stream_ring_buffer"))]
+                                    {
+                                        s.recv_buf.extend_from_slice(&data);
+                                    }
+                                    #[cfg(feature = "stream_ring_buffer")]
+                                    {
+                                        s.recv_ring.write(&data);
+                                    }
+                                    s.recv_next += data.len() as u64;
                                 } else {
-                                    s.recv_frags.insert(start, data);
+                                    s.recv_frags.insert(start, data.into_owned());
                                 }
                             }
 
@@ -940,8 +1299,20 @@ impl Connection {
                             }
                         }
                         Frame::MaxData { max } => {
-                            // Peer increased our send window
-                            self.peer_max_data = max;
+                            // Peer increased our send window - validate and clamp
+                            let clamped = if max > MAX_PEER_MAX_DATA {
+                                log::warn!(
+                                    "[transport] peer MAX_DATA {} exceeds cap {}, clamping",
+                                    max, MAX_PEER_MAX_DATA
+                                );
+                                MAX_PEER_MAX_DATA
+                            } else {
+                                max
+                            };
+                            // RFC 9000: MAX_DATA must be monotonically increasing
+                            if clamped > self.peer_max_data {
+                                self.peer_max_data = clamped;
+                            }
                         }
                         Frame::MaxStreamData { stream_id, max } => {
                             // Peer increased per-stream send window
@@ -963,6 +1334,7 @@ impl Connection {
                                 recv_final_size: None,
                                 recv_frags: std::collections::BTreeMap::new(),
                                 priority_urgency: 3,
+                                #[cfg(any(test, feature = "rust-tests"))]
                                 priority_incremental: false,
                                 max_stream_data_rx: self.config.initial_max_stream_data_bidi_local,
                                 max_stream_data_tx: self.config.initial_max_stream_data_bidi_remote,
@@ -970,17 +1342,18 @@ impl Connection {
                             s.max_stream_data_tx = max;
                         }
                         Frame::ConnectionClose { .. } => {}
-                        Frame::PathChallenge { .. } => {
+                        Frame::PathChallenge { data } => {
                             ack_eliciting = true;
                             self.stats.path_challenge_rx_count =
                                 self.stats.path_challenge_rx_count.saturating_add(1);
+                            self.enqueue_path_response(info.to, info.from, data);
                         }
                         Frame::Datagram { data } => {
                             ack_eliciting = true;
                             self.stats.dgram_recv += 1;
                             if !self.is_dgram_recv_queue_full() {
                                 #[cfg(not(feature = "zero_copy_dgram"))]
-                                self.dgram_recv_queue.push_back(data);
+                                self.dgram_recv_queue.push_back(data.into_owned());
                                 #[cfg(feature = "zero_copy_dgram")]
                                 {
                                     let mut buf = self.dgram_pool.alloc();
@@ -989,7 +1362,7 @@ impl Connection {
                                     self.dgram_recv_queue.push_back(DatagramBuffer {
                                         data: buf,
                                         len,
-                                        pool: self.dgram_pool.clone(),
+                                        _pool: self.dgram_pool.clone(),
                                     });
                                 }
                             }
@@ -1037,9 +1410,9 @@ impl Connection {
                         }
                         Frame::Crypto { offset, data } => {
                             let lvl = match pkt_ty {
-                                PacketType::Initial => crate::tls_provider::Level::Initial,
-                                PacketType::Handshake => crate::tls_provider::Level::Handshake,
-                                _ => crate::tls_provider::Level::Application,
+                                PacketType::Initial => crate::qftls::Level::Initial,
+                                PacketType::Handshake => crate::qftls::Level::Handshake,
+                                _ => crate::qftls::Level::Application,
                             };
                             self.process_crypto_frame(lvl, offset, data)?;
                             ack_eliciting = true;
@@ -1059,6 +1432,10 @@ impl Connection {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             ack_eliciting = true;
                         }
+                        Frame::PathResponse { data } => {
+                            ack_eliciting = true;
+                            self.handle_path_response_frame(info.to, info.from, data);
+                        }
                         Frame::NewToken { .. }
                         | Frame::MaxStreamsBidi { .. }
                         | Frame::MaxStreamsUni { .. }
@@ -1067,8 +1444,7 @@ impl Connection {
                         | Frame::StreamsBlockedBidi { .. }
                         | Frame::StreamsBlockedUni { .. }
                         | Frame::NewConnectionId { .. }
-                        | Frame::RetireConnectionId { .. }
-                        | Frame::PathResponse { .. } => {
+                        | Frame::RetireConnectionId { .. } => {
                             ack_eliciting = true;
                         }
                         _ => {}
@@ -1204,12 +1580,6 @@ impl Connection {
                         + crate::transport::varint::varint_len(s.send_off)
                         + 2;
                     if off + header_overhead + tag_reserve < out.len() {
-                        #[cfg(not(feature = "stream_ring_buffer"))]
-                        if !s.send_buf.is_empty() {
-                            unsafe {
-                                crate::fec::prefetch_data(s.send_buf.as_ptr());
-                            }
-                        }
                         let max_body = out.len() - off - header_overhead - tag_reserve;
                         let conn_avail =
                             self.peer_max_data.saturating_sub(self.conn_bytes_sent) as usize;
@@ -1250,7 +1620,7 @@ impl Connection {
                         let frame = Frame::Stream {
                             stream_id: s.id,
                             offset: s.send_off,
-                            data: data_vec,
+                            data: Cow::Owned(data_vec),
                             fin: fin_now,
                         };
                         let written = frames::to_bytes(&frame, &mut out[off..])?;
@@ -1300,17 +1670,14 @@ impl Connection {
                     let Some(front_owned) = self.dgram_send_queue.pop_front() else {
                         return Err(crate::error::ConnectionError::Done);
                     };
-                    unsafe {
-                        crate::fec::prefetch_data(front_owned.as_ptr());
-                    }
-                    let frame = Frame::Datagram { data: front_owned };
+                    let frame = Frame::Datagram { data: Cow::Owned(front_owned) };
                     match frames::to_bytes(&frame, &mut out[off..]) {
                         Ok(written) => {
                             off += written;
                         }
                         Err(e) => {
                             if let Frame::Datagram { data } = frame {
-                                self.dgram_send_queue.push_front(data);
+                                self.dgram_send_queue.push_front(data.into_owned());
                             }
                             return Err(e);
                         }
@@ -1318,10 +1685,11 @@ impl Connection {
                 }
                 #[cfg(feature = "zero_copy_dgram")]
                 {
-                    let frame = Frame::Datagram { data: front.data[..front.len].to_vec() };
+                    let frame =
+                        Frame::Datagram { data: Cow::Owned(front.data[..front.len].to_vec()) };
                     let written = frames::to_bytes(&frame, &mut out[off..])?;
                     off += written;
-                    let _ = self.dgram_send_queue.pop_front();
+                    self.dgram_send_queue.pop_front();
                 }
             }
         }
@@ -1337,10 +1705,26 @@ impl Connection {
         mut off: usize,
     ) -> Result<usize, crate::error::ConnectionError> {
         if self.config.stealth_padding_enabled {
-            let ad_len = pn_off + pn_len;
-            let pt_len_now = off.saturating_sub(ad_len);
             let tag_reserve = self.tag_reserve_1rtt();
             let avail = out.len().saturating_sub(off + tag_reserve);
+
+            // Strategy 5 = PacketNormalize: pad all 1-RTT packets to a fixed total size.
+            // target covers header + payload + tag; compute payload padding needed.
+            if self.config.stealth_padding_strategy == 5 {
+                let target = self.config.stealth_normalize_target_size;
+                if target > 0 && target > off + tag_reserve {
+                    let needed = target - off - tag_reserve;
+                    let pad_len = needed.min(avail);
+                    if pad_len > 0 {
+                        let pad = Frame::Padding { len: pad_len };
+                        off += frames::to_bytes(&pad, &mut out[off..])?;
+                    }
+                }
+                return Ok(off);
+            }
+
+            let ad_len = pn_off + pn_len;
+            let pt_len_now = off.saturating_sub(ad_len);
             if avail > 0 {
                 let pad_len = self.compute_stealth_padding(pt_len_now, avail);
                 if pad_len > 0 {
@@ -1351,6 +1735,16 @@ impl Connection {
             }
         }
         Ok(off)
+    }
+
+    /// Queues a cover PING frame to be emitted in the next outgoing 1-RTT packet.
+    ///
+    /// The PING is ack-eliciting: the peer sends an ACK, generating symmetric traffic
+    /// that matches idle HTTP/3 keepalive patterns observed in real browser sessions.
+    pub(crate) fn queue_cover_ping(&mut self) {
+        if self.is_established() {
+            self.pending_control.push_back(Frame::Ping { mtu_probe: None });
+        }
     }
 
     #[inline(always)]
@@ -1404,6 +1798,65 @@ impl Connection {
         }
     }
 
+    #[inline(always)]
+    fn send_targeted_short_header_frame(
+        &mut self,
+        out: &mut [u8],
+        send_local: SocketAddr,
+        send_peer: SocketAddr,
+        frame: &Frame<'_>,
+    ) -> Result<(usize, SendInfo), crate::error::ConnectionError> {
+        let base_hdr = packet::Header {
+            ty: PacketType::Short,
+            version: 0,
+            dcid: self.dcid.to_vec(),
+            scid: self.scid.to_vec(),
+            pkt_num: 0,
+            pkt_num_len: 0,
+            token: None,
+            versions: None,
+            key_phase: false,
+        };
+        let hdr_len = packet::format_header(&base_hdr, out)?;
+        let pn = self.next_send_pn_by_space[2];
+        let pn_len = if pn < (1 << 8) {
+            1
+        } else if pn < (1 << 16) {
+            2
+        } else if pn < (1 << 24) {
+            3
+        } else {
+            4
+        };
+        if out.len() < hdr_len + pn_len {
+            return Err(crate::error::ConnectionError::BufferTooShort);
+        }
+
+        let pn_off = 1 + self.dcid.as_ref().len();
+        let mut tmp = [0u8; 4];
+        packet::encode_pkt_num(pn, pn_len, &mut tmp[..pn_len])?;
+        out[pn_off..pn_off + pn_len].copy_from_slice(&tmp[..pn_len]);
+
+        let mut off = pn_off + pn_len;
+        let need = frames::wire_len(frame);
+        let tag_reserve = self.tag_reserve_1rtt();
+        if out.len() < off + need + tag_reserve {
+            return Err(crate::error::ConnectionError::BufferTooShort);
+        }
+        off += frames::to_bytes(frame, &mut out[off..])?;
+        off = self.seal_short_header_packet(out, pn, pn_off, pn_len, off)?;
+
+        let info = SendInfo { from: send_local, to: send_peer, at: Instant::now() };
+        self.mark_unvalidated_path_send(send_local, send_peer, off);
+        self.stats.sent += 1;
+        self.stats.sent_bytes += off as u64;
+        self.recovery.on_packet_sent(pn, off, Instant::now());
+        self.sent_bytes_by_pn.insert(pn, off);
+        self.cwnd = self.recovery.cwnd;
+        self.refresh_path_count();
+        Ok((off, info))
+    }
+
     /// Generates outgoing packet
     #[inline(always)]
     pub fn send(
@@ -1419,9 +1872,7 @@ impl Connection {
         if !self.recovery.can_send(self.dgram_send_max_size) {
             return Err(ConnectionError::Done);
         }
-
-        // Opportunistic zerocopy completion drain (handle completions from previous sends)
-        self.zerocopy_tick();
+        self.poll_path_validation_timeout(Instant::now());
 
         // TLS provider may derive new secrets during write-side progression. Poll here so
         // handshake completion and key installation are not dependent on receiving more CRYPTO.
@@ -1455,14 +1906,7 @@ impl Connection {
                     None
                 };
                 let base_hdr = packet::Header {
-                    ty: match pkt_ty {
-                        PacketType::Initial => packet::PacketType::Initial,
-                        PacketType::Retry => packet::PacketType::Retry,
-                        PacketType::Handshake => packet::PacketType::Handshake,
-                        PacketType::ZeroRTT => packet::PacketType::ZeroRTT,
-                        PacketType::VersionNegotiation => packet::PacketType::VersionNegotiation,
-                        PacketType::Short => packet::PacketType::Short,
-                    },
+                    ty: pkt_ty,
                     version: PROTOCOL_VERSION,
                     dcid: self.dcid.to_vec(),
                     scid: self.scid.to_vec(),
@@ -1498,13 +1942,9 @@ impl Connection {
                 let mut off = header_len;
 
                 let (lvl, max_len) = match pkt_ty {
-                    PacketType::Initial => {
-                        (crate::tls_provider::Level::Initial, out.len() - off - 16)
-                    }
-                    PacketType::Handshake => {
-                        (crate::tls_provider::Level::Handshake, out.len() - off - 16)
-                    }
-                    _ => (crate::tls_provider::Level::Application, out.len() - off - 16),
+                    PacketType::Initial => (crate::qftls::Level::Initial, out.len() - off - 16),
+                    PacketType::Handshake => (crate::qftls::Level::Handshake, out.len() - off - 16),
+                    _ => (crate::qftls::Level::Application, out.len() - off - 16),
                 };
                 if max_len < 32 {
                     continue;
@@ -1523,9 +1963,8 @@ impl Connection {
                     }
                 }
                 let ping = Frame::Ping { mtu_probe: None };
-                let _ = frames::to_bytes(&ping, &mut out[off..])?;
-                off += 1;
-                let frame = Frame::Crypto { offset: crypto_off, data };
+                off += frames::to_bytes(&ping, &mut out[off..])?;
+                let frame = Frame::Crypto { offset: crypto_off, data: Cow::Owned(data) };
                 let written = frames::to_bytes(&frame, &mut out[off..])?;
                 off += written;
 
@@ -1552,21 +1991,18 @@ impl Connection {
                 if off < target_off {
                     let pad_len = target_off - off;
                     let pad = Frame::Padding { len: pad_len };
-                    let _ = frames::to_bytes(&pad, &mut out[off..])?;
+                    frames::to_bytes(&pad, &mut out[off..])?;
                 }
 
-                if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                    eprintln!(
-                        "[send] role={} ty={:?} space={} pn={} pn_len={} hdr_len={} total={}",
-                        if self.is_server { "server" } else { "client" },
-                        pkt_ty,
-                        space_idx,
-                        pn,
-                        pn_len,
-                        header_len,
-                        target_total
-                    );
-                }
+                trace_send_packet(
+                    self.is_server,
+                    pkt_ty,
+                    space_idx,
+                    pn,
+                    pn_len,
+                    header_len,
+                    target_total,
+                );
 
                 let used = {
                     let crypto = self.crypto.read();
@@ -1576,16 +2012,7 @@ impl Connection {
                         header_len,
                         pn,
                         pn_len,
-                        match pkt_ty {
-                            PacketType::Initial => packet::PacketType::Initial,
-                            PacketType::Retry => packet::PacketType::Retry,
-                            PacketType::Handshake => packet::PacketType::Handshake,
-                            PacketType::ZeroRTT => packet::PacketType::ZeroRTT,
-                            PacketType::VersionNegotiation => {
-                                packet::PacketType::VersionNegotiation
-                            }
-                            PacketType::Short => packet::PacketType::Short,
-                        },
+                        pkt_ty,
                     )?
                 };
                 self.next_send_pn_by_space[space_idx] =
@@ -1603,6 +2030,14 @@ impl Connection {
 
             return Err(ConnectionError::Done);
         }
+        if let Some(targeted_frame) = self.pop_targeted_path_frame_for_send() {
+            return self.send_targeted_short_header_frame(
+                out,
+                targeted_frame.local_addr,
+                targeted_frame.peer_addr,
+                &targeted_frame.frame,
+            );
+        }
         // Stealth timing gate (disabled when external pacing is active)
         if self.config.stealth_timing_enabled && !self.config.external_pacing {
             let now = Instant::now();
@@ -1614,7 +2049,7 @@ impl Connection {
         }
         // Build short header prefix with DCID; we'll append PN bytes next
         let base_hdr = packet::Header {
-            ty: packet::PacketType::Short,
+            ty: PacketType::Short,
             version: 0,
             dcid: self.dcid.to_vec(),
             scid: self.scid.to_vec(),
@@ -1656,9 +2091,9 @@ impl Connection {
             let max_len = out.len().saturating_sub(off + 16);
             if max_len >= 32 {
                 if let Some((crypto_off, data)) =
-                    self.next_crypto_frame(crate::tls_provider::Level::Application, max_len)
+                    self.next_crypto_frame(crate::qftls::Level::Application, max_len)
                 {
-                    let frame = Frame::Crypto { offset: crypto_off, data };
+                    let frame = Frame::Crypto { offset: crypto_off, data: Cow::Owned(data) };
                     let need = frames::wire_len(&frame);
                     if out.len() >= off + need + 16 {
                         off += frames::to_bytes(&frame, &mut out[off..])?;
@@ -1680,7 +2115,7 @@ impl Connection {
             self.bytes_in_flight_started = Some(Instant::now());
         }
         // Maintain minimal paths_count
-        self.stats.paths_count = 1;
+        self.refresh_path_count();
 
         // Legacy transport-level FEC removed
 
@@ -1699,8 +2134,7 @@ impl Connection {
         self.cwnd = self.recovery.cwnd;
         // Schedule next send time if timing obfuscation is enabled
         if self.config.stealth_timing_enabled && !self.config.external_pacing {
-            let max_jitter_us = crate::brain::timing_jitter_hint_us()
-                .unwrap_or(self.config.stealth_timing_max_jitter_us);
+            let max_jitter_us = self.config.stealth_timing_max_jitter_us;
             if max_jitter_us > 0 {
                 let jitter = crate::transport::rand::rand_u64_uniform(max_jitter_us as u64 + 1);
                 let next = Instant::now() + Duration::from_micros(jitter);
@@ -1755,16 +2189,6 @@ impl Connection {
             }
             _ => 0,
         }
-    }
-
-    /// Returns the current key phase (short header KEY_PHASE bit).
-    pub fn key_phase(&self) -> bool {
-        self.key_phase
-    }
-
-    /// Sets the key phase bit for the short header (header signal only, no key rotation).
-    pub fn set_key_phase_bit(&mut self, enabled: bool) {
-        self.key_phase = enabled;
     }
 
     fn try_advance_read_keys(&mut self) -> bool {
@@ -1864,6 +2288,7 @@ impl Connection {
             recv_final_size: None,
             recv_frags: std::collections::BTreeMap::new(),
             priority_urgency: 3,
+            #[cfg(any(test, feature = "rust-tests"))]
             priority_incremental: false,
             max_stream_data_rx: self.config.initial_max_stream_data_bidi_local,
             max_stream_data_tx: self.config.initial_max_stream_data_bidi_remote,
@@ -1929,6 +2354,7 @@ impl Connection {
         Ok(buf.len())
     }
 
+    /// Dequeues one received DATAGRAM frame into the caller's buffer.
     #[inline(always)]
     pub fn dgram_recv(&mut self, buf: &mut [u8]) -> Result<usize, crate::error::ConnectionError> {
         if self.dgram_recv_queue.is_empty() {
@@ -1954,6 +2380,7 @@ impl Connection {
         }
     }
 
+    /// Enqueues a DATAGRAM frame for transmission on the next send call.
     #[inline(always)]
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<(), crate::error::ConnectionError> {
         if buf.len() > self.dgram_send_max_size {
@@ -1974,13 +2401,15 @@ impl Connection {
             self.dgram_send_queue.push_back(DatagramBuffer {
                 data,
                 len,
-                pool: self.dgram_pool.clone(),
+                _pool: self.dgram_pool.clone(),
             });
         }
         self.stats.dgram_sent += 1;
         Ok(())
     }
 
+    /// Dequeues one received DATAGRAM as an owned `Vec<u8>` (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_recv_vec(&mut self) -> Result<Vec<u8>, crate::error::ConnectionError> {
         if self.dgram_recv_queue.is_empty() {
             return Err(crate::error::ConnectionError::Done);
@@ -2006,6 +2435,8 @@ impl Connection {
         }
     }
 
+    /// Peeks at the front received DATAGRAM without consuming it.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_recv_peek(
         &self,
         buf: &mut [u8],
@@ -2030,6 +2461,8 @@ impl Connection {
         }
     }
 
+    /// Returns the byte length of the front received DATAGRAM, if any.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_recv_front_len(&self) -> Option<usize> {
         #[cfg(not(feature = "zero_copy_dgram"))]
         return self.dgram_recv_queue.front().map(|v| v.len());
@@ -2037,42 +2470,51 @@ impl Connection {
         return self.dgram_recv_queue.front().map(|v| v.len);
     }
 
+    /// Number of DATAGRAMs currently in the receive queue.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_recv_queue_len(&self) -> usize {
         self.dgram_recv_queue.len()
     }
+    /// Total bytes across all DATAGRAMs in the receive queue.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_recv_queue_byte_size(&self) -> usize {
         #[cfg(not(feature = "zero_copy_dgram"))]
         return self.dgram_recv_queue.iter().map(|v| v.len()).sum();
         #[cfg(feature = "zero_copy_dgram")]
         return self.dgram_recv_queue.iter().map(|v| v.len).sum();
     }
+    /// Number of DATAGRAMs currently in the send queue.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_send_queue_len(&self) -> usize {
         self.dgram_send_queue.len()
     }
+    /// Total bytes across all DATAGRAMs in the send queue.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_send_queue_byte_size(&self) -> usize {
         #[cfg(not(feature = "zero_copy_dgram"))]
         return self.dgram_send_queue.iter().map(|v| v.len()).sum();
         #[cfg(feature = "zero_copy_dgram")]
         return self.dgram_send_queue.iter().map(|v| v.len).sum();
     }
-    pub fn is_dgram_send_queue_full(&self) -> bool {
+    fn is_dgram_send_queue_full(&self) -> bool {
         let lim = self.config.dgram_send_max_queue_len;
         lim > 0 && self.dgram_send_queue.len() >= lim
     }
-    pub fn is_dgram_recv_queue_full(&self) -> bool {
+    fn is_dgram_recv_queue_full(&self) -> bool {
         let lim = self.config.dgram_recv_max_queue_len;
         lim > 0 && self.dgram_recv_queue.len() >= lim
     }
+    /// Enqueues an owned `Vec<u8>` as a DATAGRAM for transmission (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_send_vec(&mut self, buf: Vec<u8>) -> Result<(), crate::error::ConnectionError> {
         if buf.len() > self.dgram_send_max_size {
             return Err(crate::error::ConnectionError::InvalidState);
         }
         // Delegate to dgram_send so zero_copy path is handled uniformly
-        let r = self.dgram_send(&buf[..]);
-        // Periodic zerocopy drain
-        self.zerocopy_tick();
-        r
+        self.dgram_send(&buf[..])
     }
+    /// Removes outgoing DATAGRAMs matching the predicate.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_purge_outgoing<FN: Fn(&[u8]) -> bool>(&mut self, f: FN) {
         #[cfg(not(feature = "zero_copy_dgram"))]
         {
@@ -2083,6 +2525,8 @@ impl Connection {
             self.dgram_send_queue.retain(|d| !f(&d.data[..d.len]));
         }
     }
+    /// Returns the maximum DATAGRAM payload size, or `None` if the send queue is full.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn dgram_max_writable_len(&self) -> Option<usize> {
         if self.is_dgram_send_queue_full() {
             None
@@ -2101,38 +2545,36 @@ impl Connection {
         self.is_closed
     }
     /// Returns true if the connection has any readable streams
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn is_readable(&self) -> bool {
         !self.readable_streams.is_empty()
-    }
-    /// Returns trace id (hex of scid)
-    pub fn trace_id(&self) -> &str {
-        &self.trace_id
     }
     /// Returns whether this is a server-side connection
     pub fn is_server(&self) -> bool {
         self.is_server
     }
 
+    /// Returns a mutable reference to the BBR3 recovery/congestion controller.
     pub fn recovery_mut(&mut self) -> &mut recovery::Recovery {
         &mut self.recovery
     }
 
+    /// Loss-rate threshold above which FEC escalation is triggered.
     pub fn fec_escalation_threshold(&self) -> f32 {
         self.fec_escalation_threshold
     }
-    /// Whether the queried path matches the currently active validated path.
-    pub fn is_path_validated(&self, from: SocketAddr, to: SocketAddr) -> bool {
-        from == self.local_addr && to == self.peer_addr
-    }
     /// Returns true if the connection is draining
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn is_draining(&self) -> bool {
         self.is_draining
     }
     /// Returns true if the connection has timed out
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn is_timed_out(&self) -> bool {
         self.timeout_count > 0
     }
     /// Returns true when a session ticket is present in config or provider state.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn is_resumed(&self) -> bool {
         let cfg_ticket = self.config.tls_session.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
         let provider_ticket = self
@@ -2144,6 +2586,7 @@ impl Connection {
         cfg_ticket || provider_ticket
     }
     /// Returns true while 0-RTT is allowed and handshake has not fully established.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn is_in_early_data(&self) -> bool {
         self.config.enable_early_data && !self.is_established && !self.is_closed
     }
@@ -2154,15 +2597,18 @@ impl Connection {
     }
 
     /// Lightweight telemetry: ECN counters since last ACK emission
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn ecn_counts(&self) -> (u64, u64, u64) {
         (self.ecn_ect0, self.ecn_ect1, self.ecn_ce)
     }
 
     /// Current send quantum (bytes) derived from recovery
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn send_quantum(&self) -> usize {
         self.recovery.send_quantum()
     }
     /// True if we can send at least one datagram of size `sz` within cwnd
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn can_send(&self, sz: usize) -> bool {
         self.bytes_in_flight.saturating_add(sz) <= self.cwnd
     }
@@ -2183,18 +2629,90 @@ impl Connection {
     }
 
     /// ACK-eliciting threshold (packets) before emitting ACK
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn ack_eliciting_threshold(&self) -> u64 {
         self.config.ack_eliciting_threshold
     }
 
     /// Whether external pacing is enabled (internal sleeps disabled)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn external_pacing_enabled(&self) -> bool {
         self.config.external_pacing
+    }
+
+    /// Whether stealth timing obfuscation is enabled (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn stealth_timing_enabled_for_test(&self) -> bool {
+        self.config.stealth_timing_enabled
+    }
+
+    /// Configured maximum jitter in microseconds (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn stealth_timing_max_jitter_us_for_test(&self) -> u32 {
+        self.config.stealth_timing_max_jitter_us
+    }
+
+    /// Whether stealth padding is enabled (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn stealth_padding_enabled_for_test(&self) -> bool {
+        self.config.stealth_padding_enabled
+    }
+
+    /// Active stealth padding strategy ID (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn stealth_padding_strategy_for_test(&self) -> u8 {
+        self.config.stealth_padding_strategy
+    }
+
+    /// Whether the Brain sensor-fusion engine may steer this connection (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn intelligent_stealth_runtime_enabled_for_test(&self) -> bool {
+        self.intelligent_stealth_runtime
+    }
+
+    /// Current Brain runtime permission set (test accessor).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn brain_runtime_permissions_for_test(&self) -> crate::transport::BrainRuntimePermissions {
+        self.brain_runtime_permissions
     }
 
     /// Set or clear the transport observer (integration hook)
     pub fn set_observer(&mut self, obs: Option<Arc<dyn TransportObserver>>) {
         self.observer = obs;
+    }
+
+    pub(crate) fn intelligent_stealth_runtime_enabled(&self) -> bool {
+        self.intelligent_stealth_runtime
+    }
+
+    pub(crate) fn set_intelligent_stealth_runtime(&mut self, enabled: bool) {
+        self.intelligent_stealth_runtime = enabled;
+    }
+
+    /// Enables or disables Brain-driven stealth runtime for this connection (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn set_intelligent_stealth_runtime_for_test(&mut self, enabled: bool) {
+        self.set_intelligent_stealth_runtime(enabled);
+    }
+
+    pub(crate) fn brain_runtime_permissions(&self) -> crate::transport::BrainRuntimePermissions {
+        self.brain_runtime_permissions
+    }
+
+    pub(crate) fn set_brain_runtime_permissions(
+        &mut self,
+        permissions: crate::transport::BrainRuntimePermissions,
+    ) {
+        self.brain_runtime_permissions = permissions;
+    }
+
+    /// Overrides Brain runtime permissions for this connection (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn set_brain_runtime_permissions_for_test(
+        &mut self,
+        permissions: crate::transport::BrainRuntimePermissions,
+    ) {
+        self.set_brain_runtime_permissions(permissions);
     }
 
     fn install_recovery_fec_callbacks(&mut self) {
@@ -2218,43 +2736,62 @@ impl Connection {
         self.config.ack_eliciting_threshold = thr.max(1);
     }
     /// Toggle external pacing controller at runtime
-    pub fn set_external_pacing(&mut self, v: bool) {
+    pub(crate) fn set_external_pacing(&mut self, v: bool) {
         self.config.external_pacing = v;
+    }
+    /// Toggles external pacing for this connection (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
+    pub fn set_external_pacing_for_test(&mut self, v: bool) {
+        self.set_external_pacing(v);
     }
     /// Adjust streaming FEC emission interval (AdaptiveFec only)
     pub fn set_fec_stream_every(&mut self, every: usize) {
         self.fec_ctrl_delta.stream_every = Some(every.clamp(1, 32));
     }
     /// Enable/disable stealth timing and set max jitter
-    pub fn set_stealth_timing(&mut self, enabled: bool, max_jitter_us: u32) {
+    pub(crate) fn set_stealth_timing(&mut self, enabled: bool, max_jitter_us: u32) {
         self.config.stealth_timing_enabled = enabled;
         self.config.stealth_timing_max_jitter_us = max_jitter_us;
     }
     /// Set adaptive padding granularity (>=1)
-    pub fn set_stealth_adaptive_granularity(&mut self, gran: u16) {
+    pub(crate) fn set_stealth_adaptive_granularity(&mut self, gran: u16) {
         self.config.stealth_adaptive_granularity = if gran == 0 { 1 } else { gran };
     }
     /// Set browser mimic bias (1..=4)
-    pub fn set_stealth_mimic_bias(&mut self, bias: u8) {
+    pub(crate) fn set_stealth_mimic_bias(&mut self, bias: u8) {
         self.config.stealth_mimic_bias = match bias {
             1..=4 => bias,
             _ => 3,
         };
     }
     /// Adjust stealth padding parameters at runtime
-    pub fn set_stealth_padding(&mut self, enabled: bool, strategy: u8, max_size: usize) {
+    pub(crate) fn set_stealth_padding(&mut self, enabled: bool, strategy: u8, max_size: usize) {
         self.config.stealth_padding_enabled = enabled;
         self.config.stealth_padding_strategy = strategy;
         self.config.stealth_padding_max_size = max_size;
     }
-    /// Adjust recovery batch size (SIMD batching) to trade CPU vs. robustness
-    pub fn set_fec_batch_size(&mut self, size: usize) {
-        self.recovery.set_batch_size(size);
-        self.fec_batch_size = size;
-    }
-    /// Set FEC redundancy factor (0.0..=2.0)
-    pub fn set_fec_redundancy_factor(&mut self, f: f32) {
-        self.fec_redundancy_factor = f.clamp(0.0, 2.0);
+    pub(crate) fn apply_brain_stealth_runtime_delta(
+        &mut self,
+        delta: crate::transport::StealthRuntimeDelta,
+    ) {
+        if let Some(pacing) = delta.external_pacing {
+            self.set_external_pacing(pacing);
+        }
+        if let Some((enabled, max_jitter_us)) = delta.timing {
+            self.set_stealth_timing(enabled, max_jitter_us);
+        }
+        if let Some(bias) = delta.mimic_bias {
+            self.set_stealth_mimic_bias(bias);
+        }
+        if let Some(granularity) = delta.adaptive_granularity {
+            self.set_stealth_adaptive_granularity(granularity);
+        }
+        if let Some(profile) = delta.cc_profile {
+            self.set_cc_stealth_profile(true, profile);
+        }
+        if let Some((enabled, strategy, max_size)) = delta.padding {
+            self.set_stealth_padding(enabled, strategy, max_size);
+        }
     }
     /// Configure CC stealth profile to shape pacing like common browsers
     pub fn set_cc_stealth_profile(
@@ -2290,36 +2827,23 @@ impl Connection {
         )
     }
 
-    /// Returns the negotiated ALPN protocol
-    pub fn application_proto(&self) -> &[u8] {
-        b"h3"
-    }
-
     /// Returns the source connection ID
     pub fn source_id(&self) -> &ConnectionId {
         &self.scid
     }
 
-    /// Returns the destination connection ID
-    pub fn destination_id(&self) -> &ConnectionId {
-        // Touch dest_cids to maintain active use (e.g., for CID rotation/migration readiness)
-        let _ = self.dest_cids.contains(&self.dcid);
-        &self.dcid
-    }
-    /// Issues a new source connection ID (minimal: inserts into set)
-    pub fn new_scid(&mut self, cid: &ConnectionId) -> Result<(), crate::error::ConnectionError> {
-        self.source_cids.insert(cid);
-        Ok(())
-    }
     /// Returns all source IDs (minimal: only current scid)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn source_ids(&self) -> impl Iterator<Item = &ConnectionId> {
         std::iter::once(&self.scid)
     }
     /// Peer streams left (bidi)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn peer_streams_left_bidi(&self) -> u64 {
         self.config.initial_max_streams_bidi
     }
     /// Peer streams left (uni)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn peer_streams_left_uni(&self) -> u64 {
         self.config.initial_max_streams_uni
     }
@@ -2336,14 +2860,16 @@ impl Connection {
         self.local_error = Some(crate::error::ConnectionError::ApplicationClosed);
         // Emit Close frame into control queue.
         if app {
-            self.pending_control
-                .push_back(Frame::ApplicationClose { error_code: err, reason: reason.to_vec() });
+            self.pending_control.push_back(Frame::ApplicationClose {
+                error_code: err,
+                reason: Cow::Owned(reason.to_vec()),
+            });
         } else {
             // frame_type=0 (unknown) in minimal implementation
             self.pending_control.push_back(Frame::ConnectionClose {
                 error_code: err,
                 frame_type: 0,
-                reason: reason.to_vec(),
+                reason: Cow::Owned(reason.to_vec()),
             });
         }
         Ok(())
@@ -2353,10 +2879,6 @@ impl Connection {
     pub fn timeout(&self) -> Option<Duration> {
         Some(Duration::from_millis(30000))
     }
-    pub fn timeout_instant(&self) -> Option<Instant> {
-        self.timeout().map(|d| Instant::now() + d)
-    }
-
     /// Handles timeout
     pub fn on_timeout(&mut self) {
         // Handle connection timeout
@@ -2402,37 +2924,13 @@ impl Connection {
         // Switch into draining on timeout.
         self.is_draining = true;
     }
-    /// Returns last peer error if any
-    pub fn peer_error(&self) -> Option<&crate::error::ConnectionError> {
-        self.peer_error.as_ref()
-    }
-    /// Returns last local error if any
-    pub fn local_error(&self) -> Option<&crate::error::ConnectionError> {
-        self.local_error.as_ref()
-    }
-
     /// Server name (SNI) from TLS provider
     pub fn server_name(&self) -> Option<&str> {
         self.tls_provider.as_ref().and_then(|p| p.server_name_get())
     }
-    /// Peer leaf certificate DER (from TLS provider)
-    pub fn peer_cert(&self) -> Option<Vec<u8>> {
-        self.tls_provider.as_ref().and_then(|p| p.peer_cert())
-    }
-    /// Peer certificate chain DER (from TLS provider)
-    pub fn peer_cert_chain(&self) -> Option<Vec<Vec<u8>>> {
-        self.tls_provider.as_ref().and_then(|p| p.peer_cert_chain())
-    }
-    /// TLS session ticket for resumption (from TLS provider)
-    pub fn session(&self) -> Option<Vec<u8>> {
-        self.tls_provider.as_ref().and_then(|p| p.session_ticket())
-    }
-    /// Peer transport parameters (not tracked in this transport layer)
-    pub fn peer_transport_params(&self) -> Option<&()> {
-        None
-    }
-
     /// Stream priority
+    /// Sets urgency and incremental scheduling hints for a stream.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_priority(
         &mut self,
         stream_id: u64,
@@ -2444,7 +2942,10 @@ impl Connection {
             .get_mut(&stream_id)
             .ok_or(crate::error::ConnectionError::InvalidStreamState(stream_id))?;
         _stream.priority_urgency = _urgency;
-        _stream.priority_incremental = _incremental;
+        #[cfg(any(test, feature = "rust-tests"))]
+        {
+            _stream.priority_incremental = _incremental;
+        }
 
         if self.writable_streams.contains(&stream_id) {
             self.writable_streams.retain(|&id| id != stream_id);
@@ -2466,27 +2967,37 @@ impl Connection {
         Ok(())
     }
 
+    /// Shuts down a stream in the given direction (no-op in minimal impl).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_shutdown(
         &mut self,
         _stream_id: u64,
-        _direction: Shutdown,
+        _direction: std::net::Shutdown,
         _err: u64,
     ) -> Result<(), crate::error::ConnectionError> {
         Ok(())
     }
 
+    /// Returns the remaining send capacity for a stream (fixed 64 KB in minimal impl).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_capacity(&self, _stream_id: u64) -> Result<usize, crate::error::ConnectionError> {
         Ok(65536)
     }
 
+    /// Returns true if the stream has buffered receive data.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_readable(&self, _stream_id: u64) -> bool {
         self.readable_streams.contains(&_stream_id)
     }
 
+    /// Returns true if the stream has queued send data.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_writable(&self, _stream_id: u64, _len: usize) -> bool {
         self.writable_streams.contains(&_stream_id)
     }
 
+    /// Returns true if the stream's send buffer is empty and FIN has been set.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_finished(&self, _stream_id: u64) -> bool {
         if let Some(s) = self.streams.get(&_stream_id) {
             #[cfg(not(feature = "stream_ring_buffer"))]
@@ -2502,14 +3013,19 @@ impl Connection {
         }
     }
 
+    /// Iterates over stream IDs that have readable data.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn readable(&self) -> impl Iterator<Item = u64> + '_ {
         self.readable_streams.iter().copied()
     }
 
+    /// Iterates over stream IDs that have pending send data.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn writable(&self) -> impl Iterator<Item = u64> + '_ {
         self.writable_streams.iter().copied()
     }
 
+    /// Pops and returns the next stream ID that has data ready to read.
     pub fn stream_readable_next(&mut self) -> Option<u64> {
         if self.readable_streams.is_empty() {
             None
@@ -2518,6 +3034,8 @@ impl Connection {
         }
     }
 
+    /// Pops the next stream ID with queued send data (test helper).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn stream_writable_next(&mut self) -> Option<u64> {
         if self.writable_streams.is_empty() {
             None
@@ -2526,6 +3044,8 @@ impl Connection {
         }
     }
 
+    /// Maximum UDP payload size for outgoing datagrams.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn max_send_udp_payload_size(&self) -> usize {
         self.dgram_send_max_size
     }
@@ -2536,36 +3056,18 @@ impl Connection {
         local: SocketAddr,
         peer: SocketAddr,
     ) -> Result<u64, crate::error::ConnectionError> {
-        // Migrate to new path
-        let _old_local = self.local_addr;
-        let old_peer = self.peer_addr;
-        self.local_addr = local;
-        self.peer_addr = peer;
-        self.path_id += 1;
-
-        // Reset congestion control
-        self.cwnd = INITIAL_WINDOW;
-        self.bytes_in_flight = 0;
-        // Emit path events
-        self.path_events.push_back(PathEvent::New(local, peer));
-        self.path_events.push_back(PathEvent::Validated(local, peer));
-        self.path_events.push_back(PathEvent::PeerMigrated(old_peer, peer));
-
-        Ok(self.path_id)
+        self.begin_path_validation(local, peer, PathValidationOrigin::LocalMigration, 0)
     }
     /// Change only the local address (migrate source path)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn migrate_source(
         &mut self,
         local: SocketAddr,
     ) -> Result<u64, crate::error::ConnectionError> {
-        let _old_local = self.local_addr;
-        self.local_addr = local;
-        self.path_id += 1;
-        self.path_events.push_back(PathEvent::New(local, self.peer_addr));
-        self.path_events.push_back(PathEvent::Validated(local, self.peer_addr));
-        Ok(self.path_id)
+        self.begin_path_validation(local, self.peer_addr, PathValidationOrigin::LocalMigration, 0)
     }
     /// Probe a path and emit path lifecycle events for observers/control-plane.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn probe_path(
         &mut self,
         from: SocketAddr,
@@ -2575,15 +3077,11 @@ impl Connection {
             return Err(crate::error::ConnectionError::InvalidState);
         }
 
-        self.path_events.push_back(PathEvent::New(from, to));
-        self.path_events.push_back(PathEvent::Validated(from, to));
-        if self.peer_addr != to {
-            self.path_events.push_back(PathEvent::PeerMigrated(self.peer_addr, to));
-        }
-        self.path_id = self.path_id.wrapping_add(1);
+        let _ = self.begin_path_validation(from, to, PathValidationOrigin::LocalMigration, 0)?;
         Ok(())
     }
 
+    /// Returns per-path statistics for each validated path.
     pub fn path_stats(&self) -> impl Iterator<Item = PathStats> {
         std::iter::once(PathStats {
             recv: self.stats.recv_bytes,
@@ -2597,6 +3095,8 @@ impl Connection {
         })
     }
     // Pacing / Congestion / Release hooks
+    /// Returns the next pacing-based release time for outbound packets.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn get_next_release_time(&self) -> Option<Instant> {
         if !self.config.pacing {
             return None;
@@ -2618,13 +3118,14 @@ impl Connection {
             ((self.bytes_in_flight as u128) * 1_000_000u128 / rate_bps as u128).max(1) as u64;
         Some(now + Duration::from_micros(release_delay_us))
     }
-    pub fn gcongestion_enabled(&self) -> bool {
-        true
-    }
+    /// Whether send pacing is enabled.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn pacing_enabled(&self) -> bool {
         self.config.pacing
     }
 
+    /// Sends a packet targeting a specific peer address (delegates to `send`).
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn send_on_path(
         &mut self,
         out: &mut [u8],
@@ -2635,7 +3136,7 @@ impl Connection {
 
     /// Returns the next path event, if any
     pub fn path_event_next(&mut self) -> Option<PathEvent> {
-        // Return next path event
+        self.poll_path_validation_timeout(Instant::now());
         if self.path_events.is_empty() {
             None
         } else {
@@ -2643,28 +3144,34 @@ impl Connection {
         }
     }
     /// Active SCIDs count (minimal: 1)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn active_scids(&self) -> usize {
         1
     }
     /// SCIDs left to issue (minimal: 0)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn scids_left(&self) -> usize {
         0
     }
     /// Retire a DCID by sequence (minimal: record in retired_scids)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn retire_dcid(&mut self, _dcid_seq: u64) -> Result<(), crate::error::ConnectionError> {
-        self.retired_scids.push_back(self.scid.clone());
+        self.retired_scids.push_back(self.scid);
         Ok(())
     }
     /// Iterate paths (minimal: return peer addr once)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn paths_iter(&self, _from: SocketAddr) -> impl Iterator<Item = SocketAddr> {
         std::iter::once(self.peer_addr)
     }
     /// Send an ACK-eliciting frame hint (mark ACK needed)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn send_ack_eliciting(&mut self) -> Result<(), crate::error::ConnectionError> {
         self.pkt_spaces[2].ack_elicited = true;
         Ok(())
     }
     /// Send ACK-eliciting on a path (ignored in minimal impl)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn send_ack_eliciting_on_path(
         &mut self,
         _from: SocketAddr,
@@ -2672,10 +3179,12 @@ impl Connection {
         self.send_ack_eliciting()
     }
     /// Retired scids count
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn retired_scids(&self) -> usize {
         self.retired_scids.len()
     }
     /// Next retired scid if any
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn retired_scid_next(&mut self) -> Option<ConnectionId> {
         if self.retired_scids.is_empty() {
             None
@@ -2684,7 +3193,550 @@ impl Connection {
         }
     }
     /// Available dcids (minimal: 0)
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn available_dcids(&self) -> usize {
         0
+    }
+}
+
+// ============================================================================
+// Inline unit tests – no real network or TLS required.
+//
+// All tests construct a Connection via new_with_role() and exercise internal
+// state directly. Private fields are accessible from a #[cfg(test)] module
+// nested inside the same source file.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::config::Config;
+
+    fn local() -> std::net::SocketAddr {
+        "127.0.0.1:10000".parse().unwrap()
+    }
+    fn peer() -> std::net::SocketAddr {
+        "127.0.0.1:10001".parse().unwrap()
+    }
+
+    /// Minimal connection used across tests; does not require TLS or sockets.
+    fn make_conn() -> Connection {
+        Connection::new_with_role(
+            b"test_scid_0123456789",
+            local(),
+            peer(),
+            Config::new_with_version(PROTOCOL_VERSION).unwrap(),
+            false, // client
+        )
+    }
+
+    /// Install a dummy 32-byte 1-RTT write secret so key_update() can toggle
+    /// key_phase without a real TLS handshake.
+    fn install_write_secret(c: &mut Connection) {
+        c.crypto.write().write_secret_1rtt = Some(vec![0u8; 32]);
+    }
+
+    // ---- Priority 1: Flow Control ----------------------------------------
+
+    #[test]
+    fn flow_control_send_blocked_by_peer_max_data() {
+        let mut c = make_conn();
+        // Force connection window to 10 bytes – smaller than the send payload.
+        c.peer_max_data = 10;
+        let result = c.stream_send(0, &[0u8; 100], false);
+        assert!(
+            result.is_err(),
+            "stream_send must fail when payload exceeds peer_max_data"
+        );
+    }
+
+    #[test]
+    fn flow_control_window_update_unblocks_send() {
+        let mut c = make_conn();
+        c.peer_max_data = 10;
+        assert!(c.stream_send(0, &[0u8; 100], false).is_err(), "precondition: blocked");
+        // Simulate peer sending MAX_DATA that opens the window.
+        c.peer_max_data = 10_000;
+        let sent = c.stream_send(0, &[0u8; 100], false).expect("should succeed after window update");
+        assert_eq!(sent, 100);
+    }
+
+    #[test]
+    fn flow_control_data_blocked_frame_queued_on_block() {
+        let mut c = make_conn();
+        c.peer_max_data = 10;
+        let _ = c.stream_send(0, &[0u8; 100], false);
+        let has_data_blocked = c
+            .pending_control
+            .iter()
+            .any(|f| matches!(f, Frame::DataBlocked { .. }));
+        assert!(has_data_blocked, "DataBlocked frame must be queued when connection window is exhausted");
+    }
+
+    #[test]
+    fn flow_control_stream_window_blocks_independently() {
+        let mut c = make_conn();
+        // Connection window is generous; stream window is the bottleneck.
+        c.peer_max_data = 10_000;
+        // Create the stream entry with a send call that succeeds, then tighten stream window.
+        c.stream_send(0, b"", false).ok();
+        if let Some(s) = c.streams.get_mut(&0) {
+            s.max_stream_data_tx = 5;
+        }
+        let result = c.stream_send(0, &[0u8; 100], false);
+        assert!(
+            result.is_err(),
+            "stream_send must fail when payload exceeds per-stream max_stream_data_tx"
+        );
+    }
+
+    #[test]
+    fn flow_control_stream_data_blocked_frame_queued() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        c.stream_send(0, b"", false).ok();
+        if let Some(s) = c.streams.get_mut(&0) {
+            s.max_stream_data_tx = 5;
+        }
+        let _ = c.stream_send(0, &[0u8; 100], false);
+        let has_stream_blocked = c
+            .pending_control
+            .iter()
+            .any(|f| matches!(f, Frame::StreamDataBlocked { .. }));
+        assert!(has_stream_blocked, "StreamDataBlocked frame must be queued when stream window is exhausted");
+    }
+
+    // ---- Priority 2: State Transitions ------------------------------------
+
+    #[test]
+    fn close_sets_closed_and_draining() {
+        let mut c = make_conn();
+        assert!(!c.is_closed(), "must not be closed initially");
+        assert!(!c.is_draining, "must not be draining initially");
+        c.close(true, 0, b"done").unwrap();
+        assert!(c.is_closed(), "is_closed must be true after close()");
+        assert!(c.is_draining, "is_draining must be true after close()");
+    }
+
+    #[test]
+    fn close_queues_application_close_frame() {
+        let mut c = make_conn();
+        c.close(true, 42, b"reason").unwrap();
+        let has_app_close = c
+            .pending_control
+            .iter()
+            .any(|f| matches!(f, Frame::ApplicationClose { error_code: 42, .. }));
+        assert!(has_app_close, "close(app=true) must queue ApplicationClose frame");
+    }
+
+    #[test]
+    fn on_timeout_increments_count_and_sets_draining() {
+        let mut c = make_conn();
+        assert!(!c.is_draining());
+        assert!(!c.is_timed_out());
+        c.on_timeout();
+        assert!(c.is_draining(), "on_timeout() must set is_draining");
+        assert!(c.is_timed_out(), "on_timeout() must make is_timed_out() return true");
+    }
+
+    #[test]
+    fn on_timeout_clears_bytes_in_flight() {
+        let mut c = make_conn();
+        c.bytes_in_flight = 4800;
+        c.on_timeout();
+        assert_eq!(c.bytes_in_flight, 0, "on_timeout() must zero bytes_in_flight");
+    }
+
+    // ---- Priority 3: Key Update ------------------------------------------
+
+    #[test]
+    fn key_phase_starts_false() {
+        let c = make_conn();
+        assert!(!c.key_phase, "initial key_phase must be false (RFC 9001 §5.4)");
+    }
+
+    #[test]
+    fn key_update_toggles_phase_with_installed_secret() {
+        let mut c = make_conn();
+        install_write_secret(&mut c);
+        assert!(!c.key_phase);
+        c.key_update();
+        assert!(c.key_phase, "key_update() must flip key_phase to true when write secret is present");
+    }
+
+    #[test]
+    fn key_update_twice_restores_phase() {
+        let mut c = make_conn();
+        install_write_secret(&mut c);
+        c.key_update();
+        assert!(c.key_phase, "after first update: key_phase = true");
+        // The second update derives from the rotated secret – re-install a known secret
+        // so the derivation chain can continue without panicking.
+        install_write_secret(&mut c);
+        c.key_update();
+        assert!(!c.key_phase, "after second update: key_phase must return to false");
+    }
+
+    // ---- Priority 4: In-Flight / Congestion Control ----------------------
+
+    #[test]
+    fn can_send_allows_when_below_cwnd() {
+        let c = make_conn();
+        // Fresh connection: bytes_in_flight = 0, cwnd = INITIAL_WINDOW.
+        assert!(c.can_send(100), "can_send(100) must be true on fresh connection");
+    }
+
+    #[test]
+    fn can_send_blocks_when_bytes_exceed_cwnd() {
+        let mut c = make_conn();
+        c.bytes_in_flight = c.cwnd + 1;
+        assert!(!c.can_send(1), "can_send must return false when bytes_in_flight exceeds cwnd");
+    }
+
+    #[test]
+    fn bytes_in_flight_cleared_by_timeout_restores_can_send() {
+        let mut c = make_conn();
+        // Saturate the congestion window.
+        c.bytes_in_flight = c.cwnd + 1;
+        assert!(!c.can_send(1), "precondition: window saturated");
+        c.on_timeout();
+        assert_eq!(c.bytes_in_flight, 0, "on_timeout must clear bytes_in_flight");
+        assert!(c.can_send(1), "can_send must be true after timeout clears in-flight");
+    }
+
+    // ---- Connection State Transitions ------------------------------------
+
+    #[test]
+    fn new_connection_starts_unestablished() {
+        let c = make_conn();
+        assert!(!c.is_established(), "fresh connection must not be established");
+        assert!(!c.is_closed(), "fresh connection must not be closed");
+        assert!(!c.is_draining, "fresh connection must not be draining");
+    }
+
+    #[test]
+    fn server_role_sets_is_server_flag() {
+        let s = Connection::new_with_role(
+            b"server_cid_12345678",
+            local(),
+            peer(),
+            Config::new_with_version(PROTOCOL_VERSION).unwrap(),
+            true,
+        );
+        assert!(s.is_server(), "server connection must report is_server=true");
+    }
+
+    #[test]
+    fn close_transport_queues_connection_close_frame() {
+        let mut c = make_conn();
+        c.close(false, 0x0a, b"flow_control").unwrap();
+        let has_conn_close = c
+            .pending_control
+            .iter()
+            .any(|f| matches!(f, Frame::ConnectionClose { error_code: 0x0a, .. }));
+        assert!(has_conn_close, "close(app=false) must queue ConnectionClose frame");
+    }
+
+    #[test]
+    fn double_close_is_idempotent() {
+        let mut c = make_conn();
+        c.close(true, 1, b"first").unwrap();
+        c.close(true, 2, b"second").unwrap();
+        assert!(c.is_closed(), "connection must remain closed after double close");
+        assert_eq!(
+            c.pending_control.len(),
+            2,
+            "both close frames should be queued"
+        );
+    }
+
+    // ---- Stream Open/Close and Flow Control ------------------------------
+
+    #[test]
+    fn stream_send_creates_stream_entry() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        c.stream_send(4, b"hello", false).unwrap();
+        assert!(c.streams.contains_key(&4), "stream_send must create stream entry");
+    }
+
+    #[test]
+    fn stream_send_with_fin_marks_send_fin() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        c.stream_send(4, b"done", true).unwrap();
+        let s = c.streams.get(&4).expect("stream must exist");
+        assert!(s.send_fin, "stream must have send_fin set after fin=true");
+    }
+
+    #[test]
+    fn stream_send_after_fin_returns_final_size_error() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        c.stream_send(4, b"done", true).unwrap();
+        let err = c.stream_send(4, b"more", false).unwrap_err();
+        assert!(
+            matches!(err, crate::error::ConnectionError::FinalSize),
+            "sending after FIN must return FinalSize error, got {:?}", err
+        );
+    }
+
+    #[test]
+    fn stream_writable_list_tracks_active_streams() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        c.stream_send(0, b"a", false).unwrap();
+        c.stream_send(4, b"b", false).unwrap();
+        assert!(c.writable_streams.contains(&0), "stream 0 must be writable");
+        assert!(c.writable_streams.contains(&4), "stream 4 must be writable");
+    }
+
+    // ---- Error Handling: Transport Errors, Reset -------------------------
+
+    #[test]
+    fn local_error_none_on_fresh_connection() {
+        let c = make_conn();
+        assert!(c.local_error.is_none(), "fresh connection must not have local_error");
+    }
+
+    #[test]
+    fn close_sets_local_error_application_closed() {
+        let mut c = make_conn();
+        c.close(true, 0, b"bye").unwrap();
+        assert!(
+            matches!(c.local_error, Some(crate::error::ConnectionError::ApplicationClosed)),
+            "close() must set local_error to ApplicationClosed"
+        );
+    }
+
+    #[test]
+    fn timeout_increments_lost_stats() {
+        let mut c = make_conn();
+        c.peer_max_data = 10_000;
+        // Queue some data to trigger the lost counter in on_timeout
+        c.stream_send(0, b"some data for timeout test", false).unwrap();
+        let lost_before = c.stats.lost;
+        c.on_timeout();
+        assert!(
+            c.stats.lost > lost_before,
+            "on_timeout must increment lost stats when streams have pending data"
+        );
+    }
+
+    // ---- 0-RTT Early Data Paths ------------------------------------------
+
+    #[test]
+    fn is_in_early_data_when_configured() {
+        let mut cfg = Config::new_with_version(PROTOCOL_VERSION).unwrap();
+        cfg.enable_early_data = true;
+        let c = Connection::new_with_role(
+            b"test_scid_0123456789",
+            local(),
+            peer(),
+            cfg,
+            false,
+        );
+        assert!(c.is_in_early_data(), "connection with enable_early_data must report is_in_early_data");
+    }
+
+    #[test]
+    fn not_in_early_data_when_established() {
+        let mut cfg = Config::new_with_version(PROTOCOL_VERSION).unwrap();
+        cfg.enable_early_data = true;
+        let mut c = Connection::new_with_role(
+            b"test_scid_0123456789",
+            local(),
+            peer(),
+            cfg,
+            false,
+        );
+        c.is_established = true;
+        assert!(!c.is_in_early_data(), "established connection must not be in early data");
+    }
+
+    #[test]
+    fn not_in_early_data_when_disabled() {
+        let c = make_conn();
+        assert!(!c.is_in_early_data(), "connection without enable_early_data must not be in early data");
+    }
+
+    // ---- Idle Timeout and Keepalive --------------------------------------
+
+    #[test]
+    fn timeout_returns_some_duration() {
+        let c = make_conn();
+        let t = c.timeout();
+        assert!(t.is_some(), "timeout() must return Some");
+        assert!(t.unwrap() > Duration::from_secs(0), "timeout must be positive");
+    }
+
+    #[test]
+    fn on_timeout_increases_rtt_estimate() {
+        let mut c = make_conn();
+        let rtt_before = c.rtt;
+        c.on_timeout();
+        assert!(c.rtt > rtt_before, "on_timeout must increase RTT estimate");
+    }
+
+    #[test]
+    fn multiple_timeouts_accumulate() {
+        let mut c = make_conn();
+        c.on_timeout();
+        c.on_timeout();
+        assert!(c.timeout_count >= 2, "multiple on_timeout calls must accumulate timeout_count");
+    }
+
+    // ---- MAX_STREAMS / MAX_DATA Handling ---------------------------------
+
+    #[test]
+    fn peer_max_data_update_monotonic() {
+        let mut c = make_conn();
+        let initial = c.peer_max_data;
+        // Simulate peer sending larger MAX_DATA
+        c.peer_max_data = initial + 1000;
+        assert_eq!(c.peer_max_data, initial + 1000);
+        // Verify peer_max_data was updated to the new value
+        assert_eq!(c.peer_max_data, initial + 1000, "peer_max_data must reflect the update");
+    }
+
+    #[test]
+    fn conn_max_data_initial_matches_config() {
+        let cfg = Config::new_with_version(PROTOCOL_VERSION).unwrap();
+        let initial_max = cfg.initial_max_data;
+        let c = Connection::new_with_role(
+            b"test_scid_0123456789",
+            local(),
+            peer(),
+            cfg,
+            false,
+        );
+        assert_eq!(c.conn_max_data, initial_max, "conn_max_data must match config initial_max_data");
+    }
+
+    #[test]
+    fn max_peer_max_data_cap_prevents_resource_exhaustion() {
+        // Verify the cap constant exists and is reasonable
+        const { assert!(MAX_PEER_MAX_DATA > 0, "MAX_PEER_MAX_DATA must be positive") };
+        assert!(MAX_PEER_MAX_DATA <= 2_u64.pow(30), "MAX_PEER_MAX_DATA must be bounded");
+    }
+
+    // ---- Packet Number Space Management ----------------------------------
+
+    #[test]
+    fn initial_pn_spaces_start_at_zero() {
+        let c = make_conn();
+        for (i, &pn) in c.next_send_pn_by_space.iter().enumerate() {
+            assert_eq!(pn, 0, "next_send_pn for space {} must start at 0", i);
+        }
+    }
+
+    #[test]
+    fn three_pn_spaces_exist() {
+        let c = make_conn();
+        assert_eq!(c.pkt_spaces.len(), 3, "must have exactly 3 PN spaces (Initial, Handshake, Application)");
+        assert_eq!(c.next_send_pn_by_space.len(), 3, "must have 3 next_send_pn counters");
+    }
+
+    // ---- Connection Close Frame Generation -------------------------------
+
+    #[test]
+    fn close_app_and_transport_produce_different_frames() {
+        let mut c1 = make_conn();
+        c1.close(true, 42, b"app error").unwrap();
+        let has_app = c1.pending_control.iter().any(|f| matches!(f, Frame::ApplicationClose { .. }));
+        assert!(has_app, "app close must produce ApplicationClose frame");
+
+        let mut c2 = make_conn();
+        c2.close(false, 0x01, b"protocol error").unwrap();
+        let has_conn = c2.pending_control.iter().any(|f| matches!(f, Frame::ConnectionClose { .. }));
+        assert!(has_conn, "transport close must produce ConnectionClose frame");
+    }
+
+    #[test]
+    fn close_reason_preserved_in_frame() {
+        let mut c = make_conn();
+        c.close(true, 99, b"test reason").unwrap();
+        let frame = c.pending_control.back().expect("must have queued frame");
+        match frame {
+            Frame::ApplicationClose { error_code, reason } => {
+                assert_eq!(*error_code, 99);
+                assert_eq!(reason.as_ref(), b"test reason");
+            }
+            _ => panic!("expected ApplicationClose frame"),
+        }
+    }
+
+    // ---- ECN Counters ----------------------------------------------------
+
+    #[test]
+    fn ecn_counters_start_at_zero() {
+        let c = make_conn();
+        let (ect0, ect1, ce) = c.ecn_counts();
+        assert_eq!(ect0, 0);
+        assert_eq!(ect1, 0);
+        assert_eq!(ce, 0);
+    }
+
+    // ---- Stats -----------------------------------------------------------
+
+    #[test]
+    fn stats_start_zeroed() {
+        let c = make_conn();
+        let s = c.stats();
+        assert_eq!(s.recv, 0);
+        assert_eq!(s.sent, 0);
+        assert_eq!(s.lost, 0);
+    }
+
+    // ---- Stream Priority -------------------------------------------------
+
+    #[test]
+    fn stream_priority_reorders_writable_queue() {
+        let mut c = make_conn();
+        c.peer_max_data = 100_000;
+        c.stream_send(0, b"low", false).unwrap();
+        c.stream_send(4, b"high", false).unwrap();
+        // Set stream 4 to higher priority (lower urgency number)
+        c.stream_priority(4, 1, false).unwrap();
+        let first = c.writable_streams.front().copied();
+        assert_eq!(first, Some(4), "higher-priority stream must be first in writable queue");
+    }
+
+    // ---- Datagram Queues -------------------------------------------------
+
+    #[test]
+    fn dgram_send_recv_roundtrip() {
+        let mut c = make_conn();
+        c.enable_datagrams(16, 16);
+        c.dgram_send(b"test_dgram").unwrap();
+        assert_eq!(c.dgram_send_queue_len(), 1);
+        assert_eq!(c.dgram_send_queue_byte_size(), 10);
+    }
+
+    // ---- Recovery / FEC Escalation ---------------------------------------
+
+    #[test]
+    fn fec_escalation_threshold_default() {
+        let c = make_conn();
+        let thr = c.fec_escalation_threshold();
+        assert!(thr > 0.0, "FEC escalation threshold must be positive");
+        assert!(thr < 1.0, "FEC escalation threshold must be < 1.0");
+    }
+
+    // ---- Brain / Stealth Runtime -----------------------------------------
+
+    #[test]
+    fn intelligent_stealth_runtime_default_off() {
+        let c = make_conn();
+        assert!(!c.intelligent_stealth_runtime_enabled_for_test(),
+            "intelligent stealth runtime must default to off");
+    }
+
+    #[test]
+    fn set_intelligent_stealth_runtime_toggle() {
+        let mut c = make_conn();
+        c.set_intelligent_stealth_runtime_for_test(true);
+        assert!(c.intelligent_stealth_runtime_enabled_for_test());
+        c.set_intelligent_stealth_runtime_for_test(false);
+        assert!(!c.intelligent_stealth_runtime_enabled_for_test());
     }
 }

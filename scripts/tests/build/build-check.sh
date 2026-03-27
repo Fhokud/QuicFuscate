@@ -13,7 +13,6 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --skip-clippy) SKIP_CLIPPY=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--skip-clippy]"; exit 0;;
     *) break;;
@@ -60,5 +59,5 @@ if ! cargo bench --no-run --features benches; then
   warn "benchmark compilation failed (benches may be optional in this build)"
 fi
 
-echo -e "\n[OK] All checks passed"
+echo -e "\n[OK] Compilation checks passed (see any warnings above for fmt/clippy issues)"
 json_end "$JSON"

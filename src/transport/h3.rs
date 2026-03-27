@@ -56,7 +56,6 @@ struct PushPromise {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PushState {
     Promised,
-    HeadersSent,
     DataSending,
     Complete,
 }
@@ -69,27 +68,43 @@ impl Header {
 
     /// Builds a header from preallocated vectors (SIMD-friendly callers).
     #[inline]
-    pub fn from_parts(name: Vec<u8>, value: Vec<u8>) -> Self {
+    pub(crate) fn from_parts(name: Vec<u8>, value: Vec<u8>) -> Self {
         Self { name, value }
     }
 
+    /// Returns the header name bytes.
+    #[inline]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Returns the header value bytes.
+    #[inline]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
     /// Returns a mutable reference to the header name bytes.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn name_mut(&mut self) -> &mut [u8] {
         &mut self.name
     }
 
     /// Returns a mutable reference to the header value bytes.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn value_mut(&mut self) -> &mut [u8] {
         &mut self.value
     }
 }
 
 /// Trait for accessing header name and value
+#[cfg(any(test, feature = "rust-tests"))]
 pub trait NameValue {
     fn name(&self) -> &[u8];
     fn value(&self) -> &[u8];
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
 impl NameValue for Header {
     fn name(&self) -> &[u8] {
         &self.name
@@ -120,14 +135,15 @@ impl Config {
     }
 
     /// Sets QPACK max table capacity
-    pub fn set_qpack_max_table_capacity(&mut self, v: u64) {
+    pub(crate) fn set_qpack_max_table_capacity(&mut self, v: u64) {
         self.qpack_max_table_capacity = v;
     }
     /// Sets QPACK blocked streams
-    pub fn set_qpack_blocked_streams(&mut self, v: u64) {
+    pub(crate) fn set_qpack_blocked_streams(&mut self, v: u64) {
         self.qpack_blocked_streams = v;
     }
     /// Sets max field section size
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn set_max_field_section_size(&mut self, v: u64) {
         self.max_field_section_size = v;
     }
@@ -163,7 +179,6 @@ struct StreamState {
     _stream_type: StreamType,
     sent_bytes: usize,
     fin_sent: bool,
-    #[allow(dead_code)]
     fin_received: bool,
     _stream_type_dup: StreamType,
     masque_established: bool,
@@ -179,6 +194,28 @@ enum StreamType {
 }
 
 impl Connection {
+    fn encode_headers_block(&mut self, headers: &[Header]) -> Result<Vec<u8>, Error> {
+        // QPACK header blocks can exceed 4KiB when stealth adds realistic header cover.
+        // Grow the buffer until the encoder succeeds (bounded to avoid pathological allocations).
+        let mut cap = 4096usize;
+        loop {
+            let mut buf = vec![0u8; cap];
+            match self.encoder.encode(headers, &mut buf) {
+                Ok(len) => {
+                    buf.truncate(len);
+                    return Ok(buf);
+                }
+                Err(Error::BufferTooShort) => {
+                    if cap >= 256 * 1024 {
+                        return Err(Error::BufferTooShort);
+                    }
+                    cap = (cap * 2).min(256 * 1024);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Creates a new HTTP/3 connection with proper initialization
     pub fn with_transport(conn: &mut super::Connection, config: &Config) -> Result<Self, Error> {
         // Validate config limits for HTTP/3 compliance and safety.
@@ -213,7 +250,7 @@ impl Connection {
         Ok(h3_conn)
     }
     /// Set the persona index policy (header names that should be prioritised).
-    pub fn set_qpack_index_policy(&mut self, prefer: &[&[u8]]) {
+    pub(crate) fn set_qpack_index_policy(&mut self, prefer: &[&[u8]]) {
         self.encoder.set_index_policy(prefer);
     }
 
@@ -258,25 +295,7 @@ impl Connection {
         }
         let stream_id = self.next_stream_id;
         self.next_stream_id += 4;
-        // QPACK header blocks can exceed 4KiB when stealth adds realistic header cover.
-        // Grow the buffer until the encoder succeeds (bounded to avoid pathological allocations).
-        let mut cap = 4096usize;
-        let encoded = loop {
-            let mut buf = vec![0u8; cap];
-            match self.encoder.encode(headers, &mut buf) {
-                Ok(len) => {
-                    buf.truncate(len);
-                    break buf;
-                }
-                Err(Error::BufferTooShort) => {
-                    if cap >= 256 * 1024 {
-                        return Err(Error::BufferTooShort);
-                    }
-                    cap = (cap * 2).min(256 * 1024);
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let encoded = self.encode_headers_block(headers)?;
         let encoded_len = encoded.len();
         // Create HEADERS frame
         let mut frame = Vec::new();
@@ -481,7 +500,7 @@ impl Connection {
 
     /// **STEALTH FEATURE**: Create server push promise for cover traffic
     /// This generates realistic HTTP/3 server push traffic to mask real data flows
-    pub fn create_stealth_push_promise(
+    fn create_stealth_push_promise(
         &mut self,
         path: &str,
         content_type: &str,
@@ -539,45 +558,50 @@ impl Connection {
         }
 
         for stream_id in ready_streams {
+            let Some(promise) = self.push_streams.get(&stream_id) else { continue };
+            let headers = promise.headers.clone();
+            let headers_for_stream = headers.clone();
+            let cover_payload = promise.cover_payload.clone();
+            let encoded = match self.encode_headers_block(&headers) {
+                Ok(encoded) => encoded,
+                Err(_) => continue,
+            };
+
+            let mut frame = Vec::new();
+            frame.push(0x01); // HEADERS
+            Self::encode_varint(encoded.len() as u64, &mut frame);
+            frame.extend_from_slice(&encoded);
+            if conn.stream_send(stream_id, &frame, false).is_err() {
+                // Retry on next poll once flow-control or transport pressure clears.
+                continue;
+            }
+
+            // Queue push promise event only once HEADERS are really queued at transport level.
+            self.pending_events
+                .push_back((stream_id, Event::PushPromise { push_id: stream_id, headers }));
+
+            // Register stream with body and switch to DataSending
+            self.streams.insert(
+                stream_id,
+                StreamState {
+                    _headers: headers_for_stream,
+                    _body_buffer: cover_payload,
+                    _received_bytes: 0,
+                    _stream_type: StreamType::Push,
+                    sent_bytes: 0,
+                    fin_sent: false,
+                    fin_received: false,
+                    _stream_type_dup: StreamType::Push,
+                    masque_established: false,
+                },
+            );
             if let Some(promise) = self.push_streams.get_mut(&stream_id) {
-                promise.state = PushState::HeadersSent;
-                // Queue push promise event
-                self.pending_events.push_back((
-                    stream_id,
-                    Event::PushPromise { push_id: stream_id, headers: promise.headers.clone() },
-                ));
-                // Create stream state and send HEADERS frame now
-                let headers = promise.headers.clone();
-                let mut encoded = vec![0u8; 4096];
-                if let Ok(encoded_len) = self.encoder.encode(&headers, &mut encoded) {
-                    encoded.truncate(encoded_len);
-                    let mut frame = Vec::new();
-                    frame.push(0x01); // HEADERS
-                    Self::encode_varint(encoded_len as u64, &mut frame);
-                    frame.extend_from_slice(&encoded);
-                    let _ = conn.stream_send(stream_id, &frame, false);
-                    crate::optimize::telemetry::H3_FRAMES
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::optimize::telemetry::H3_HEADERS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Register stream with body and switch to DataSending
-                self.streams.insert(
-                    stream_id,
-                    StreamState {
-                        _headers: promise.headers.clone(),
-                        _body_buffer: promise.cover_payload.clone(),
-                        _received_bytes: 0,
-                        _stream_type: StreamType::Push,
-                        sent_bytes: 0,
-                        fin_sent: false,
-                        fin_received: false,
-                        _stream_type_dup: StreamType::Push,
-                        masque_established: false,
-                    },
-                );
                 promise.state = PushState::DataSending;
             }
+            crate::optimize::telemetry::H3_FRAMES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::optimize::telemetry::H3_HEADERS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -599,8 +623,8 @@ impl Connection {
                 Self::encode_varint(take as u64, &mut frame);
                 frame.extend_from_slice(&st._body_buffer[start..end]);
                 let fin = end == total;
-                if let Ok(sent) = conn.stream_send(*stream_id, &frame, fin) {
-                    st.sent_bytes += sent;
+                if conn.stream_send(*stream_id, &frame, fin).is_ok() {
+                    st.sent_bytes += take;
                     st.fin_sent = fin;
                     crate::optimize::telemetry::H3_FRAMES
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -624,7 +648,10 @@ impl Connection {
 
     /// **STEALTH FEATURE**: Generate burst of cover traffic push promises
     /// Simulates realistic web page loading with multiple resources
-    pub fn generate_stealth_cover_burst(&mut self, base_path: &str) -> Result<Vec<u64>, Error> {
+    pub(crate) fn generate_stealth_cover_burst(
+        &mut self,
+        base_path: &str,
+    ) -> Result<Vec<u64>, Error> {
         let mut push_ids = Vec::new();
 
         // Simulate typical web page resources
@@ -646,7 +673,6 @@ impl Connection {
 
         Ok(push_ids)
     }
-    #[allow(dead_code)]
     fn process_stream(
         &mut self,
         conn: &mut super::Connection,
@@ -720,7 +746,6 @@ impl Connection {
     }
 
     /// Parse frame header
-    #[allow(dead_code)]
     fn parse_frame_header(buf: &[u8]) -> Result<(u8, usize, usize), Error> {
         if buf.is_empty() {
             return Err(Error::BufferTooShort);
@@ -738,7 +763,6 @@ impl Connection {
     }
 
     /// Decode variable-length integer (SIMD-dispatched)
-    #[allow(dead_code)]
     fn decode_varint(buf: &[u8]) -> Result<(u64, usize), Error> {
         match crate::simd::transport::decode_varint(buf) {
             Some((v, used)) => Ok((v, used)),
@@ -988,7 +1012,7 @@ pub enum Event {
 }
 
 /// QPACK encoder/decoder module with dynamic table support
-pub mod qpack {
+pub(crate) mod qpack {
     use super::*;
 
     // HPACK/QPACK Huffman coding tables (RFC 7541 Appendix B)
@@ -1052,32 +1076,6 @@ pub mod qpack {
         }
         // EOS padding to next 8 bits
         bits.div_ceil(8)
-    }
-
-    #[allow(dead_code)]
-    fn huff_encode(s: &[u8], out: &mut Vec<u8>) -> usize {
-        let mut acc: u64 = 0;
-        let mut acc_bits: usize = 0;
-        let start = out.len();
-        for &b in s {
-            let code = HUFF_CODES[b as usize] as u64;
-            let clen = HUFF_LENS[b as usize] as usize;
-            acc = (acc << clen) | code;
-            acc_bits += clen;
-            while acc_bits >= 8 {
-                let shift = acc_bits - 8;
-                let byte = ((acc >> shift) & 0xff) as u8;
-                out.push(byte);
-                acc_bits -= 8;
-                acc &= (1u64 << shift) - 1;
-            }
-        }
-        if acc_bits > 0 {
-            let pad = (1u64 << (8 - acc_bits)) - 1; // EOS padding with ones
-            let byte = ((acc << (8 - acc_bits)) | pad) as u8;
-            out.push(byte);
-        }
-        out.len() - start
     }
 
     #[inline]
@@ -1260,7 +1258,7 @@ pub mod qpack {
     ];
 
     /// QPACK encoder with dynamic table
-    pub struct Encoder {
+    pub(crate) struct Encoder {
         dynamic_table: Vec<(Vec<u8>, Vec<u8>)>,
         dyn_index: std::collections::HashMap<u64, usize>,
         _max_table_capacity: usize,
@@ -1275,10 +1273,10 @@ pub mod qpack {
         }
     }
     impl Encoder {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::with_capacity(0)
         }
-        pub fn with_capacity(capacity: u64) -> Self {
+        pub(crate) fn with_capacity(capacity: u64) -> Self {
             let mut s = Self {
                 dynamic_table: Vec::new(),
                 dyn_index: std::collections::HashMap::new(),
@@ -1325,10 +1323,14 @@ pub mod qpack {
                 self._inserted_count = self._inserted_count.saturating_add(1);
             }
         }
-        pub fn set_index_policy(&mut self, prefer: &[&[u8]]) {
+        pub(super) fn set_index_policy(&mut self, prefer: &[&[u8]]) {
             self.index_prefer = prefer.iter().map(|s| s.to_vec()).collect();
         }
-        pub fn encode(&mut self, headers: &[Header], out: &mut [u8]) -> Result<usize, Error> {
+        pub(crate) fn encode(
+            &mut self,
+            headers: &[Header],
+            out: &mut [u8],
+        ) -> Result<usize, Error> {
             let mut written = 0;
             if out.len() < 2 {
                 return Err(Error::BufferTooShort);
@@ -1539,17 +1541,14 @@ pub mod qpack {
                 if out.len() < header_len + raw_len {
                     return Err(Error::BufferTooShort);
                 }
-                crate::optimize::simd::memcpy_prefetch(
-                    &mut out[header_len..header_len + raw_len],
-                    s,
-                );
+                out[header_len..header_len + raw_len].copy_from_slice(s);
                 Ok(header_len + raw_len)
             }
         }
     }
 
     /// QPACK decoder with dynamic table
-    pub struct Decoder {
+    pub(crate) struct Decoder {
         dynamic_table: Vec<(Vec<u8>, Vec<u8>)>,
         _max_table_capacity: usize,
         _current_capacity: usize,
@@ -1562,10 +1561,10 @@ pub mod qpack {
         }
     }
     impl Decoder {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::with_capacity(0)
         }
-        pub fn with_capacity(capacity: u64) -> Self {
+        pub(crate) fn with_capacity(capacity: u64) -> Self {
             Self {
                 dynamic_table: Vec::new(),
                 _max_table_capacity: capacity as usize,
@@ -1574,7 +1573,7 @@ pub mod qpack {
                 _evicted_count: 0,
             }
         }
-        pub fn decode(&mut self, data: &[u8]) -> Result<Vec<Header>, Error> {
+        pub(crate) fn decode(&mut self, data: &[u8]) -> Result<Vec<Header>, Error> {
             if data.len() < 2 {
                 return Err(Error::BufferTooShort);
             }
@@ -1702,6 +1701,62 @@ mod tests {
         let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let scid = [0u8; 8];
         crate::transport::packet::connect(None, &scid, local, peer, &mut cfg).unwrap()
+    }
+
+    fn make_conn_with_limits(
+        initial_max_data: u64,
+        initial_max_stream_data_remote: u64,
+    ) -> super::super::Connection {
+        let mut cfg = crate::transport::Config::new_with_version(PROTOCOL_VERSION).unwrap();
+        cfg.set_initial_max_data(initial_max_data);
+        cfg.set_initial_max_stream_data_bidi_remote(initial_max_stream_data_remote);
+        let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let scid = [1u8; 8];
+        crate::transport::packet::connect(None, &scid, local, peer, &mut cfg).unwrap()
+    }
+
+    #[test]
+    fn scheduled_push_stays_promised_when_headers_send_fails() {
+        let mut conn = make_conn_with_limits(0, 0);
+        let mut cfg = super::Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+
+        let push_id =
+            h3.create_stealth_push_promise("/blocked.css", "text/css", 512).expect("push");
+        if let Some(promise) = h3.push_streams.get_mut(&push_id) {
+            promise.scheduled_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+
+        h3.process_scheduled_push_streams(&mut conn);
+
+        assert_eq!(h3.push_streams.get(&push_id).map(|p| p.state), Some(PushState::Promised));
+        assert!(!h3.streams.contains_key(&push_id));
+        assert!(!h3.pending_events.iter().any(|(sid, _)| *sid == push_id));
+    }
+
+    #[test]
+    fn push_data_progress_tracks_payload_bytes() {
+        const CHUNK: usize = 16 * 1024;
+        let mut conn = make_conn();
+        let mut cfg = super::Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+
+        let push_id = h3
+            .create_stealth_push_promise("/big.js", "application/javascript", CHUNK + 10)
+            .expect("push");
+        if let Some(promise) = h3.push_streams.get_mut(&push_id) {
+            promise.scheduled_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+
+        h3.process_scheduled_push_streams(&mut conn);
+        h3.process_push_data(&mut conn);
+
+        let st = h3.streams.get(&push_id).expect("push stream");
+        assert_eq!(st.sent_bytes, CHUNK);
+        assert!(!st.fin_sent);
     }
 
     #[test]
@@ -1887,5 +1942,445 @@ mod tests {
         let _ = Connection::decode_capsule(&cap22).expect("capsule22");
         assert!(telemetry::MASQUE_CAPSULE_21.get() > before21);
         assert!(telemetry::MASQUE_CAPSULE_22.get() > before22);
+    }
+
+    #[test]
+    fn test_header_new_accessors() {
+        let h = Header::new(b"content-type", b"text/html");
+        assert_eq!(h.name(), b"content-type");
+        assert_eq!(h.value(), b"text/html");
+
+        let h2 = Header::new(b":status", b"200");
+        assert_eq!(h2.name(), b":status");
+        assert_eq!(h2.value(), b"200");
+
+        // Empty value
+        let h3 = Header::new(b"x-empty", b"");
+        assert_eq!(h3.name(), b"x-empty");
+        assert_eq!(h3.value(), b"");
+    }
+
+    #[test]
+    fn test_config_new_defaults() {
+        let cfg = Config::new().expect("Config::new");
+        // Verify defaults are sane (non-zero max_field_section_size)
+        assert_eq!(cfg.qpack_max_table_capacity, 0);
+        assert_eq!(cfg.qpack_blocked_streams, 0);
+        assert_eq!(cfg.max_field_section_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_encode_capsule_roundtrip() {
+        let payload = b"test capsule payload data";
+        let capsule = Connection::encode_capsule(0x00, payload);
+        let (ctype, used, decoded) = Connection::decode_capsule(&capsule)
+            .expect("decode capsule roundtrip");
+        assert_eq!(ctype, 0x00);
+        assert_eq!(used, capsule.len());
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_encode_capsule_empty_payload() {
+        let capsule = Connection::encode_capsule(0x21, &[]);
+        let (ctype, used, decoded) = Connection::decode_capsule(&capsule)
+            .expect("decode empty capsule");
+        assert_eq!(ctype, 0x21);
+        assert_eq!(used, capsule.len());
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_masque_established_tracking() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+
+        let sid = h3.connect_udp(&mut conn, "proxy.test", "target.test:443")
+            .expect("connect_udp");
+
+        // Before marking: not established
+        assert!(!h3.masque_established(sid));
+
+        // After marking: established
+        h3.mark_masque_established(sid);
+        assert!(h3.masque_established(sid));
+
+        // Non-existent stream returns false
+        assert!(!h3.masque_established(99999));
+    }
+
+    #[test]
+    fn test_encode_udp_compress_capsule_contains_flow_id() {
+        // encode_capsule with type 0x21 should start with varint 0x21
+        let payload = b"some compressed data";
+        let capsule = Connection::encode_capsule(0x21, payload);
+
+        // First byte(s) encode the capsule type as varint.
+        // 0x21 = 33 fits in a single-byte varint (< 64).
+        assert!(!capsule.is_empty());
+        let (decoded_type, _) = Connection::decode_varint(&capsule)
+            .expect("varint decode");
+        assert_eq!(decoded_type, 0x21);
+
+        // Full roundtrip confirms payload integrity
+        let (ctype, _, decoded_payload) = Connection::decode_capsule(&capsule)
+            .expect("decode capsule");
+        assert_eq!(ctype, 0x21);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    // ---- QPACK Encode/Decode Tests ---------------------------------------
+
+    #[test]
+    fn qpack_encode_decode_static_table_hit() {
+        let mut enc = qpack::Encoder::new();
+        let mut dec = qpack::Decoder::new();
+        let headers = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", b"https"),
+            Header::new(b":path", b"/"),
+        ];
+        let mut buf = vec![0u8; 4096];
+        let written = enc.encode(&headers, &mut buf).expect("encode");
+        assert!(written > 0, "encoder must produce output");
+
+        let decoded = dec.decode(&buf[..written]).expect("decode");
+        assert_eq!(decoded.len(), 3, "must decode 3 headers");
+        assert_eq!(decoded[0].name(), b":method");
+        assert_eq!(decoded[0].value(), b"GET");
+    }
+
+    #[test]
+    fn qpack_encode_decode_literal_header() {
+        let mut enc = qpack::Encoder::new();
+        let mut dec = qpack::Decoder::new();
+        let headers = vec![
+            Header::new(b"x-custom-header", b"custom-value-123"),
+        ];
+        let mut buf = vec![0u8; 4096];
+        let written = enc.encode(&headers, &mut buf).expect("encode");
+        assert!(written > 2, "literal encoding must produce more than 2 bytes");
+
+        let decoded = dec.decode(&buf[..written]).expect("decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name(), b"x-custom-header");
+        assert_eq!(decoded[0].value(), b"custom-value-123");
+    }
+
+    #[test]
+    fn qpack_encode_empty_headers_produces_minimal_output() {
+        let mut enc = qpack::Encoder::new();
+        let headers: Vec<Header> = vec![];
+        let mut buf = vec![0u8; 4096];
+        let written = enc.encode(&headers, &mut buf).expect("encode empty");
+        // At minimum, the 2-byte prefix (RIC + base)
+        assert_eq!(written, 2, "empty headers should produce exactly 2-byte prefix");
+    }
+
+    #[test]
+    fn qpack_encode_buffer_too_short_returns_error() {
+        let mut enc = qpack::Encoder::new();
+        let headers = vec![Header::new(b":method", b"GET")];
+        let mut buf = vec![0u8; 1]; // Too small
+        let result = enc.encode(&headers, &mut buf);
+        assert!(matches!(result, Err(Error::BufferTooShort)));
+    }
+
+    // ---- HTTP/3 Frame Parsing: HEADERS, DATA, SETTINGS -------------------
+
+    #[test]
+    fn parse_frame_header_data_type() {
+        // DATA frame: type=0x00, length=5
+        let mut buf = vec![0x00]; // type
+        Connection::encode_varint(5, &mut buf);
+        buf.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let (frame_type, frame_len, header_offset) =
+            Connection::parse_frame_header(&buf).expect("parse");
+        assert_eq!(frame_type, 0x00, "frame type must be DATA");
+        assert_eq!(frame_len, 5, "frame length must be 5");
+        assert!(header_offset > 0, "header offset must be positive");
+    }
+
+    #[test]
+    fn parse_frame_header_headers_type() {
+        let mut buf = vec![0x01]; // HEADERS type
+        Connection::encode_varint(10, &mut buf);
+        buf.extend_from_slice(&[0u8; 10]);
+        let (frame_type, frame_len, _) =
+            Connection::parse_frame_header(&buf).expect("parse");
+        assert_eq!(frame_type, 0x01, "frame type must be HEADERS");
+        assert_eq!(frame_len, 10);
+    }
+
+    #[test]
+    fn parse_frame_header_settings_type() {
+        let mut buf = vec![0x04]; // SETTINGS type
+        Connection::encode_varint(0, &mut buf);
+        let (frame_type, frame_len, _) =
+            Connection::parse_frame_header(&buf).expect("parse");
+        assert_eq!(frame_type, 0x04, "frame type must be SETTINGS");
+        assert_eq!(frame_len, 0);
+    }
+
+    #[test]
+    fn parse_frame_header_empty_buffer_returns_error() {
+        let buf: Vec<u8> = vec![];
+        let result = Connection::parse_frame_header(&buf);
+        assert!(matches!(result, Err(Error::BufferTooShort)));
+    }
+
+    // ---- Stream Type Identification --------------------------------------
+
+    #[test]
+    fn connect_udp_assigns_masque_stream_type() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        let sid = h3.connect_udp(&mut conn, "proxy.test", "target.test:443").expect("connect_udp");
+        let st = h3.streams.get(&sid).expect("stream state");
+        assert!(matches!(st._stream_type, StreamType::Masque));
+        assert!(matches!(st._stream_type_dup, StreamType::Masque));
+    }
+
+    #[test]
+    fn send_response_assigns_response_stream_type() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        let headers = vec![Header::new(b":status", b"200")];
+        h3.send_response(&mut conn, 0, &headers, false).expect("send_response");
+        let st = h3.streams.get(&0).expect("stream state");
+        assert!(matches!(st._stream_type, StreamType::Response));
+    }
+
+    // ---- Settings Frame Encode/Decode ------------------------------------
+
+    #[test]
+    fn config_new_defaults_are_valid_for_with_transport() {
+        let mut conn = make_conn();
+        let cfg = Config::new().expect("cfg");
+        // Default config has max_field_section_size = 1MiB which is valid
+        let h3 = super::h3::Connection::with_transport(&mut conn, &cfg);
+        assert!(h3.is_ok(), "default Config must produce valid H3 connection");
+    }
+
+    #[test]
+    fn config_zero_max_field_section_rejects() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(0);
+        let result = super::h3::Connection::with_transport(&mut conn, &cfg);
+        assert!(matches!(result, Err(Error::ExcessiveLoad)),
+            "zero max_field_section_size must be rejected");
+    }
+
+    #[test]
+    fn config_excessive_max_field_section_rejects() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(32 * 1024 * 1024); // 32 MiB > 16 MiB limit
+        let result = super::h3::Connection::with_transport(&mut conn, &cfg);
+        assert!(matches!(result, Err(Error::ExcessiveLoad)),
+            "excessive max_field_section_size must be rejected");
+    }
+
+    // ---- GOAWAY Handling -------------------------------------------------
+
+    #[test]
+    fn goaway_blocks_new_requests() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        h3.goaway_sent = true;
+        let result = h3.send_request(
+            &mut conn,
+            &[Header::new(b":method", b"GET")],
+            true,
+        );
+        assert!(matches!(result, Err(Error::ClosedCriticalStream)),
+            "send_request after GOAWAY must fail");
+    }
+
+    #[test]
+    fn goaway_received_blocks_new_requests() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        h3.goaway_received = true;
+        let result = h3.send_request(
+            &mut conn,
+            &[Header::new(b":method", b"GET")],
+            true,
+        );
+        assert!(matches!(result, Err(Error::ClosedCriticalStream)));
+    }
+
+    // ---- Error Code Mapping ----------------------------------------------
+
+    #[test]
+    fn h3_error_from_transport_error() {
+        let h3e: Error = Error::from(super::super::Error::BufferTooShort);
+        assert!(matches!(h3e, Error::TransportError(_)));
+        // Display works
+        let s = format!("{}", h3e);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn h3_error_display_variants() {
+        let variants = vec![
+            Error::Done,
+            Error::BufferTooShort,
+            Error::InternalError,
+            Error::ExcessiveLoad,
+            Error::IdError,
+            Error::StreamCreationError,
+            Error::ClosedCriticalStream,
+            Error::FrameUnexpected,
+            Error::FrameError,
+            Error::QpackDecompressionFailed,
+        ];
+        for err in variants {
+            let s = format!("{}", err);
+            assert!(!s.is_empty(), "Display must produce non-empty string for {:?}", err);
+        }
+    }
+
+    // ---- Request/Response Header Formatting ------------------------------
+
+    #[test]
+    fn send_request_allocates_stream_id() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        let headers = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":path", b"/"),
+            Header::new(b":scheme", b"https"),
+        ];
+        let sid = h3.send_request(&mut conn, &headers, true).expect("send_request");
+        assert!(h3.streams.contains_key(&sid));
+        let st = h3.streams.get(&sid).expect("stream");
+        assert!(matches!(st._stream_type, StreamType::Request));
+        assert!(st.fin_sent, "fin must be set when fin=true");
+    }
+
+    #[test]
+    fn send_body_on_finished_stream_returns_done() {
+        let mut conn = make_conn();
+        let mut cfg = Config::new().expect("cfg");
+        cfg.set_max_field_section_size(1024 * 1024);
+        let mut h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        let headers = vec![Header::new(b":method", b"GET")];
+        let sid = h3.send_request(&mut conn, &headers, true).expect("send_request");
+        // Stream is finished (fin_sent=true)
+        let result = h3.send_body(&mut conn, sid, b"body", false);
+        assert!(matches!(result, Err(Error::Done)),
+            "send_body on finished stream must return Done");
+    }
+
+    // ---- Huffman Encoding ------------------------------------------------
+
+    #[test]
+    fn huffman_encode_decode_roundtrip() {
+        let input = b"content-type";
+        let est = qpack::huff_estimate_len(input);
+        let mut encoded = vec![0u8; est + 8];
+        let enc_len = qpack::huff_encode_into(input, &mut encoded);
+        let mut decoded = vec![0u8; input.len() + 16];
+        let dec_len = qpack::huff_decode_into(&encoded[..enc_len], &mut decoded)
+            .expect("huff decode");
+        assert_eq!(&decoded[..dec_len], input);
+    }
+
+    #[test]
+    fn huffman_encode_ascii_range() {
+        // Test encoding of common ASCII printable characters
+        let input = b"GET /index.html HTTP/1.1";
+        let est = qpack::huff_estimate_len(input);
+        assert!(est > 0, "huffman estimate must be positive for non-empty input");
+        assert!(est <= input.len(), "huffman should compress common HTTP text");
+    }
+
+    // ---- Varint Encoding/Decoding ----------------------------------------
+
+    #[test]
+    fn varint_roundtrip_small_values() {
+        for val in [0u64, 1, 63, 127, 255] {
+            let mut buf = Vec::new();
+            Connection::encode_varint(val, &mut buf);
+            let (decoded, used) = Connection::decode_varint(&buf).expect("decode");
+            assert_eq!(decoded, val, "varint roundtrip failed for {}", val);
+            assert_eq!(used, buf.len());
+        }
+    }
+
+    #[test]
+    fn varint_roundtrip_large_values() {
+        for val in [16383u64, 16384, 1_000_000, u32::MAX as u64] {
+            let mut buf = Vec::new();
+            Connection::encode_varint(val, &mut buf);
+            let (decoded, _) = Connection::decode_varint(&buf).expect("decode");
+            assert_eq!(decoded, val, "varint roundtrip failed for {}", val);
+        }
+    }
+
+    // ---- Cover Traffic Generation ----------------------------------------
+
+    #[test]
+    fn fake_css_generates_correct_size() {
+        let css = generate_fake_css(1000);
+        assert_eq!(css.len(), 1000);
+        // Should contain CSS-like content
+        assert!(css.windows(4).any(|w| w == b"body" || w == b".rul"),
+            "generated CSS must contain CSS-like text");
+    }
+
+    #[test]
+    fn fake_js_generates_correct_size() {
+        let js = generate_fake_js(500);
+        assert_eq!(js.len(), 500);
+    }
+
+    #[test]
+    fn fake_image_starts_with_jpeg_magic() {
+        let img = generate_fake_image_data(100);
+        assert_eq!(&img[..2], &[0xFF, 0xD8], "fake image must start with JPEG magic bytes");
+    }
+
+    // ---- Header from_parts -----------------------------------------------
+
+    #[test]
+    fn header_from_parts_avoids_copy() {
+        let name = b"x-test".to_vec();
+        let value = b"value".to_vec();
+        let h = Header::from_parts(name, value);
+        assert_eq!(h.name(), b"x-test");
+        assert_eq!(h.value(), b"value");
+    }
+
+    // ---- Control Stream --------------------------------------------------
+
+    #[test]
+    fn client_h3_initializes_control_stream() {
+        let mut conn = make_conn(); // client
+        let cfg = Config::new().expect("cfg");
+        let h3 = super::h3::Connection::with_transport(&mut conn, &cfg).expect("h3");
+        assert!(h3.control_stream_id.is_some(), "client must initialize control stream");
+        let csid = h3.control_stream_id.unwrap();
+        assert!(h3.streams.contains_key(&csid), "control stream must be registered");
+    }
+
+    #[test]
+    fn h3_config_default_field_section_size() {
+        let cfg = Config::new().expect("default H3 config must succeed");
+        assert!(cfg.max_field_section_size > 0, "default field section size must be positive");
     }
 }

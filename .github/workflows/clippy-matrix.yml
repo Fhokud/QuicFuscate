@@ -2,9 +2,9 @@ name: Clippy Matrix
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,20 +18,19 @@ jobs:
       matrix:
         features:
           - ""
-          - "fec_advanced"
-          - "fec_advanced,wiedemann"
           - "unsafe_rust"
           - "unsafe_rust,compression_zstd_ffi"
           - "simd-selfcheck"
-          - "optimized"
-          - "fec_advanced,unsafe_rust"
-          - "fec_advanced,unsafe_rust,compression_zstd_ffi"
+          - "internal_wiedemann"
+          - "internal_wiedemann,unsafe_rust"
+          - "internal_wiedemann,unsafe_rust,compression_zstd_ffi"
+          - "io_uring"
 
     steps:
     - uses: actions/checkout@v4
       
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.93.0
       with:
         components: clippy
         

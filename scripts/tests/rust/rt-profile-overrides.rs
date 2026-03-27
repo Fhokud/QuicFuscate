@@ -9,7 +9,7 @@ static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn sum_u32_sse2_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0xD15EA5E5);
     let data: Vec<u32> = (0..4096).map(|_| rng.u32(..)).collect();
 
@@ -27,7 +27,7 @@ fn sum_u32_sse2_matches_scalar() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn sum_u32_neon_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0xD15EA5E5);
     let data: Vec<u32> = (0..4096).map(|_| rng.u32(..)).collect();
 
@@ -45,7 +45,7 @@ fn sum_u32_neon_matches_scalar() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn sum_f32_sse2_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0xC0FFEE42);
     let data: Vec<f32> = (0..2048).map(|_| rng.f32() * 2000.0 - 1000.0).collect();
 
@@ -65,7 +65,7 @@ fn sum_f32_sse2_matches_scalar() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn sum_f32_neon_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0xC0FFEE42);
     let data: Vec<f32> = (0..2048).map(|_| rng.f32() * 2000.0 - 1000.0).collect();
 
@@ -85,7 +85,7 @@ fn sum_f32_neon_matches_scalar() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn compress_classify_sse2_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0x5A11_0C0D);
     let bytes: Vec<u8> = (0..8192).map(|_| rng.u8(..)).collect();
 
@@ -109,7 +109,7 @@ fn compress_classify_sse2_matches_scalar() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn compress_classify_neon_matches_scalar() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut rng = fastrand::Rng::with_seed(0x5A11_0C0D);
     let bytes: Vec<u8> = (0..8192).map(|_| rng.u8(..)).collect();
 

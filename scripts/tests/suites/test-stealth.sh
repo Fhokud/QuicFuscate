@@ -15,12 +15,10 @@ while [[ $# -gt 0 ]]; do
     --fast) FAST=1;;
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h)
       echo "Usage: $(basename "$0") [options]"; echo "Stealth Comprehensive Test Suite"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -33,6 +31,19 @@ JSON="$OUTPUT_DIR/results.json"; json_begin "$JSON" "tests_stealth_comprehensive
 echo "==============================================================="
 echo "  Stealth Comprehensive Test Suite"
 echo "==============================================================="
+
+if (( FAST )); then
+  echo -e "\n> Fast mode enabled (focused stealth confidence set)"
+  run env QUICFUSCATE_STEALTH_MODE=stealth cargo test --release --lib stealth:: -- --nocapture
+  run_cargo test --release --lib qftls::tests::profile_from_ -- --nocapture
+  run_cargo test --release \
+    --test rt-stealth-config-toml \
+    --test rt-stealth-persona-headers \
+    -- --nocapture
+  echo -e "\n[OK] Stealth Fast Tests Complete"
+  json_end "$JSON"
+  exit 0
+fi
 
 # Test all stealth modes
 echo -e "\n> Testing Stealth Mode: Off..."
@@ -64,7 +75,6 @@ run_cargo test --release \
   --test rt-stealth-config-toml \
   --test rt-stealth-persona-headers \
   --test rt-stealth-ascii-count \
-  --test rt-xor-obfuscator-parity \
   -- --nocapture
 
 echo -e "\n[OK] Stealth Comprehensive Tests Complete"

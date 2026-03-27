@@ -6,40 +6,47 @@ use crate::optimize::CpuProfile;
 use crate::optimize::FeatureDetector;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(test)]
 use std::time::Duration;
 
 const DEC_DIGITS_LUT: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 const HEX_DIGITS_LUT: &[u8; 16] = b"0123456789abcdef";
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StealthAsciiBenchmarkScenario {
-    pub name: &'static str,
-    pub bytes: usize,
-    pub iterations: usize,
+struct StealthAsciiBenchmarkScenario {
+    name: &'static str,
+    bytes: usize,
+    iterations: usize,
 }
 
-pub const STEALTH_ASCII_BENCHMARK_SET: [StealthAsciiBenchmarkScenario; 4] = [
+#[cfg(test)]
+const STEALTH_ASCII_BENCHMARK_SET: [StealthAsciiBenchmarkScenario; 4] = [
     StealthAsciiBenchmarkScenario { name: "headers-small", bytes: 384, iterations: 20_000 },
     StealthAsciiBenchmarkScenario { name: "cookies-medium", bytes: 2048, iterations: 8_000 },
     StealthAsciiBenchmarkScenario { name: "capsule-large", bytes: 16_384, iterations: 1_500 },
     StealthAsciiBenchmarkScenario { name: "burst-xlarge", bytes: 65_536, iterations: 320 },
 ];
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
-pub struct StealthAsciiPerfThresholds {
-    pub min_mb_per_sec: f64,
+struct StealthAsciiPerfThresholds {
+    min_mb_per_sec: f64,
 }
 
-pub const STEALTH_ASCII_INTERNAL_TARGETS: StealthAsciiPerfThresholds =
+#[cfg(test)]
+const STEALTH_ASCII_INTERNAL_TARGETS: StealthAsciiPerfThresholds =
     StealthAsciiPerfThresholds { min_mb_per_sec: 250.0 };
 
+#[cfg(test)]
 impl Default for StealthAsciiPerfThresholds {
     fn default() -> Self {
         STEALTH_ASCII_INTERNAL_TARGETS
     }
 }
 
-pub fn evaluate_stealth_ascii_perf_smoke(
+#[cfg(test)]
+fn evaluate_stealth_ascii_perf_smoke(
     processed_bytes: usize,
     elapsed: Duration,
     thresholds: StealthAsciiPerfThresholds,
@@ -81,21 +88,6 @@ impl AsciiSimdBackend {
         let digits = lower_hex_to_ascii(value, &mut scratch);
         append_ascii_with_profile(dst, digits, self.profile);
     }
-}
-
-#[inline(always)]
-pub fn append_ascii_simd(dst: &mut Vec<u8>, src: &[u8]) {
-    AsciiSimdBackend::detect().append_bytes(dst, src);
-}
-
-#[inline(always)]
-pub fn append_decimal_simd(dst: &mut Vec<u8>, value: u64) {
-    AsciiSimdBackend::detect().append_decimal(dst, value);
-}
-
-#[inline(always)]
-pub fn append_lower_hex_simd(dst: &mut Vec<u8>, value: u64) {
-    AsciiSimdBackend::detect().append_lower_hex(dst, value);
 }
 
 #[inline(always)]
@@ -204,7 +196,7 @@ fn append_ascii_with_profile(dst: &mut Vec<u8>, src: &[u8], profile: CpuProfile)
     crate::optimize::telemetry::STEALTH_ASCII_SCALAR_BYTES.inc_by(src.len() as u64);
     let start = dst.len();
     dst.resize(start + src.len(), 0);
-    crate::optimize::simd::core::memcpy_fast(&mut dst[start..], src);
+    dst[start..].copy_from_slice(src);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -295,6 +287,7 @@ unsafe fn append_ascii_neon(dst: &mut Vec<u8>, src: &[u8]) {
 
 /// Pattern injection with SIMD - 3x faster (AVX2/NEON)
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn inject_pattern(data: &mut [u8], pattern: &[u8], positions: &[usize]) {
     let _profile = FeatureDetector::instance().profile();
 
@@ -439,7 +432,7 @@ unsafe fn inject_pattern_sse2(data: &mut [u8], pattern: &[u8], positions: &[usiz
 }
 
 /// NEON-optimized pattern injection on aarch64.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn inject_pattern_neon(data: &mut [u8], pattern: &[u8], positions: &[usize]) {
     use std::arch::aarch64::*;
@@ -496,284 +489,9 @@ unsafe fn inject_pattern_neon(data: &mut [u8], pattern: &[u8], positions: &[usiz
     }
 }
 
-/// Entropy mixing with AES-NI CTR mode - 5x faster
-#[inline(always)]
-pub fn mix_entropy(data: &mut [u8], key: &[u8; 16]) {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P1b
-        | CpuProfile::X86_P1f
-        | CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            mix_entropy_aesni(data, key);
-            return;
-        },
-        CpuProfile::X86_P1a | CpuProfile::X86_P0b | CpuProfile::X86_P0a => unsafe {
-            mix_entropy_sse2(data, key);
-            return;
-        },
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A0
-        | CpuProfile::ARM_A1a
-        | CpuProfile::ARM_A1b
-        | CpuProfile::ARM_A1c
-        | CpuProfile::ARM_A1d
-        | CpuProfile::ARM_A2
-        | CpuProfile::Apple_M => unsafe {
-            mix_entropy_neon_aes(data, key);
-            return;
-        },
-        _ => {}
-    }
-
-    // Scalar XOR fallback
-    for (i, byte) in data.iter_mut().enumerate() {
-        *byte ^= key[i % 16];
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "aes", enable = "sse4.1")]
-unsafe fn mix_entropy_aesni(data: &mut [u8], key: &[u8; 16]) {
-    // Generate keystream with AES-CTR
-    let key_vec = _mm_loadu_si128(key.as_ptr() as *const __m128i);
-
-    // Expand AES key
-    let round_keys = aes_key_expand(key_vec);
-
-    let mut counter = _mm_setzero_si128();
-    let mut i = 0;
-
-    while i + 16 <= data.len() {
-        // Generate keystream block
-        let keystream = aes_encrypt_block(counter, &round_keys);
-
-        // XOR with data
-        let data_block = _mm_loadu_si128(data.as_ptr().add(i) as *const __m128i);
-        let mixed = _mm_xor_si128(data_block, keystream);
-        _mm_storeu_si128(data.as_mut_ptr().add(i) as *mut __m128i, mixed);
-
-        // Increment counter
-        counter = _mm_add_epi64(counter, _mm_set_epi64x(0, 1));
-        i += 16;
-    }
-
-    // Handle remainder
-    if i < data.len() {
-        let keystream = aes_encrypt_block(counter, &round_keys);
-        let mut keystream_bytes = [0u8; 16];
-        _mm_storeu_si128(keystream_bytes.as_mut_ptr() as *mut __m128i, keystream);
-
-        for j in 0..(data.len() - i) {
-            data[i + j] ^= keystream_bytes[j];
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn mix_entropy_sse2(data: &mut [u8], key: &[u8; 16]) {
-    use std::arch::x86_64::*;
-
-    if data.is_empty() {
-        return;
-    }
-
-    let key_vec = _mm_loadu_si128(key.as_ptr() as *const __m128i);
-    let mut idx = 0usize;
-
-    while idx + 16 <= data.len() {
-        let block = _mm_loadu_si128(data.as_ptr().add(idx) as *const __m128i);
-        let mixed = _mm_xor_si128(block, key_vec);
-        _mm_storeu_si128(data.as_mut_ptr().add(idx) as *mut __m128i, mixed);
-        idx += 16;
-    }
-
-    while idx < data.len() {
-        data[idx] ^= key[idx % 16];
-        idx += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "aes", enable = "sse4.1")]
-#[inline]
-unsafe fn aes_key_expand(key: __m128i) -> [__m128i; 11] {
-    let mut round_keys = [_mm_setzero_si128(); 11];
-    round_keys[0] = key;
-
-    // Full AES-256 key expansion
-    round_keys[1] = _mm_aeskeygenassist_si128(round_keys[0], 0x01);
-    round_keys[1] = _mm_xor_si128(round_keys[0], _mm_slli_si128(round_keys[1], 4));
-    round_keys[2] = _mm_aeskeygenassist_si128(round_keys[1], 0x02);
-    round_keys[2] = _mm_xor_si128(round_keys[1], _mm_slli_si128(round_keys[2], 4));
-    round_keys[3] = _mm_aeskeygenassist_si128(round_keys[2], 0x04);
-    round_keys[3] = _mm_xor_si128(round_keys[2], _mm_slli_si128(round_keys[3], 4));
-    round_keys[4] = _mm_aeskeygenassist_si128(round_keys[3], 0x08);
-    round_keys[4] = _mm_xor_si128(round_keys[3], _mm_slli_si128(round_keys[4], 4));
-    round_keys[5] = _mm_aeskeygenassist_si128(round_keys[4], 0x10);
-    round_keys[5] = _mm_xor_si128(round_keys[4], _mm_slli_si128(round_keys[5], 4));
-    round_keys[6] = _mm_aeskeygenassist_si128(round_keys[5], 0x20);
-    round_keys[6] = _mm_xor_si128(round_keys[5], _mm_slli_si128(round_keys[6], 4));
-    round_keys[7] = _mm_aeskeygenassist_si128(round_keys[6], 0x40);
-    round_keys[7] = _mm_xor_si128(round_keys[6], _mm_slli_si128(round_keys[7], 4));
-    round_keys[8] = _mm_aeskeygenassist_si128(round_keys[7], 0x80);
-    round_keys[8] = _mm_xor_si128(round_keys[7], _mm_slli_si128(round_keys[8], 4));
-    round_keys[9] = _mm_aeskeygenassist_si128(round_keys[8], 0x1B);
-    round_keys[9] = _mm_xor_si128(round_keys[8], _mm_slli_si128(round_keys[9], 4));
-    round_keys[10] = _mm_aeskeygenassist_si128(round_keys[9], 0x36);
-    round_keys[10] = _mm_xor_si128(round_keys[9], _mm_slli_si128(round_keys[10], 4));
-
-    round_keys
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "aes", enable = "sse4.1")]
-#[inline]
-unsafe fn aes_encrypt_block(block: __m128i, round_keys: &[__m128i; 11]) -> __m128i {
-    let mut state = _mm_xor_si128(block, round_keys[0]);
-
-    for i in 1..10 {
-        state = _mm_aesenc_si128(state, round_keys[i]);
-    }
-
-    _mm_aesenclast_si128(state, round_keys[10])
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon", enable = "aes")]
-unsafe fn mix_entropy_neon_aes(data: &mut [u8], key: &[u8; 16]) {
-    #[allow(unused_imports)]
-    use std::arch::aarch64::*;
-
-    // ARM NEON AES implementation
-    // Similar structure to x86 but using NEON intrinsics
-    for (i, byte) in data.iter_mut().enumerate() {
-        *byte ^= key[i % 16];
-    }
-}
-
-/// HTTP header mimicry with BMI2/SWAR - 2x faster
-#[inline(always)]
-pub fn generate_http_headers(buffer: &mut [u8], headers: &[(&str, &str)]) -> usize {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { generate_http_headers_bmi2(buffer, headers) };
-        }
-        _ => {}
-    }
-
-    // Scalar fallback
-    let mut pos = 0;
-
-    // HTTP/1.1 200 OK\r\n
-    let status_line = b"HTTP/1.1 200 OK\r\n";
-    buffer[pos..pos + status_line.len()].copy_from_slice(status_line);
-    pos += status_line.len();
-
-    for (name, value) in headers {
-        let header_line = format!("{}: {}\r\n", name, value);
-        let bytes = header_line.as_bytes();
-        if pos + bytes.len() <= buffer.len() {
-            buffer[pos..pos + bytes.len()].copy_from_slice(bytes);
-            pos += bytes.len();
-        }
-    }
-
-    // Final CRLF
-    if pos + 2 <= buffer.len() {
-        buffer[pos..pos + 2].copy_from_slice(b"\r\n");
-        pos += 2;
-    }
-
-    pos
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn generate_http_headers_bmi2(buffer: &mut [u8], headers: &[(&str, &str)]) -> usize {
-    // Use BMI2 for efficient string operations
-    let mut pos = 0;
-
-    // Fast copy with AVX2
-    let status_line = b"HTTP/1.1 200 OK\r\n";
-    if pos + status_line.len() <= buffer.len() {
-        if status_line.len() >= 32 {
-            let vec = _mm256_loadu_si256(status_line.as_ptr() as *const __m256i);
-            _mm256_storeu_si256(buffer.as_mut_ptr().add(pos) as *mut __m256i, vec);
-        } else {
-            buffer[pos..pos + status_line.len()].copy_from_slice(status_line);
-        }
-        pos += status_line.len();
-    }
-
-    for (name, value) in headers {
-        // Fast string concatenation with SIMD
-        let name_bytes = name.as_bytes();
-        let value_bytes = value.as_bytes();
-
-        // Copy name
-        if pos + name_bytes.len() <= buffer.len() {
-            buffer[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
-            pos += name_bytes.len();
-        }
-
-        // Copy ": "
-        if pos + 2 <= buffer.len() {
-            buffer[pos] = b':';
-            buffer[pos + 1] = b' ';
-            pos += 2;
-        }
-
-        // Copy value
-        if pos + value_bytes.len() <= buffer.len() {
-            buffer[pos..pos + value_bytes.len()].copy_from_slice(value_bytes);
-            pos += value_bytes.len();
-        }
-
-        // Copy "\r\n"
-        if pos + 2 <= buffer.len() {
-            buffer[pos] = b'\r';
-            buffer[pos + 1] = b'\n';
-            pos += 2;
-        }
-    }
-
-    // Final CRLF
-    if pos + 2 <= buffer.len() {
-        buffer[pos] = b'\r';
-        buffer[pos + 1] = b'\n';
-        pos += 2;
-    }
-
-    pos
-}
-
 /// TLS record padding with AVX2 broadcast - 3x faster
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 pub fn add_tls_padding(record: &mut Vec<u8>, target_size: usize, padding_byte: u8) {
     let current_len = record.len();
     if current_len >= target_size {
@@ -896,6 +614,7 @@ pub fn gfni_padding_bytes(len: usize, pad_byte: u8, seed_lo: u64, seed_hi: u64) 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn add_tls_padding_avx2(record: &mut Vec<u8>, target_size: usize, padding_byte: u8) {
     let current_len = record.len();
     if current_len >= target_size {
@@ -926,6 +645,7 @@ unsafe fn add_tls_padding_avx2(record: &mut Vec<u8>, target_size: usize, padding
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn add_tls_padding_sse2(record: &mut Vec<u8>, target_size: usize, padding_byte: u8) {
     use std::arch::x86_64::*;
 
@@ -955,6 +675,7 @@ unsafe fn add_tls_padding_sse2(record: &mut Vec<u8>, target_size: usize, padding
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn add_tls_padding_neon(record: &mut Vec<u8>, target_size: usize, padding_byte: u8) {
     use std::arch::aarch64::*;
     let current_len = record.len();
@@ -983,6 +704,8 @@ unsafe fn add_tls_padding_neon(record: &mut Vec<u8>, target_size: usize, padding
 
 /// Fake HMAC generation (select accelerated SHA backends when available).
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn generate_fake_hmac(data: &[u8], key: &[u8; 32]) -> [u8; 32] {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let detector = FeatureDetector::instance();
@@ -1013,149 +736,7 @@ pub fn generate_fake_hmac(data: &[u8], key: &[u8; 32]) -> [u8; 32] {
     }
     hmac
 }
-
-/// Pattern-based traffic shaping with AVX2
-#[inline(always)]
-pub fn shape_traffic_pattern(data: &mut [u8], pattern: &[f32], intensity: f32) {
-    let profile = FeatureDetector::instance().profile();
-    if pattern.is_empty() {
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    match profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            shape_traffic_pattern_avx2(data, pattern, intensity);
-            return;
-        },
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match profile {
-        CpuProfile::ARM_A0
-        | CpuProfile::ARM_A1a
-        | CpuProfile::ARM_A1b
-        | CpuProfile::ARM_A1c
-        | CpuProfile::ARM_A1d
-        | CpuProfile::ARM_A2
-        | CpuProfile::Apple_M => unsafe {
-            shape_traffic_pattern_neon(data, pattern, intensity);
-            return;
-        },
-        _ => {}
-    }
-
-    // Scalar fallback
-    for (i, byte) in data.iter_mut().enumerate() {
-        let pattern_val = pattern[i % pattern.len()];
-        let adjustment = (pattern_val * intensity * 255.0) as i16;
-        let new_val = (*byte as i16 + adjustment).clamp(0, 255) as u8;
-        *byte = new_val;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn shape_traffic_pattern_avx2(data: &mut [u8], pattern: &[f32], intensity: f32) {
-    use std::arch::x86_64::*;
-
-    let intensity_vec = _mm256_set1_ps(intensity * 255.0);
-    let zero = _mm256_setzero_ps();
-    let max_val = _mm256_set1_ps(255.0);
-
-    let mut i = 0;
-    while i + 8 <= data.len() && (i % pattern.len()) + 8 <= pattern.len() {
-        // Load pattern values
-        let pattern_vec = _mm256_loadu_ps(pattern.as_ptr().add(i % pattern.len()));
-
-        // Calculate adjustments
-        let adjustments = _mm256_mul_ps(pattern_vec, intensity_vec);
-
-        // Convert data bytes to float
-        let data_bytes = _mm_loadl_epi64(data.as_ptr().add(i) as *const __m128i);
-        let data_i32 = _mm_cvtepu8_epi32(data_bytes);
-        let data_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_cvtepi8_epi16(data_bytes)));
-
-        // Apply adjustments
-        let adjusted = _mm256_add_ps(data_f32, adjustments);
-        let clamped = _mm256_min_ps(_mm256_max_ps(adjusted, zero), max_val);
-
-        // Convert back to bytes
-        let result_i32 = _mm256_cvtps_epi32(clamped);
-        let result_i16 = _mm256_packs_epi32(result_i32, result_i32);
-        let result_i8 = _mm_packus_epi16(
-            _mm256_extracti128_si256(result_i16, 0),
-            _mm256_extracti128_si256(result_i16, 0),
-        );
-
-        _mm_storel_epi64(data.as_mut_ptr().add(i) as *mut __m128i, result_i8);
-        i += 8;
-    }
-
-    // Handle remainder with scalar
-    while i < data.len() {
-        let pattern_val = pattern[i % pattern.len()];
-        let adjustment = (pattern_val * intensity * 255.0) as i16;
-        let new_val = (data[i] as i16 + adjustment).clamp(0, 255) as u8;
-        data[i] = new_val;
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn shape_traffic_pattern_neon(data: &mut [u8], pattern: &[f32], intensity: f32) {
-    use std::arch::aarch64::*;
-
-    let intensity_vec = vdupq_n_f32(intensity * 255.0);
-    let zero = vdupq_n_f32(0.0);
-    let max_val = vdupq_n_f32(255.0);
-    let plen = pattern.len();
-
-    let mut i = 0usize;
-    while i + 4 <= data.len() && (i % plen) + 4 <= plen {
-        let pattern_vec = vld1q_f32(pattern.as_ptr().add(i % plen));
-        let adjustments = vmulq_f32(pattern_vec, intensity_vec);
-
-        let mut tmp_in = [0u8; 8];
-        tmp_in[..4].copy_from_slice(&data[i..i + 4]);
-        let data_bytes = vld1_u8(tmp_in.as_ptr());
-        let data_u16 = vmovl_u8(data_bytes);
-        let data_u32 = vmovl_u16(vget_low_u16(data_u16));
-        let data_f32 = vcvtq_f32_u32(data_u32);
-
-        let adjusted = vaddq_f32(data_f32, adjustments);
-        let clamped = vminq_f32(vmaxq_f32(adjusted, zero), max_val);
-
-        let result_u32 = vcvtq_u32_f32(clamped);
-        let result_u16 = vqmovn_u32(result_u32);
-        let result_u8 = vqmovn_u16(vcombine_u16(result_u16, result_u16));
-
-        let mut tmp_out = [0u8; 8];
-        vst1_u8(tmp_out.as_mut_ptr(), result_u8);
-        data[i..i + 4].copy_from_slice(&tmp_out[..4]);
-        i += 4;
-    }
-
-    while i < data.len() {
-        let pattern_val = pattern[i % plen];
-        let adjustment = (pattern_val * intensity * 255.0) as i16;
-        let new_val = (data[i] as i16 + adjustment).clamp(0, 255) as u8;
-        data[i] = new_val;
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn inject_pattern_sve2(data: &mut [u8], pattern: &[u8], positions: &[usize]) {
     #[cfg(target_feature = "sve2")]
     {
@@ -1168,7 +749,7 @@ unsafe fn inject_pattern_sve2(data: &mut [u8], pattern: &[u8], positions: &[usiz
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sve2")]
 unsafe fn inject_pattern_sve2_impl(data: &mut [u8], pattern: &[u8], positions: &[usize]) {
     use std::arch::aarch64::*;
@@ -1196,136 +777,7 @@ unsafe fn inject_pattern_sve2_impl(data: &mut [u8], pattern: &[u8], positions: &
     }
 }
 
-/// Convert HTTP header names into Title-Case (Safari/Firefox style) using SIMD acceleration.
-#[inline(always)]
-pub fn titlecase_header_name(name: &mut [u8]) {
-    if name.is_empty() || name[0] == b':' {
-        return;
-    }
-
-    let mut lowered = false;
-    #[cfg(target_arch = "x86_64")]
-    {
-        let profile = FeatureDetector::instance().profile();
-        if matches!(
-            profile,
-            CpuProfile::X86_P1a
-                | CpuProfile::X86_P1b
-                | CpuProfile::X86_P1f
-                | CpuProfile::X86_P2a
-                | CpuProfile::X86_P2b
-                | CpuProfile::X86_P3a
-                | CpuProfile::X86_P3b
-                | CpuProfile::X86_P3c
-                | CpuProfile::X86_P3d
-                | CpuProfile::X86_P3e
-        ) {
-            unsafe {
-                lowercase_ascii_sse2(name);
-            }
-            lowered = true;
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let profile = FeatureDetector::instance().profile();
-        if matches!(
-            profile,
-            CpuProfile::ARM_A0
-                | CpuProfile::ARM_A1a
-                | CpuProfile::ARM_A1b
-                | CpuProfile::ARM_A1c
-                | CpuProfile::ARM_A1d
-                | CpuProfile::ARM_A2
-                | CpuProfile::Apple_M
-        ) {
-            unsafe {
-                lowercase_ascii_neon(name);
-            }
-            lowered = true;
-        }
-    }
-
-    if !lowered {
-        lowercase_ascii_scalar(name);
-    }
-
-    let mut uppercase_next = true;
-    for byte in name.iter_mut() {
-        if uppercase_next {
-            if byte.is_ascii_lowercase() {
-                *byte &= 0xDF;
-            }
-            uppercase_next = false;
-        }
-        if *byte == b'-' {
-            uppercase_next = true;
-        }
-    }
-}
-
-#[inline(always)]
-fn lowercase_ascii_scalar(bytes: &mut [u8]) {
-    for b in bytes.iter_mut() {
-        if b.is_ascii_uppercase() {
-            *b |= 0x20;
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn lowercase_ascii_sse2(bytes: &mut [u8]) {
-    use std::arch::x86_64::*;
-
-    let len = bytes.len();
-    let a_minus_one = _mm_set1_epi8((b'A' - 1) as i8);
-    let z_plus_one = _mm_set1_epi8((b'Z' + 1) as i8);
-    let add_mask = _mm_set1_epi8(0x20);
-
-    let mut i = 0usize;
-    while i + 16 <= len {
-        let ptr = bytes.as_mut_ptr().add(i) as *mut __m128i;
-        let v = _mm_loadu_si128(ptr);
-        let gt = _mm_cmpgt_epi8(v, a_minus_one);
-        let lt = _mm_cmplt_epi8(v, z_plus_one);
-        let mask = _mm_and_si128(gt, lt);
-        let add = _mm_and_si128(mask, add_mask);
-        let lowered = _mm_or_si128(v, add);
-        _mm_storeu_si128(ptr, lowered);
-        i += 16;
-    }
-
-    lowercase_ascii_scalar(&mut bytes[i..]);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn lowercase_ascii_neon(bytes: &mut [u8]) {
-    use std::arch::aarch64::*;
-
-    let len = bytes.len();
-    let a_minus_one = vdupq_n_u8(b'A' - 1);
-    let z_val = vdupq_n_u8(b'Z');
-    let add_mask = vdupq_n_u8(0x20);
-
-    let mut i = 0usize;
-    while i + 16 <= len {
-        let ptr = bytes.as_mut_ptr().add(i);
-        let v = vld1q_u8(ptr);
-        let gt = vcgtq_u8(v, a_minus_one);
-        let le = vcleq_u8(v, z_val);
-        let mask = vandq_u8(gt, le);
-        let add = vandq_u8(mask, add_mask);
-        let lowered = vorrq_u8(v, add);
-        vst1q_u8(ptr, lowered);
-        i += 16;
-    }
-
-    lowercase_ascii_scalar(&mut bytes[i..]);
-}
-
+#[cfg(any(test, feature = "rust-tests"))]
 #[cfg(test)]
 mod tests {
     use super::*;

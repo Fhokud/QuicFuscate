@@ -255,6 +255,7 @@ fn bench_poly1305_mac(total_bytes: usize, iters: usize) {
     );
 }
 
+#[cfg(feature = "benches")]
 fn bench_sha256(total_bytes: usize, iters: usize, backend: Option<&str>) {
     use quicfuscate::simd::{bench, Sha256BenchBackend};
 
@@ -289,6 +290,12 @@ fn bench_sha256(total_bytes: usize, iters: usize, backend: Option<&str>) {
         last_used.as_str(),
         sink
     );
+}
+
+#[cfg(not(feature = "benches"))]
+fn bench_sha256(_total_bytes: usize, _iters: usize, _backend: Option<&str>) {
+    eprintln!("sha256 microbench requires --features benches");
+    std::process::exit(2);
 }
 
 fn bench_hmac_sha256(total_bytes: usize, iters: usize) {
@@ -333,7 +340,7 @@ fn print_profile_info() {
 
 fn print_help() {
     eprintln!(
-        "Microbench CLI\n\nCommands:\n  profile\n  aes-block <bytes_per_iter> <iters>\n  ghash <bytes_per_iter> <iters>\n  aes-gcm <bytes_per_iter> <iters>\n  chacha-x4 <bytes_per_iter> <iters>\n  morus-enc <bytes_per_iter> <iters>\n  morus-dec <bytes_per_iter> <iters>\n  poly1305-mac <bytes_per_iter> <iters>\n  sha256 <bytes_per_iter> <iters> [backend:auto|avx2|vnni|scalar]\n  hmac-sha256 <bytes_per_iter> <iters>\n  varint <values_per_iter> <iters>\n  hdr-validate <headers_per_iter> <iters>\n  bitpack <bit_width:1-8> <values_per_iter> <iters>\n  bitunpack <bit_width:1-8> <values_per_iter> <iters>\n  qpack-enc <bytes_per_iter> <iters>\n  qpack-dec <bytes_per_iter> <iters>\n  popcnt <bytes_per_iter> <iters>\nSizes accept suffixes: B, KiB, MiB"
+        "Microbench CLI\n\nCommands:\n  profile\n  aes-block <bytes_per_iter> <iters>\n  ghash <bytes_per_iter> <iters>\n  aes-gcm <bytes_per_iter> <iters>\n  chacha-x4 <bytes_per_iter> <iters>\n  morus-enc <bytes_per_iter> <iters>\n  morus-dec <bytes_per_iter> <iters>\n  poly1305-mac <bytes_per_iter> <iters>\n  sha256 <bytes_per_iter> <iters> [backend:auto|avx2|vnni|scalar] (requires --features benches)\n  hmac-sha256 <bytes_per_iter> <iters>\n  varint <values_per_iter> <iters>\n  hdr-validate <headers_per_iter> <iters>\n  bitpack <bit_width:1-8> <values_per_iter> <iters>\n  bitunpack <bit_width:1-8> <values_per_iter> <iters>\n  qpack-enc <bytes_per_iter> <iters>\n  qpack-dec <bytes_per_iter> <iters>\n  popcnt <bytes_per_iter> <iters>\nSizes accept suffixes: B, KiB, MiB"
     );
 }
 

@@ -26,12 +26,12 @@ fn ecn_popcount_basic_cases() {
 
 #[test]
 fn ecn_popcount_randomized() {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for &len_words in &[0usize, 1, 2, 3, 4, 7, 8, 16, 31, 32, 64, 127, 128, 256] {
         for _ in 0..32 {
             let mut v = vec![0u64; len_words];
             for w in &mut v {
-                *w = rng.gen::<u64>();
+                *w = rng.random::<u64>();
             }
             let acc = count_ecn_marks(&v);
             let refc = scalar_count(&v);

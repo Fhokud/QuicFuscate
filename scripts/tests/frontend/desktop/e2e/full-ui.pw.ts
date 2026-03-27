@@ -1,9 +1,21 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Desktop UI (Browser Mode)", () => {
+  async function waitForHydration(page: any) {
+    await expect(page.locator('#qf-app-stage[data-hydrated="true"]')).toBeVisible();
+  }
+
+  function createButton(page: any) {
+    return page.getByRole("button", { name: "Open tunnel composer", exact: true });
+  }
+
+  function importQkeyButton(page: any) {
+    return page.getByRole("button", { name: "Open QKey vault", exact: true });
+  }
+
   async function expectNoHorizontalOverflow(page: any) {
     const m = await page.evaluate(() => {
-      const shell = document.querySelector("#root > div");
+      const shell = document.querySelector("#qf-app-stage");
       return {
         shellClientWidth: (shell as HTMLElement | null)?.clientWidth ?? 0,
         shellScrollWidth: (shell as HTMLElement | null)?.scrollWidth ?? 0,
@@ -28,10 +40,11 @@ test.describe("Desktop UI (Browser Mode)", () => {
 
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
+    await waitForHydration(page);
   });
 
   test("app shell renders and primary navigation is accessible", async ({ page }) => {
-    await expect(page.getByText("QuicFuscate")).toBeVisible();
+    await expect(page.getByAltText("QuicFuscate logo")).toBeVisible();
 
     const nav = page.getByRole("navigation", { name: "Primary" });
     await expect(nav).toBeVisible();
@@ -42,8 +55,8 @@ test.describe("Desktop UI (Browser Mode)", () => {
   });
 
   test("tunnels view shows create + import actions and a stable content area", async ({ page }) => {
-    await expect(page.getByRole("button", { name: "Create" }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: "Import QKey" })).toBeVisible();
+    await expect(createButton(page)).toBeVisible();
+    await expect(importQkeyButton(page)).toBeVisible();
     const openConfigButtons = page.getByRole("button", { name: "Open configuration", exact: true });
     if ((await openConfigButtons.count()) > 0) {
       await expect(openConfigButtons.first()).toBeVisible();
@@ -54,7 +67,7 @@ test.describe("Desktop UI (Browser Mode)", () => {
   });
 
   test("create tunnel validates remote and creates a tunnel shell", async ({ page }) => {
-    await page.getByRole("button", { name: "Create" }).first().click();
+    await createButton(page).click();
     const dialog = page.getByRole("dialog", { name: "Create Tunnel" });
     await expect(dialog).toBeVisible();
 
@@ -79,7 +92,7 @@ test.describe("Desktop UI (Browser Mode)", () => {
   });
 
   test("country code renders flag and can delete tunnels", async ({ page }) => {
-    await page.getByRole("button", { name: "Create" }).first().click();
+    await createButton(page).click();
     const dialog = page.getByRole("dialog", { name: "Create Tunnel" });
     await expect(dialog).toBeVisible();
     await dialog.getByLabel("Name of the Connection", { exact: true }).fill("Berlin");
@@ -96,11 +109,11 @@ test.describe("Desktop UI (Browser Mode)", () => {
     await expect(page.getByText("DE", { exact: true }).first()).toBeVisible();
 
     // Toolbar should appear once we have tunnels.
-    await expect(page.getByRole("button", { name: "Create" }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: "Import QKey" }).first()).toBeVisible();
+    await expect(createButton(page)).toBeVisible();
+    await expect(importQkeyButton(page)).toBeVisible();
 
     // Remove the tunnel and confirm the destructive action.
-    const berlinCard = page.locator("main").locator("[role='button']").filter({ hasText: "Berlin" }).first();
+    const berlinCard = page.locator("[data-tunnel-card]").filter({ hasText: "Berlin" }).first();
     await berlinCard.hover();
     const removeBtn = berlinCard.getByRole("button", { name: "Remove tunnel", exact: true });
     await expect(removeBtn).toBeVisible();
@@ -113,7 +126,7 @@ test.describe("Desktop UI (Browser Mode)", () => {
   });
 
   test("without QKey the connect control stays disabled and import flow is available", async ({ page }) => {
-    await page.getByRole("button", { name: "Create" }).first().click();
+    await createButton(page).click();
     const dialog = page.getByRole("dialog", { name: "Create Tunnel" });
     await expect(dialog).toBeVisible();
     await dialog.getByLabel("Name of the Connection", { exact: true }).fill("Test");
@@ -124,17 +137,17 @@ test.describe("Desktop UI (Browser Mode)", () => {
     await expect(connectWithoutQKey).toBeVisible();
     await expect(connectWithoutQKey).toBeDisabled();
 
-    await page.getByRole("button", { name: "Import QKey" }).click();
+    await importQkeyButton(page).click();
     await expect(page.getByRole("dialog")).toBeVisible();
     await expect(page.getByLabel("QKey String", { exact: true })).toBeVisible();
   });
 
   test("import qkey is disabled in browser mode and warns clearly", async ({ page }) => {
-    await page.getByRole("button", { name: "Import QKey" }).click();
+    await importQkeyButton(page).click();
     await expect(page.getByLabel("QKey String", { exact: true })).toBeVisible();
 
     await page.getByRole("textbox", { name: "QKey String" }).fill("QKey-TESTONLY");
-    const importBtn = page.getByRole("button", { name: "Import" });
+    const importBtn = page.getByRole("button", { name: "Import", exact: true });
     await expect(importBtn).toBeDisabled();
   });
 
@@ -144,7 +157,8 @@ test.describe("Desktop UI (Browser Mode)", () => {
     await expect(page.getByRole("main").getByText("Configuration", { exact: true })).toBeVisible();
 
     await expect(page.getByText("Logging", { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: /Log level/i }).first()).toBeVisible();
+    await expect(page.getByText("Log Level", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Log level info", exact: true })).toBeVisible();
     await expect(page.getByText("Startup", { exact: true })).toBeVisible();
     await expect(page.getByText("Updates", { exact: true })).toBeVisible();
   });
@@ -183,15 +197,15 @@ test.describe("Desktop UI (Browser Mode)", () => {
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.setViewportSize({ width: 900, height: 600 });
 
-      await page.getByRole("button", { name: "Create" }).first().click();
+      await createButton(page).click();
       const dialog = page.getByRole("dialog").first();
       await expect(dialog).toBeVisible();
 
       await expectLocatorInViewport(page, dialog, 8);
 
       // Regression check: labels must not overlap previous fields.
-      const nameInput = dialog.locator("#create-tunnel-name");
-      const remoteLabel = dialog.locator("label[for='create-tunnel-remote']");
+      const nameInput = dialog.getByLabel("Name of the Connection", { exact: true });
+      const remoteLabel = dialog.locator("label").filter({ hasText: "Remote [IP-Address:Port]" }).first();
       const nameBox = await nameInput.boundingBox();
       const remoteLabelBox = await remoteLabel.boundingBox();
       if (nameBox && remoteLabelBox) {
@@ -206,13 +220,13 @@ test.describe("Desktop UI (Browser Mode)", () => {
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.setViewportSize({ width: 900, height: 600 });
 
-      await page.getByRole("button", { name: "Create" }).first().click();
+      await createButton(page).click();
       const dialog = page.getByRole("dialog").first();
       await expect(dialog).toBeVisible();
 
-      const nameInput = dialog.locator("#create-tunnel-name");
-      const remoteLabel = dialog.locator("label[for='create-tunnel-remote']");
-      const remoteInput = dialog.locator("#create-tunnel-remote");
+      const nameInput = dialog.getByLabel("Name of the Connection", { exact: true });
+      const remoteLabel = dialog.locator("label").filter({ hasText: "Remote [IP-Address:Port]" }).first();
+      const remoteInput = dialog.getByLabel("Remote [IP-Address:Port]", { exact: true });
 
       const nameBox = await nameInput.boundingBox();
       const remoteLabelBox = await remoteLabel.boundingBox();
@@ -234,7 +248,7 @@ test.describe("Desktop UI (Browser Mode)", () => {
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.setViewportSize({ width: 900, height: 600 });
 
-      await page.getByRole("button", { name: "Import QKey" }).click();
+      await importQkeyButton(page).click();
       const dialog = page.getByRole("dialog").first();
       await expect(dialog).toBeVisible();
 
@@ -247,7 +261,7 @@ test.describe("Desktop UI (Browser Mode)", () => {
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.setViewportSize({ width: 900, height: 600 });
 
-      await page.getByRole("button", { name: "Create" }).first().click();
+      await createButton(page).click();
       const dialog = page.getByRole("dialog", { name: "Create Tunnel" });
       await expect(dialog).toBeVisible();
       await dialog.getByLabel("Name of the Connection", { exact: true }).fill("Viewport");

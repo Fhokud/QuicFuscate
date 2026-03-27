@@ -7,14 +7,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 [[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
 
-OUTPUT_DIR=""; RUSTFLAGS_EXTRA=""; FAST=0; INTEGRATION=0
+OUTPUT_DIR=""; FAST=0; INTEGRATION=0; RUSTFLAGS_EXTRA=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --fast) FAST=1;;
     --integration) INTEGRATION=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--fast] [--integration]"; exit 0;;
     *) break;;
@@ -110,27 +109,27 @@ run_case "E2E H3 Server Push (Promise->Headers->Data->FIN)" \
   "test:it-stealth-mode-matrix" \
   "test_should_trigger_server_push_mode_matrix"
 
-# FEC streaming recovery under 6% loss
-run_case "E2E FEC Streaming @6% loss" \
+# Internal machine-room FEC streaming recovery under 6% loss
+run_case "E2E Internal FEC Streaming @6% loss" \
   "QUICFUSCATE_FEC_INITIAL_MODE=streaming QUICFUSCATE_RS_LOSS=0.06 QUICFUSCATE_FEC_USE_ADAPTIVE=1" \
   "lib" \
   "test_streaming_tetrys_style_recovery_single_loss"
 
-# Migration under loss
-run_case "E2E Connection Migration under loss" \
-  "QUICFUSCATE_RS_LOSS=0.03" \
-  "lib" \
-  "connection_migration_path_id_increments"
+# Transport migration validation control-path
+run_case "Transport Migration Validation Control Path" \
+  "" \
+  "test:rt-transport-connection" \
+  "connection_migrate_emits_path_events_in_order"
 
 # Zero-RTT
 run_case "E2E 0-RTT Resume" \
-  "QUICFUSCATE_ENABLE_0RTT=1" \
+  "" \
   "test:rt-transport-frames-roundtrip" \
   "ack_in_zero_rtt_is_invalid"
 
 # Full-stack stealth
 (( ! FAST )) && run_case "E2E Full-Stack Stealth" \
-  "QUICFUSCATE_STEALTH_MODE=anti_dpi QUICFUSCATE_BROWSER_PROFILE=chrome QUICFUSCATE_OS_PROFILE=windows QUICFUSCATE_DOH_ENABLED=1 QUICFUSCATE_H3_MASQUERADE=1 QUICFUSCATE_STEALTH_PADDING=1" \
+  "QUICFUSCATE_STEALTH_MODE=anti_dpi QUICFUSCATE_BROWSER=chrome QUICFUSCATE_OS=windows QUICFUSCATE_DOH=1 QUICFUSCATE_H3_MASQUERADE=1 QUICFUSCATE_STEALTH_PADDING=1" \
   "test:it-stealth-mode-matrix" \
   "test_mode_feature_matrix_core_expectations"
 
@@ -141,7 +140,7 @@ if (( INTEGRATION )); then
     "test_control_plane_start_stop_commands"
 
   run_case "E2E FEC (Adaptive Mode)" \
-    "QUICFUSCATE_FEC_USE_ADAPTIVE=1 QUICFUSCATE_FEC_INITIAL_MODE=normal" \
+    "QUICFUSCATE_FEC_USE_ADAPTIVE=1 QUICFUSCATE_FEC_INITIAL_MODE=auto" \
     "lib" \
     "test_replayed_loss_trace_drives_end_to_end_adaptation"
 
@@ -158,7 +157,7 @@ if (( INTEGRATION )); then
   run_case "E2E Performance Under Load" \
     "" \
     "lib" \
-    "test_fec_perf_smoke_thresholds_pass"
+    "test_hotpath_perf_smoke_thresholds_pass"
 fi
 
 echo -e "\n[OK] E2E scenarios complete. Artifacts: $OUTPUT_DIR"

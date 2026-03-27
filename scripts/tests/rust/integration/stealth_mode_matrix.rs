@@ -1,9 +1,7 @@
 use quicfuscate::crypto::CryptoManager;
-use quicfuscate::optimize::telemetry::MASQUE_HINT;
 use quicfuscate::optimize::OptimizationManager;
 use quicfuscate::stealth::{StealthConfig, StealthManager, StealthMode};
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 fn manager_for_mode(mode: StealthMode) -> StealthManager {
@@ -18,9 +16,12 @@ fn manager_for_config(cfg: StealthConfig) -> StealthManager {
     StealthManager::new(cfg, Arc::new(OptimizationManager::new()), Arc::new(CryptoManager::new()))
 }
 
-fn telemetry_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn manager_for_config_with_masque_compat(cfg: StealthConfig) -> StealthManager {
+    StealthManager::new_with_masque_compat_for_test(
+        cfg,
+        Arc::new(OptimizationManager::new()),
+        Arc::new(CryptoManager::new()),
+    )
 }
 
 #[test]
@@ -122,58 +123,54 @@ fn test_conflicting_stealth_feature_combinations_are_rejected() {
 #[test]
 fn test_intelligent_runtime_push_requires_nonzero_level_hint() {
     let manager = manager_for_mode(StealthMode::Intelligent);
-    manager.enable_server_push_runtime(true, Some(0.8));
-    assert!(manager.get_server_push_config().is_none());
+    manager.enable_server_push_runtime_for_test(true, Some(0.8));
+    assert!(manager.server_push_cover_plan_for_test().is_none());
 }
 
 #[test]
 fn test_intelligent_masque_preference_uses_hint_fallback() {
-    let _guard = telemetry_lock().lock().unwrap();
-    let manager = manager_for_mode(StealthMode::Intelligent);
-    MASQUE_HINT.store(0, std::sync::atomic::Ordering::Relaxed);
+    let manager =
+        manager_for_config_with_masque_compat(StealthConfig::from_mode(StealthMode::Intelligent));
     manager.set_masque_preferred(true);
-    manager.maybe_escalate_masque_intelligent();
+    manager.sync_masque_preference_with_hint_for_test(0);
     assert!(!manager.masque_preferred());
 
-    MASQUE_HINT.store(1, std::sync::atomic::Ordering::Relaxed);
-    manager.maybe_escalate_masque_intelligent();
+    manager.sync_masque_preference_with_hint_for_test(1);
     assert!(manager.masque_preferred());
-
-    MASQUE_HINT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[test]
 fn test_should_trigger_server_push_mode_matrix() {
     let off = manager_for_mode(StealthMode::Off);
-    assert!(!off.should_trigger_server_push());
+    assert!(off.server_push_cover_plan_for_test().is_none());
 
     let mut perf_cfg = StealthConfig::performance();
     perf_cfg.server_push_burst_interval = 1;
     let perf = manager_for_config(perf_cfg);
-    perf.enable_server_push_runtime(true, Some(0.5));
+    perf.enable_server_push_runtime_for_test(true, Some(0.5));
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(perf.should_trigger_server_push());
+    assert!(perf.server_push_cover_plan_for_test().is_some());
 
     let mut stealth_cfg = StealthConfig::stealth();
     stealth_cfg.server_push_burst_interval = 1;
     let stealth = manager_for_config(stealth_cfg);
-    stealth.enable_server_push_runtime(true, Some(0.7));
+    stealth.enable_server_push_runtime_for_test(true, Some(0.7));
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(stealth.should_trigger_server_push());
+    assert!(stealth.server_push_cover_plan_for_test().is_some());
 
     let mut anti_cfg = StealthConfig::anti_dpi();
     anti_cfg.server_push_burst_interval = 1;
     let anti = manager_for_config(anti_cfg);
     std::thread::sleep(Duration::from_millis(1100));
-    assert!(anti.should_trigger_server_push());
+    assert!(anti.server_push_cover_plan_for_test().is_some());
 
     let mut intelligent_cfg = StealthConfig::from_mode(StealthMode::Intelligent);
     intelligent_cfg.server_push_burst_interval = 1;
     let intelligent = manager_for_config(intelligent_cfg);
-    intelligent.enable_server_push_runtime(true, Some(0.8));
+    intelligent.enable_server_push_runtime_for_test(true, Some(0.8));
     std::thread::sleep(Duration::from_millis(1100));
     assert!(
-        !intelligent.should_trigger_server_push(),
+        intelligent.server_push_cover_plan_for_test().is_none(),
         "intelligent mode should not trigger without brain level hint >= 1"
     );
 }

@@ -35,32 +35,38 @@ async function assertDialogCenteredInStage(page: Page, testInfo: TestInfo, label
 }
 
 async function createTunnelShell(page: Page, name: string) {
-  await page.getByRole("button", { name: "Create" }).first().click();
+  await page.getByRole("button", { name: "Open tunnel composer", exact: true }).click();
   await page.getByLabel("Name of the Connection", { exact: true }).fill(name);
   await page.getByLabel("Remote [IP-Address:Port]", { exact: true }).fill("203.0.113.11:4433");
-  await page.getByRole("button", { name: "Create" }).click();
+  await page.getByRole("button", { name: "Create Tunnel", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByText(name, { exact: true }).first()).toBeVisible();
+}
+
+async function waitForHydration(page: Page) {
+  await expect(page.locator('#qf-app-stage[data-hydrated="true"]')).toBeVisible();
 }
 
 test.describe("Dialog Centering [Desktop Browser Mode]", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
+    await waitForHydration(page);
   });
 
   test("create dialog is centered in stage", async ({ page }, testInfo) => {
-    await page.getByRole("button", { name: "Create" }).first().click();
+    await page.getByRole("button", { name: "Open tunnel composer", exact: true }).click();
     await assertDialogCenteredInStage(page, testInfo, "create-tunnel");
   });
 
   test("import qkey dialog is centered in stage", async ({ page }, testInfo) => {
-    await page.getByRole("button", { name: "Import QKey" }).first().click();
+    await page.getByRole("button", { name: "Open QKey vault", exact: true }).click();
     await assertDialogCenteredInStage(page, testInfo, "import-qkey");
   });
 
   test("delete confirm dialog is centered in stage", async ({ page }, testInfo) => {
     await createTunnelShell(page, "Center Delete");
-    const card = page.getByRole("button", { name: /Center Delete/ }).first();
+    const card = page.locator("[data-tunnel-card]").filter({ hasText: "Center Delete" }).first();
+    await expect(card).toBeVisible();
     await card.getByRole("button", { name: "Remove tunnel", exact: true }).click();
     await expect(page.getByRole("dialog", { name: "Delete Tunnel" })).toBeVisible();
     await assertDialogCenteredInStage(page, testInfo, "delete-confirm");

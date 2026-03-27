@@ -1,0 +1,6 @@
+{
+  "user": "admin",
+  "password_phc": "<argon2id-hash-auto-generated-on-first-start>",
+  "requires_password_change": true,
+  "updated_at": 0
+}

@@ -6,11 +6,10 @@ use quicfuscate::engine::qkey;
 use quicfuscate::error::ConnectionError;
 use quicfuscate::fec::FecConfig;
 use quicfuscate::implementations::server::qkey_registry::{
-    qkey_id as registry_qkey_id, token_sha256_hex_from_token_hex, QKeyRegistry,
+    qkey_id as registry_qkey_id, token_matches_hash, token_sha256_hex_from_token_hex, QKeyRegistry,
 };
 use quicfuscate::optimize::OptimizeConfig;
 use quicfuscate::stealth::StealthConfig;
-use quicfuscate::transport::h3::NameValue;
 use quicfuscate::transport::packet::PacketType;
 use quicfuscate::transport::{Config, ConnectionId, RecvInfo, PROTOCOL_VERSION};
 
@@ -304,14 +303,7 @@ fn simulate_qkey_http3_auth(
                             return;
                         }
                     };
-                    let provided_hash = match token_sha256_hex_from_token_hex(provided) {
-                        Some(h) => h,
-                        None => {
-                            should_close.set(Some(b"invalid_qkey_auth"));
-                            return;
-                        }
-                    };
-                    if provided_hash.eq_ignore_ascii_case(expected.trim()) {
+                    if token_matches_hash(provided, expected.trim()) {
                         authed.set(true);
                     } else {
                         should_close.set(Some(b"invalid_qkey_auth"));

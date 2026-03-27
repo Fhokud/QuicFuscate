@@ -14,7 +14,6 @@ while [[ $# -gt 0 ]]; do
     --fast) FAST=1;;
     --full) FAST=0;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
-    --dry-run) DRY_RUN=1;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--fast] [--full]"; exit 0;;
     *) break;;
   esac; shift
@@ -45,12 +44,23 @@ fi
 
 # 3) Core integration suite (run individually, sequential)
 run "$SCRIPT_DIR/../suites/test-core.sh" --output-dir "$OUTPUT_DIR/tests-core"
+run "$SCRIPT_DIR/../suites/test-desktop-webadmin-rust-integration.sh" --output-dir "$OUTPUT_DIR/tests-desktop-webadmin-rust"
 
 # 4) Core suite coverage (run individually, sequential)
 if (( ! FAST )); then
   run "$SCRIPT_DIR/../suites/test-transport.sh" --output-dir "$OUTPUT_DIR/tests-transport"
   run "$SCRIPT_DIR/../suites/test-fec.sh" --refactor --output-dir "$OUTPUT_DIR/tests-fec"
   run "$SCRIPT_DIR/../suites/test-stealth.sh" --output-dir "$OUTPUT_DIR/tests-stealth"
+  run "$SCRIPT_DIR/../suites/test-profile-overrides.sh" --output-dir "$OUTPUT_DIR/tests-profile-overrides"
+  run "$SCRIPT_DIR/../suites/test-profile-fuzz-parity.sh" --output-dir "$OUTPUT_DIR/tests-profile-fuzz-parity"
+  run "$SCRIPT_DIR/../suites/test-fec-auto-controller-scenarios.sh" --output-dir "$OUTPUT_DIR/tests-fec-auto-controller-scenarios"
+  run "$SCRIPT_DIR/../suites/test-fec-auto-controller-proof.sh" --output-dir "$OUTPUT_DIR/tests-fec-auto-controller-proof"
+  run "$SCRIPT_DIR/../suites/test-security.sh" --output-dir "$OUTPUT_DIR/tests-security"
+  run "$SCRIPT_DIR/../suites/test-security-fuzzing.sh" --output-dir "$OUTPUT_DIR/tests-security-fuzzing"
+  run "$SCRIPT_DIR/../suites/test-e2e-admin-web.sh" --output-dir "$OUTPUT_DIR/tests-e2e-admin-web"
+  run "$SCRIPT_DIR/../suites/test-runtime-soak-chaos.sh" --output-dir "$OUTPUT_DIR/tests-runtime-soak-chaos"
+else
+  run "$SCRIPT_DIR/../suites/test-stealth.sh" --output-dir "$OUTPUT_DIR/tests-stealth" --fast
 fi
 run "$SCRIPT_DIR/../suites/test-crypto.sh" --output-dir "$OUTPUT_DIR/tests-crypto" $([[ $FAST -eq 1 ]] && echo --fast)
 run "$SCRIPT_DIR/../suites/test-optimization.sh" --output-dir "$OUTPUT_DIR/tests-optimization" $([[ $FAST -eq 1 ]] && echo --fast)
@@ -64,12 +74,12 @@ fi
 # 5) Targeted crypto smoke (aligned to test-all coverage)
 if (( ! FAST )); then
   run_cargo test --release --lib aes_gcm
-  run_cargo test --release --lib aegis_128l
+  run_cargo test --release --lib aegis128l
 fi
 
 # Linux-specific paths
 if [[ "$(detect_os 2>/dev/null || echo unknown)" == linux ]]; then
-  run_cargo test --release --features uring_sys --test rt-transport-uring -- --nocapture
+  run_cargo test --release --features io_uring --test rt-transport-uring -- --nocapture
   run_cargo test --release --test rt-transport-xdp -- --nocapture
 fi
 
@@ -82,7 +92,10 @@ run "$SCRIPT_DIR/../suites/test-probe-detection.sh" --output-dir "$OUTPUT_DIR/te
 
 # 7) E2E
 run "$SCRIPT_DIR/../suites/test-e2e.sh" --output-dir "$OUTPUT_DIR/e2e" $( ((FAST)) && echo --fast )
-run "$SCRIPT_DIR/../suites/test-e2e-integration.sh" --output-dir "$OUTPUT_DIR/e2e-integration" $( ((FAST)) && echo --fast )
+run "$SCRIPT_DIR/../suites/test-e2e.sh" --integration --output-dir "$OUTPUT_DIR/e2e-integration" $( ((FAST)) && echo --fast )
+if (( ! FAST )); then
+  run "$SCRIPT_DIR/../smoke/smoke-ui-frontends.sh" --output-dir "$OUTPUT_DIR/frontend-smoke"
+fi
 
 # 8) Performance regression (fast reduces scope)
 run "$SCRIPT_DIR/../suites/test-performance-regression.sh" --output-dir "$OUTPUT_DIR/tests-perf" $( ((FAST)) && echo --fast )

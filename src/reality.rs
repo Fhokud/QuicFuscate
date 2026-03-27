@@ -13,16 +13,25 @@ const TARGETS: &[&str] = &[
     "9.9.9.9:443", // Quad9
 ];
 
+/// Deterministic cleanup interval - sweep stale sessions every 60 seconds.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+/// Force immediate cleanup when session count exceeds this threshold.
+const MAX_SESSIONS: usize = 10_000;
+/// Session TTL - evict entries inactive for longer than this.
+const SESSION_TTL: Duration = Duration::from_secs(300);
+
 /// Represents a raw response packet that needs to be relayed back to the scanner.
 pub struct FallbackResponse {
+    /// Original scanner address to send the response back to.
     pub target: SocketAddr,
+    /// Raw upstream response payload to relay.
     pub data: Vec<u8>,
 }
 
 /// Manages reverse proxy sessions for active probes.
 /// When a probe is detected (invalid auth), we transparently forward it to a legitimate upstream.
-/// The response is captured and sent back to the scanner, providing a cryptographically valid
-/// proof that we are a standard QUIC server (e.g., Cloudflare/Google).
+/// The response is captured and sent back to the scanner so the observable path resembles a
+/// legitimate upstream service instead of exposing the forked server directly.
 pub struct RealityProxy {
     // Channel to send responses back to the main server loop
     tx: mpsc::Sender<FallbackResponse>,
@@ -32,20 +41,25 @@ pub struct RealityProxy {
     target_idx: AtomicUsize,
     // Upstream targets (env override supported)
     targets: Vec<String>,
+    // Deterministic cleanup tracker
+    last_cleanup: Mutex<Instant>,
 }
 
 struct SessionHandle {
     last_active: Instant,
-    sender: mpsc::Sender<Vec<u8>>, // Send packets TO upstream task
+    sender: mpsc::Sender<Vec<u8>>,     // Send packets TO upstream task
+    task: tokio::task::JoinHandle<()>, // Tracked proxy task handle
 }
 
 impl RealityProxy {
+    /// Create a new reality proxy with the given response channel.
     pub fn new(tx: mpsc::Sender<FallbackResponse>) -> Self {
         Self {
             tx,
             sessions: Mutex::new(HashMap::new()),
             target_idx: AtomicUsize::new(0),
             targets: load_targets(),
+            last_cleanup: Mutex::new(Instant::now()),
         }
     }
 
@@ -55,6 +69,7 @@ impl RealityProxy {
         self.targets[idx % self.targets.len()].clone()
     }
 
+    /// Test-only accessor for the target selection logic.
     #[cfg(feature = "rust-tests")]
     pub fn select_target_for_tests(&self) -> String {
         self.select_target()
@@ -65,16 +80,39 @@ impl RealityProxy {
     pub fn forward_probe(&self, packet: &[u8], source: SocketAddr) {
         let mut sessions = self.sessions.lock();
 
-        // Prune old sessions (lazy cleanup)
-        // In a real high-perf scenario, use a separate cleanup task or timing wheel.
-        // For stealth fallback (low volume), simple probabilistic prune is fine.
-        if sessions.len() > 100 && rand::random::<u8>() < 10 {
-            sessions.retain(|_, v| v.last_active.elapsed() < Duration::from_secs(60));
+        // Deterministic session cleanup: time-based interval or capacity pressure.
+        {
+            let mut last = self.last_cleanup.lock();
+            if last.elapsed() > CLEANUP_INTERVAL || sessions.len() > MAX_SESSIONS {
+                let before = sessions.len();
+                sessions.retain(|_, v| {
+                    let keep = v.last_active.elapsed() < SESSION_TTL;
+                    if !keep {
+                        v.task.abort();
+                    }
+                    keep
+                });
+                let evicted = before.saturating_sub(sessions.len());
+                if evicted > 0 {
+                    log::debug!(
+                        "Reality Proxy: evicted {} stale sessions ({} remaining)",
+                        evicted,
+                        sessions.len()
+                    );
+                }
+                *last = Instant::now();
+            }
         }
 
         if let Some(session) = sessions.get_mut(&source) {
             session.last_active = Instant::now();
-            let _ = session.sender.try_send(packet.to_vec());
+            if let Err(e) = session.sender.try_send(packet.to_vec()) {
+                log::debug!(
+                    "Reality Proxy: failed to enqueue probe packet for existing session {}: {}",
+                    source,
+                    e
+                );
+            }
         } else {
             // New Probe Session
             let target_addr_str = self.select_target();
@@ -88,8 +126,8 @@ impl RealityProxy {
             let response_tx = self.tx.clone();
             let source_copy = source;
 
-            // Spawn lightweight proxy task
-            tokio::spawn(async move {
+            // Spawn lightweight proxy task (JoinHandle tracked in SessionHandle)
+            let task = tokio::spawn(async move {
                 // Ephemeral local socket for upstream communication
                 let upstream = match UdpSocket::bind("0.0.0.0:0").await {
                     Ok(s) => s,
@@ -146,9 +184,18 @@ impl RealityProxy {
             });
 
             // Send the first packet immediately via the new channel
-            let _ = pkt_tx.try_send(packet.to_vec());
+            if let Err(e) = pkt_tx.try_send(packet.to_vec()) {
+                log::debug!(
+                    "Reality Proxy: failed to enqueue first probe packet for session {}: {}",
+                    source,
+                    e
+                );
+            }
 
-            sessions.insert(source, SessionHandle { last_active: Instant::now(), sender: pkt_tx });
+            sessions.insert(
+                source,
+                SessionHandle { last_active: Instant::now(), sender: pkt_tx, task },
+            );
         }
     }
 }
@@ -166,4 +213,94 @@ fn load_targets() -> Vec<String> {
         }
     }
     TARGETS.iter().map(|s| s.to_string()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_proxy() -> (RealityProxy, mpsc::Receiver<FallbackResponse>) {
+        let (tx, rx) = mpsc::channel(64);
+        (RealityProxy::new(tx), rx)
+    }
+
+    #[test]
+    fn target_rotation_is_round_robin() {
+        let (proxy, _rx) = make_proxy();
+        let t0 = proxy.select_target();
+        let t1 = proxy.select_target();
+        let t2 = proxy.select_target();
+        // After 3 targets we wrap around
+        let t3 = proxy.select_target();
+        assert_eq!(t0, TARGETS[0]);
+        assert_eq!(t1, TARGETS[1]);
+        assert_eq!(t2, TARGETS[2]);
+        assert_eq!(t3, TARGETS[0], "should wrap around");
+    }
+
+    #[test]
+    fn default_targets_are_populated() {
+        let targets = load_targets();
+        assert_eq!(targets.len(), 3);
+        assert!(targets.contains(&"1.1.1.1:443".to_string()));
+        assert!(targets.contains(&"8.8.8.8:443".to_string()));
+        assert!(targets.contains(&"9.9.9.9:443".to_string()));
+    }
+
+    #[test]
+    fn session_creation_on_new_source() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (proxy, _rx) = make_proxy();
+            let source: SocketAddr = "10.0.0.1:12345".parse().expect("parse addr");
+            proxy.forward_probe(b"test-probe", source);
+            // Session should exist now
+            let sessions = proxy.sessions.lock();
+            assert_eq!(sessions.len(), 1);
+            assert!(sessions.contains_key(&source));
+        });
+    }
+
+    #[test]
+    fn same_source_reuses_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (proxy, _rx) = make_proxy();
+            let source: SocketAddr = "10.0.0.2:54321".parse().expect("parse addr");
+            proxy.forward_probe(b"probe-1", source);
+            proxy.forward_probe(b"probe-2", source);
+            let sessions = proxy.sessions.lock();
+            assert_eq!(sessions.len(), 1, "same source should reuse session");
+        });
+    }
+
+    #[test]
+    fn different_sources_create_separate_sessions() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (proxy, _rx) = make_proxy();
+            let s1: SocketAddr = "10.0.0.1:1111".parse().expect("addr1");
+            let s2: SocketAddr = "10.0.0.2:2222".parse().expect("addr2");
+            proxy.forward_probe(b"probe-a", s1);
+            proxy.forward_probe(b"probe-b", s2);
+            let sessions = proxy.sessions.lock();
+            assert_eq!(sessions.len(), 2);
+        });
+    }
+
+    #[test]
+    fn constants_are_reasonable() {
+        const { assert!(MAX_SESSIONS >= 1000, "MAX_SESSIONS too low") };
+        const { assert!(SESSION_TTL.as_secs() >= 60, "SESSION_TTL too short") };
+        const { assert!(CLEANUP_INTERVAL.as_secs() >= 10, "CLEANUP_INTERVAL too short") };
+    }
 }

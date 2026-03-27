@@ -1,58 +1,55 @@
-//! QuicFuscate - Performance-focused VPN with stealth transport features.
+//! QuicFuscate - Forked stealth transport and VPN runtime.
 //!
-//! This crate provides the core engine and protocol building blocks.
+//! This crate provides the core engine and protocol building blocks for the forked
+//! QuicFuscate runtime. It is not a drop-in upstream QUIC implementation.
 //!
 //! # Features
-//! - **SIMD Everything**: AVX512/NEON/SVE2 in all hot paths
-//! - **Zero-Copy**: io_uring, huge pages, NUMA-aware memory
-//! - **Crypto**: AEGIS-128L and MORUS with automatic hardware selection when available
-//! - **FEC Mastery**: Bitsliced Wiedemann, parallel recovery
-//! - **Stealth Perfection**: Timing-perfect obfuscation
+//! - **Forked Transport/Crypto Stack**: custom transport and AEAD posture for this fork
+//! - **CPU-Aware Acceleration**: SIMD and hardware-dispatched fast paths where the runtime uses them
+//! - **UDP/io_uring Fastpath**: compatibility-oriented fastpath surface, with XDP kept experimental/test-only
+//! - **Adaptive FEC**: runtime-owned adaptive FEC with burst-protection and explicit policy snapshots
+//! - **Stealth Features**: canonical stealth runtime plus compatibility-only retained surfaces where documented
 
 // Unstable stdarch/core_intrinsics features removed for stable toolchain compatibility.
-#![allow(clippy::too_many_arguments)] // Performance over style
-#![allow(clippy::large_enum_variant)] // Performance over memory
+// Required for deeply nested macro expansions in crypto/FEC SIMD code
 #![recursion_limit = "1024"]
 
+/// CPU feature detection and hardware-accelerated dispatch (SIMD, AES-NI, VAES, NEON).
 pub mod accelerate;
+/// Core QUIC connection state machine, packet processing, and stream management.
 pub mod core;
+/// AEAD cipher selection, key derivation, and header protection.
 pub mod crypto;
+/// Canonical environment variable parsing utilities (flags, typed parse, multi-name lookup).
+pub mod env_utils;
+/// Unified error types for the QuicFuscate runtime.
 pub mod error {
     use std::fmt;
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum ConnectionError {
-        TransportError(String),
         CryptoError(String),
-        CryptoFail,
-        FlowControlError,
-        StreamLimitError,
         ProtocolViolation,
         InvalidState,
         Timeout,
-        BufferExhausted,
         InvalidFrame,
         Done,
         TlsError(String),
         TlsAlert(u64),
         BufferTooShort,
-        TlsFail,
         PeerCertificateUnsupported,
-        UnknownVersion,
         InvalidPacket,
         InvalidStreamState(u64),
         FinalSize,
         InternalError,
         Fec(String),
         Transport(String),
-        TlsHandshake,
         StreamReset,
         StreamStopped,
         IdLimit,
         FlowControl,
         ApplicationError(u64),
         StreamLimit,
-        StateError,
         ApplicationProtoError,
         VersionMismatch,
         FrameEncoding,
@@ -64,12 +61,6 @@ pub mod error {
         NoViablePath,
         ConnectionRefused,
         InvalidStreamId,
-    }
-
-    #[allow(non_upper_case_globals)]
-    impl ConnectionError {
-        pub const Fec: Self = ConnectionError::Fec(String::new());
-        pub const Transport: Self = ConnectionError::Transport(String::new());
     }
 
     impl fmt::Display for ConnectionError {
@@ -94,22 +85,22 @@ pub mod error {
                 ConnectionError::ConnectionRefused => write!(f, "Connection refused"),
                 ConnectionError::Timeout => write!(f, "Timeout"),
                 ConnectionError::Transport(msg) => write!(f, "Transport error: {}", msg),
-                ConnectionError::TlsFail => write!(f, "TLS failure"),
                 ConnectionError::TlsAlert(code) => write!(f, "TLS alert: {}", code),
                 ConnectionError::PeerCertificateUnsupported => {
                     write!(f, "Peer certificate unsupported")
                 }
                 ConnectionError::Done => write!(f, "Connection done"),
                 ConnectionError::BufferTooShort => write!(f, "Buffer too short"),
-                ConnectionError::UnknownVersion => write!(f, "Unknown version"),
                 ConnectionError::InvalidState => write!(f, "Invalid state"),
                 ConnectionError::Fec(ref msg) => write!(f, "FEC error: {}", msg),
-                ConnectionError::TlsHandshake => write!(f, "TLS handshake error"),
                 ConnectionError::StreamReset => write!(f, "Stream reset"),
                 ConnectionError::StreamStopped => write!(f, "Stream stopped"),
                 ConnectionError::IdLimit => write!(f, "ID limit exceeded"),
                 ConnectionError::ApplicationClosed => write!(f, "Application closed"),
-                _ => write!(f, "Other error"),
+                ConnectionError::CryptoError(msg) => write!(f, "Crypto error: {}", msg),
+                ConnectionError::TlsError(msg) => write!(f, "TLS error: {}", msg),
+                ConnectionError::ApplicationProtoError => write!(f, "Application protocol error"),
+                ConnectionError::VersionMismatch => write!(f, "Version mismatch"),
             }
         }
     }
@@ -132,52 +123,62 @@ pub mod error {
         }
     }
 }
+/// Adaptive decision engine for runtime parameter tuning (FEC, stealth, transport).
 pub mod brain;
+/// Packet compression utilities (LZ4/zstd integration for payload reduction).
 pub mod compress;
+/// Forward Error Correction - adaptive Reed-Solomon with PID controller and Kalman filter.
 pub mod fec;
+/// Test harness utilities for integration and property-based testing.
 pub mod harness;
+/// Tracing and span instrumentation for runtime observability.
 pub mod instrumentation;
+/// TUN/TAP interface management and platform-specific network device abstraction.
 pub mod interface;
+/// Runtime metrics collection - counters, gauges, and histograms for all subsystems.
 pub mod metrics;
-pub mod optimize;
+/// Performance optimization subsystem - memory pools, crypto planning, transport tuning.
+#[doc(hidden)]
+#[cfg(any(test, feature = "rust-tests"))]
+/// Browser/OS TLS fingerprint profile definitions (test-only).
 pub mod profile;
+/// TLS provider system - rustls integration with custom ClientHello and ALPN handling.
 pub mod qftls;
-pub mod reality; // REALITY FALLBACK (REVERSE PROXY)
-pub mod simd; // ULTRA-SOPHISTICATED CENTRALIZED SIMD!
+/// REALITY fallback reverse proxy for censorship-resistant server fronting.
+pub mod reality;
+/// Cryptographically secure random number generation with hardware entropy sources.
+pub mod rng;
+/// Centralized SIMD dispatch - x86 (SSE/AVX/AVX-512) and ARM (NEON) fast paths.
+pub mod simd;
+/// Stealth and obfuscation engine - traffic shaping, protocol mimicry, fingerprint rotation.
 pub mod stealth;
+/// Monotonic time source abstraction for consistent timing across platforms.
 pub mod time_source;
+/// QUIC transport layer - frames, packets, congestion control, recovery, and fast UDP paths.
 pub mod transport;
 
-// Unified Engine API
+/// Unified engine API - configuration, lifecycle, and high-level connection management.
 pub mod engine;
 
-// Production Implementations
+/// Production client and server implementations with platform-specific backends.
 pub mod implementations;
+
+/// Performance optimization - CPU detection, SIMD dispatch, memory pools, telemetry counters.
+pub mod optimize;
 
 // TLS Provider System (consolidated)
 // Compatibility aliases for existing paths.
-pub use qftls as tls_provider;
-pub use qftls as tls_combined;
-pub use qftls as RealTLS_rustls;
 
-// integration module removed; system initialization helpers are available via core/interface when needed
-
-// tests module was removed during consolidation
 pub use crate::stealth::tls_cover;
 // Telemetry module - consolidated from previous scattered modules
 pub mod telemetry {
     pub use crate::optimize::telemetry::*;
 }
 
-// Telemetry metrics alias for compatibility
-pub use telemetry as telemetry_metrics;
-
 // Global functions moved to optimize::telemetry module
 pub use crate::optimize::telemetry::{flush, update_memory_usage};
 
 // Re-export main types
-#[cfg(feature = "unsafe_rust")]
-pub use crate::optimize::r#unsafe::{UnsafeMemoryPool, UnsafePacket};
 pub use core::QuicFuscateConnection;
 pub use error::ConnectionError;
 // FEC types are re-exported from the fec module

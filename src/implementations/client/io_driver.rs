@@ -7,11 +7,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 
 use crate::core::QuicFuscateConnection;
 use crate::engine::EngineError;
-use crate::interface::{FastpathMode, TunInterface};
+use crate::interface::TunInterface;
 
 #[inline]
 fn profile_prefers_wide_batches(profile: crate::optimize::CpuProfile) -> bool {
@@ -91,19 +90,21 @@ pub struct IoDriverStatsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(target_os = "linux")]
 enum OutboundDispatch {
+    #[cfg(feature = "io_uring")]
+    IoUringBatch,
     SendmmsgBatch,
-    UringPerPacket,
     SocketPerPacket,
 }
 
 #[inline]
 #[cfg(target_os = "linux")]
-fn resolve_outbound_dispatch(mode: FastpathMode, _queued: usize) -> OutboundDispatch {
-    if !mode.allows_uring() && _queued > 1 {
-        return OutboundDispatch::SendmmsgBatch;
+fn resolve_outbound_dispatch(_queued: usize, _has_uring: bool) -> OutboundDispatch {
+    #[cfg(feature = "io_uring")]
+    if _queued > 1 && _has_uring {
+        return OutboundDispatch::IoUringBatch;
     }
-    if mode.allows_uring() {
-        OutboundDispatch::UringPerPacket
+    if _queued > 1 {
+        OutboundDispatch::SendmmsgBatch
     } else {
         OutboundDispatch::SocketPerPacket
     }
@@ -112,21 +113,41 @@ fn resolve_outbound_dispatch(mode: FastpathMode, _queued: usize) -> OutboundDisp
 #[cfg(target_os = "linux")]
 trait IoHotpathAdapter: Send + Sync {
     fn sendmmsg_batch(&self, socket_fd: i32, payloads: &[&[u8]]) -> Result<usize, String>;
-    fn try_send_connected(&self, socket_fd: i32, payload: &[u8]) -> Result<Option<usize>, String>;
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Default)]
-struct SystemIoHotpathAdapter;
+struct SystemIoHotpathAdapter {
+    acceleration_initialized: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for SystemIoHotpathAdapter {
+    fn default() -> Self {
+        Self { acceleration_initialized: AtomicBool::new(false) }
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl IoHotpathAdapter for SystemIoHotpathAdapter {
     fn sendmmsg_batch(&self, socket_fd: i32, payloads: &[&[u8]]) -> Result<usize, String> {
-        crate::optimize::zc_batch::sendmmsg(socket_fd, payloads)
-    }
+        if self
+            .acceleration_initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            // SAFETY: `socket_fd` is a valid open UDP socket fd passed in by the caller
+            // (`SystemIoHotpathAdapter` receives it from the IO driver which owns it).
+            // We call `into_raw_fd()` immediately after the acceleration init so the fd
+            // is not closed when `socket` is dropped; the driver retains ownership.
+            let socket = unsafe { std::net::UdpSocket::from_raw_fd(socket_fd) };
+            if let Err(e) = crate::transport::init_socket_acceleration(&socket) {
+                log::debug!("batch acceleration init failed: {}", e);
+            }
+            let _ = socket.into_raw_fd();
+        }
 
-    fn try_send_connected(&self, socket_fd: i32, payload: &[u8]) -> Result<Option<usize>, String> {
-        crate::transport::uring::try_send_connected(socket_fd, payload)
+        crate::optimize::zc_batch::sendmmsg(socket_fd, payloads).map_err(|e| e.to_string())
     }
 }
 
@@ -141,22 +162,6 @@ fn try_sendmmsg_batch(
         return Ok(0);
     }
     Ok(adapter.sendmmsg_batch(socket_fd, payloads)?.min(payloads.len()))
-}
-
-#[cfg(target_os = "linux")]
-fn try_send_uring_packet(
-    adapter: &dyn IoHotpathAdapter,
-    socket_fd: i32,
-    dispatch: OutboundDispatch,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if !matches!(dispatch, OutboundDispatch::UringPerPacket) {
-        return Ok(false);
-    }
-    match adapter.try_send_connected(socket_fd, payload)? {
-        Some(n) if n == payload.len() => Ok(true),
-        _ => Ok(false),
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -233,9 +238,13 @@ pub struct IoDriver {
     shutdown: Arc<AtomicBool>,
     stats: Arc<IoDriverStats>,
     #[cfg(target_os = "linux")]
-    fastpath_mode: FastpathMode,
-    #[cfg(target_os = "linux")]
     hotpath_adapter: Arc<dyn IoHotpathAdapter>,
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    uring_sender: parking_lot::Mutex<Option<crate::optimize::uring_batch::UringBatchSender>>,
+    /// Cached at construction: true when io_uring init succeeded.
+    /// Avoids a Mutex lock just to check availability on every hot-path iteration.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    uring_available: bool,
     wide_batch_cpu: bool,
 }
 
@@ -248,25 +257,30 @@ impl IoDriver {
 
     /// Create a new I/O driver.
     pub fn new(config: IoDriverConfig) -> Self {
-        let fastpath_mode = FastpathMode::from_env();
         #[cfg(target_os = "linux")]
         let hotpath_adapter: Arc<dyn IoHotpathAdapter> = Arc::new(SystemIoHotpathAdapter);
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        let (uring_sender, uring_available) = {
+            let sender = crate::optimize::uring_batch::UringBatchSender::with_defaults();
+            let available = sender.is_some();
+            if available {
+                log::info!("io_uring batch sender initialised");
+            }
+            (parking_lot::Mutex::new(sender), available)
+        };
         let profile = crate::optimize::FeatureDetector::instance().profile();
         crate::optimize::telemetry::publish_cpu_profile_mask(profile);
         let wide_batch_cpu = profile_prefers_wide_batches(profile);
-        if matches!(fastpath_mode, FastpathMode::Xdp) {
-            log::info!(
-                "QUICFUSCATE_FASTPATH=xdp requested; async client io_driver uses UDP/uring path and will fallback to UDP socket"
-            );
-        }
         Self {
             config,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(IoDriverStats::default()),
             #[cfg(target_os = "linux")]
-            fastpath_mode,
-            #[cfg(target_os = "linux")]
             hotpath_adapter,
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            uring_sender,
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            uring_available,
             wide_batch_cpu,
         }
     }
@@ -279,6 +293,14 @@ impl IoDriver {
         let mut driver = Self::new(config);
         driver.hotpath_adapter = hotpath_adapter;
         driver
+    }
+
+    /// True when io_uring was successfully initialised at construction.
+    /// Cached to avoid a Mutex lock on every hot-path iteration.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[inline(always)]
+    fn has_uring(&self) -> bool {
+        self.uring_available
     }
 
     /// Get shutdown signal.
@@ -359,7 +381,12 @@ impl IoDriver {
                     }
 
                     #[cfg(target_os = "linux")]
-                    let dispatch = resolve_outbound_dispatch(self.fastpath_mode, queued);
+                    let dispatch = {
+                        #[cfg(feature = "io_uring")]
+                        { resolve_outbound_dispatch(queued, self.has_uring()) }
+                        #[cfg(not(feature = "io_uring"))]
+                        { resolve_outbound_dispatch(queued, false) }
+                    };
                     #[cfg(target_os = "linux")]
                     let mut already_sent = 0usize;
                     #[cfg(not(target_os = "linux"))]
@@ -368,7 +395,36 @@ impl IoDriver {
                     {
                         use std::os::fd::AsRawFd;
                         let socket_fd = socket.as_raw_fd();
-                        if matches!(dispatch, OutboundDispatch::SendmmsgBatch) {
+
+                        // io_uring batch path (preferred when available).
+                        #[cfg(feature = "io_uring")]
+                        if matches!(dispatch, OutboundDispatch::IoUringBatch) {
+                            batch_refs.clear();
+                            for payload in batch_payloads.iter().take(queued) {
+                                batch_refs.push(payload.as_slice());
+                            }
+                            if let Ok(mut guard) = self.uring_sender.lock() {
+                                if let Some(ref mut uring) = *guard {
+                                    match uring.send_batch(socket_fd, &batch_refs) {
+                                        Ok(n) => {
+                                            already_sent = n.min(queued);
+                                            crate::telemetry::IO_URING_SUBMIT_PACKETS
+                                                .inc_by(already_sent as u64);
+                                        }
+                                        Err(e) => {
+                                            log::debug!(
+                                                "io_uring batch failed, falling back: {}",
+                                                e
+                                            );
+                                            crate::telemetry::IO_URING_FALLBACKS.inc();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // sendmmsg batch path (fallback from io_uring, or primary).
+                        if already_sent == 0 && queued > 1 {
                             batch_refs.clear();
                             for payload in batch_payloads.iter().take(queued) {
                                 batch_refs.push(payload.as_slice());
@@ -376,7 +432,7 @@ impl IoDriver {
                             match try_sendmmsg_batch(
                                 self.hotpath_adapter.as_ref(),
                                 socket_fd,
-                                dispatch,
+                                OutboundDispatch::SendmmsgBatch,
                                 &batch_refs,
                             ) {
                                 Ok(n) => {
@@ -394,40 +450,10 @@ impl IoDriver {
                     }
 
                     for payload in batch_payloads.iter().take(queued).skip(already_sent) {
-                        #[cfg(target_os = "linux")]
-                        let mut sent_ok = false;
-                        #[cfg(not(target_os = "linux"))]
-                        let sent_ok = false;
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::fd::AsRawFd;
-                            let socket_fd = socket.as_raw_fd();
-                            if matches!(dispatch, OutboundDispatch::UringPerPacket) {
-                                match try_send_uring_packet(
-                                    self.hotpath_adapter.as_ref(),
-                                    socket_fd,
-                                    dispatch,
-                                    payload,
-                                ) {
-                                    Ok(true) => {
-                                        sent_ok = true;
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        log::debug!("io_uring connected send fallback: {}", e);
-                                    }
-                                }
-                            } else if matches!(dispatch, OutboundDispatch::SocketPerPacket) {
-                                crate::optimize::telemetry::URING_FALLBACKS.inc();
-                            }
-                        }
-
-                        if !sent_ok {
-                            if let Err(e) = socket.send(payload).await {
-                                log::warn!("UDP send error: {}", e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
+                        if let Err(e) = socket.send(payload).await {
+                            log::warn!("UDP send error: {}", e);
+                            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
 
                         {
@@ -501,21 +527,46 @@ impl IoDriver {
     /// Run the inbound loop (QUIC -> TUN).
     ///
     /// Receives packets from UDP, processes through FEC/Stealth, writes to TUN.
+    /// On Linux with `io_uring` feature: uses a dedicated io_uring ring with
+    /// pre-posted RecvMsg SQEs and an eventfd bridge to Tokio.
     pub async fn run_inbound(
         &self,
         tun: Arc<parking_lot::Mutex<TunInterface>>,
         conn: Arc<parking_lot::Mutex<QuicFuscateConnection>>,
         socket: Arc<UdpSocket>,
+        handshake_event: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+    ) -> Result<(), EngineError> {
+        // Try io_uring recv path on Linux.
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        {
+            if let Some((mut uring_recv, async_efd)) = Self::try_init_uring_recv(&socket) {
+                return self
+                    .run_inbound_uring(tun, conn, handshake_event, &mut uring_recv, async_efd)
+                    .await;
+            }
+        }
+
+        // Fallback: standard Tokio recv path.
+        self.run_inbound_standard(tun, conn, socket, handshake_event)
+            .await
+    }
+
+    /// Standard inbound path using Tokio async recv + try_recv drain loop.
+    async fn run_inbound_standard(
+        &self,
+        tun: Arc<parking_lot::Mutex<TunInterface>>,
+        conn: Arc<parking_lot::Mutex<QuicFuscateConnection>>,
+        socket: Arc<UdpSocket>,
+        handshake_event: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
     ) -> Result<(), EngineError> {
         let mut recv_buf = vec![0u8; 65535];
         let mut stream_buf = vec![0u8; 65535];
         let batch_cap = self.normalized_batch_size();
         let mut inbound_batch: Vec<Vec<u8>> =
             (0..batch_cap).map(|_| Vec::with_capacity(2048)).collect();
+        let mut handshake_signaled = false;
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            // Async receive from UDP. We cannot block forever here, otherwise
-            // shutdown would hang while waiting for a packet.
             let recv = tokio::time::timeout(
                 tokio::time::Duration::from_millis(200),
                 socket.recv(&mut recv_buf),
@@ -565,73 +616,241 @@ impl IoDriver {
                             .fetch_add((queued - 1) as u64, Ordering::Relaxed);
                     }
 
-                    for payload in inbound_batch.iter().take(queued) {
-                        self.stats.udp_packets_received.fetch_add(1, Ordering::Relaxed);
+                    Self::process_inbound_batch(
+                        &self.stats, &conn, &tun, &mut stream_buf, &inbound_batch, queued,
+                    );
+                }
+                Ok(Ok(_)) => {}
+            }
 
-                        // Global metrics
-                        let global = crate::instrumentation::global();
-                        global.transport.record_bytes_in(payload.len() as u64);
-                        global.transport.record_packet_in();
+            if !handshake_signaled {
+                let established = { conn.lock().conn.is_established() };
+                if established {
+                    let (lock, cvar) = &*handshake_event;
+                    *lock.lock() = true;
+                    cvar.notify_all();
+                    handshake_signaled = true;
+                }
+            }
+        }
+        Ok(())
+    }
 
-                        {
-                            let mut conn_guard = conn.lock();
-                            if let Err(e) = conn_guard.recv(payload) {
-                                log::debug!("Connection recv error: {:?}", e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+    /// io_uring inbound path using pre-posted RecvMsg SQEs and eventfd bridge.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    async fn run_inbound_uring(
+        &self,
+        tun: Arc<parking_lot::Mutex<TunInterface>>,
+        conn: Arc<parking_lot::Mutex<QuicFuscateConnection>>,
+        handshake_event: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+        uring_recv: &mut crate::optimize::uring_batch::UringRecvBatch,
+        async_efd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    ) -> Result<(), EngineError> {
+        let mut stream_buf = vec![0u8; 65535];
+        let mut handshake_signaled = false;
 
-                        loop {
-                            let read_len = {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            // Wait for CQ notification via eventfd (with shutdown timeout).
+            let readable = tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                async_efd.readable(),
+            )
+            .await;
+
+            match readable {
+                Ok(Ok(mut guard)) => {
+                    // Clear the eventfd counter (read 8 bytes).
+                    let mut efd_buf = [0u8; 8];
+                    // SAFETY: `uring_recv.eventfd_fd()` returns the eventfd file descriptor
+                    // created inside `UringRecvBatch::with_defaults`. It is valid and open
+                    // for the lifetime of `uring_recv`. `efd_buf` is an 8-byte stack buffer
+                    // (the exact width mandated by the eventfd ABI). We request exactly 8
+                    // bytes, which is the only valid read size for an eventfd. The raw
+                    // pointer cast to `*mut c_void` is safe for a `[u8; 8]` stack array.
+                    let efd_ret = unsafe {
+                        libc::read(
+                            uring_recv.eventfd_fd(),
+                            efd_buf.as_mut_ptr() as *mut libc::c_void,
+                            8,
+                        )
+                    };
+                    if efd_ret < 0 {
+                        log::debug!(
+                            "eventfd read failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    guard.clear_ready();
+
+                    // Drain all completed receives.
+                    let completions = uring_recv.drain_completions().map_err(|e| {
+                        EngineError::Io(std::io::Error::new(e.kind(), format!("uring recv drain: {e}")))
+                    })?;
+
+                    if !completions.is_empty() {
+                        crate::telemetry::IO_URING_RECV_BATCHES.inc();
+                        crate::telemetry::IO_URING_RECV_PACKETS
+                            .inc_by(completions.len() as u64);
+
+                        for c in &completions {
+                            self.stats.udp_packets_received.fetch_add(1, Ordering::Relaxed);
+                            let global = crate::instrumentation::global();
+                            global.transport.record_bytes_in(c.data.len() as u64);
+                            global.transport.record_packet_in();
+
+                            {
                                 let mut conn_guard = conn.lock();
-                                match conn_guard.conn.dgram_recv(&mut stream_buf) {
-                                    Ok(read_len) if read_len > 0 => read_len,
-                                    Ok(_) => break,
-                                    Err(crate::error::ConnectionError::Done) => break,
-                                    Err(e) => {
-                                        log::debug!("Datagram recv error: {:?}", e);
-                                        break;
-                                    }
+                                if let Err(e) = conn_guard.recv(&c.data) {
+                                    log::debug!("Connection recv error: {:?}", e);
+                                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
                                 }
-                            };
+                            }
 
-                            let mut tun_guard = tun.lock();
-                            if let Err(e) = tun_guard.write_packet(&stream_buf[..read_len]) {
-                                log::warn!("TUN write error: {:?}", e);
-                                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                self.stats.tun_packets_written.fetch_add(1, Ordering::Relaxed);
+                            // Drain datagrams to TUN.
+                            loop {
+                                let read_len = {
+                                    let mut conn_guard = conn.lock();
+                                    match conn_guard.conn.dgram_recv(&mut stream_buf) {
+                                        Ok(n) if n > 0 => n,
+                                        Ok(_) => break,
+                                        Err(crate::error::ConnectionError::Done) => break,
+                                        Err(e) => {
+                                            log::debug!("Datagram recv error: {:?}", e);
+                                            break;
+                                        }
+                                    }
+                                };
+                                let mut tun_guard = tun.lock();
+                                if let Err(e) = tun_guard.write_packet(&stream_buf[..read_len]) {
+                                    log::warn!("TUN write error: {:?}", e);
+                                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    self.stats
+                                        .tun_packets_written
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
                 }
-                Ok(Ok(_)) => {
-                    // No data
+                Ok(Err(e)) => {
+                    log::warn!("AsyncFd error on uring recv eventfd: {}", e);
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    // Timeout - check shutdown, continue.
+                }
+            }
+
+            if !handshake_signaled {
+                let established = { conn.lock().conn.is_established() };
+                if established {
+                    let (lock, cvar) = &*handshake_event;
+                    *lock.lock() = true;
+                    cvar.notify_all();
+                    handshake_signaled = true;
                 }
             }
         }
-
         Ok(())
     }
-}
 
-/// Packet channel for inter-task communication.
-#[allow(dead_code)]
-pub struct PacketChannel {
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: mpsc::Receiver<Vec<u8>>,
-}
+    /// Try to initialise io_uring recv batch on the socket fd.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    fn try_init_uring_recv(
+        socket: &Arc<UdpSocket>,
+    ) -> Option<(
+        crate::optimize::uring_batch::UringRecvBatch,
+        tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    )> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-impl PacketChannel {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(buffer_size: usize) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
-        mpsc::channel(buffer_size)
+        let socket_fd = socket.as_raw_fd();
+        let mut uring_recv =
+            crate::optimize::uring_batch::UringRecvBatch::with_defaults(socket_fd, false)?;
+
+        if uring_recv.post_initial().is_err() {
+            log::debug!("io_uring recv post_initial failed");
+            return None;
+        }
+
+        // dup() the eventfd so AsyncFd can take ownership of the copy
+        // while UringRecvBatch retains the original (both sides close safely).
+        // SAFETY: `uring_recv.eventfd_fd()` returns a valid open eventfd descriptor for
+        // the lifetime of `uring_recv`. `dup()` creates a new independent fd referring to
+        // the same underlying kernel object; the original is unaffected. We check for < 0
+        // (error) before using `efd_dup`.
+        let efd_dup = unsafe { libc::dup(uring_recv.eventfd_fd()) };
+        if efd_dup < 0 {
+            log::debug!("eventfd dup failed");
+            return None;
+        }
+        // SAFETY: `efd_dup` is the freshly duplicated file descriptor obtained from the
+        // successful `libc::dup()` call above. It is a valid, open fd that we have just
+        // created, so we are taking its sole ownership here. `OwnedFd` will close it on
+        // drop; the original eventfd in `uring_recv` is separately managed.
+        let owned_efd = unsafe { OwnedFd::from_raw_fd(efd_dup) };
+        let async_efd = tokio::io::unix::AsyncFd::new(owned_efd).ok()?;
+
+        log::info!("io_uring recv batch initialised (eventfd bridge active)");
+        crate::telemetry::IO_URING_RECV_ACTIVE
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        Some((uring_recv, async_efd))
+    }
+
+    /// Process a batch of received inbound packets through the QUIC connection and TUN.
+    fn process_inbound_batch(
+        stats: &Arc<IoDriverStats>,
+        conn: &Arc<parking_lot::Mutex<QuicFuscateConnection>>,
+        tun: &Arc<parking_lot::Mutex<TunInterface>>,
+        stream_buf: &mut [u8],
+        batch: &[Vec<u8>],
+        count: usize,
+    ) {
+        for payload in batch.iter().take(count) {
+            stats.udp_packets_received.fetch_add(1, Ordering::Relaxed);
+            let global = crate::instrumentation::global();
+            global.transport.record_bytes_in(payload.len() as u64);
+            global.transport.record_packet_in();
+
+            {
+                let mut conn_guard = conn.lock();
+                if let Err(e) = conn_guard.recv(payload) {
+                    log::debug!("Connection recv error: {:?}", e);
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            loop {
+                let read_len = {
+                    let mut conn_guard = conn.lock();
+                    match conn_guard.conn.dgram_recv(stream_buf) {
+                        Ok(n) if n > 0 => n,
+                        Ok(_) => break,
+                        Err(crate::error::ConnectionError::Done) => break,
+                        Err(e) => {
+                            log::debug!("Datagram recv error: {:?}", e);
+                            break;
+                        }
+                    }
+                };
+                let mut tun_guard = tun.lock();
+                if let Err(e) = tun_guard.write_packet(&stream_buf[..read_len]) {
+                    log::warn!("TUN write error: {:?}", e);
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.tun_packets_written.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::FastpathMode;
 
     #[test]
     fn test_io_driver_config_default() {
@@ -661,19 +880,9 @@ mod tests {
 
     #[test]
     fn test_fastpath_mode_parse() {
-        assert_eq!(FastpathMode::parse("off"), FastpathMode::Off);
-        assert_eq!(FastpathMode::parse("uring"), FastpathMode::Uring);
-        assert_eq!(FastpathMode::parse("xdp"), FastpathMode::Xdp);
         assert_eq!(FastpathMode::parse("auto"), FastpathMode::Auto);
+        assert_eq!(FastpathMode::parse("off"), FastpathMode::Off);
         assert_eq!(FastpathMode::parse("unknown"), FastpathMode::Auto);
-    }
-
-    #[test]
-    fn test_fastpath_mode_allows_uring() {
-        assert!(FastpathMode::Uring.allows_uring());
-        assert!(FastpathMode::Auto.allows_uring());
-        assert!(!FastpathMode::Off.allows_uring());
-        assert!(!FastpathMode::Xdp.allows_uring());
     }
 
     #[test]
@@ -692,45 +901,35 @@ mod tests {
     fn test_resolve_outbound_dispatch_paths() {
         #[cfg(target_os = "linux")]
         {
-            assert_eq!(
-                resolve_outbound_dispatch(FastpathMode::Uring, 8),
-                OutboundDispatch::UringPerPacket
-            );
-            assert_eq!(
-                resolve_outbound_dispatch(FastpathMode::Auto, 8),
-                OutboundDispatch::UringPerPacket
-            );
-            assert_eq!(
-                resolve_outbound_dispatch(FastpathMode::Off, 1),
-                OutboundDispatch::SocketPerPacket
-            );
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                resolve_outbound_dispatch(FastpathMode::Off, 8),
-                OutboundDispatch::SendmmsgBatch
-            );
+            // Without io_uring available.
+            assert_eq!(resolve_outbound_dispatch(1, false), OutboundDispatch::SocketPerPacket);
+            assert_eq!(resolve_outbound_dispatch(8, false), OutboundDispatch::SendmmsgBatch);
+
+            // With io_uring available (feature-gated variant).
+            #[cfg(feature = "io_uring")]
+            {
+                assert_eq!(resolve_outbound_dispatch(1, true), OutboundDispatch::SocketPerPacket);
+                assert_eq!(resolve_outbound_dispatch(8, true), OutboundDispatch::IoUringBatch);
+            }
+
+            // has_uring=true without feature compiles to sendmmsg.
+            #[cfg(not(feature = "io_uring"))]
+            assert_eq!(resolve_outbound_dispatch(8, true), OutboundDispatch::SendmmsgBatch);
         }
     }
 
     #[cfg(target_os = "linux")]
     struct MockHotpathAdapter {
         sendmmsg_result: std::sync::Mutex<Result<usize, String>>,
-        uring_result: std::sync::Mutex<Result<Option<usize>, String>>,
         sendmmsg_calls: AtomicU64,
-        uring_calls: AtomicU64,
     }
 
     #[cfg(target_os = "linux")]
     impl MockHotpathAdapter {
-        fn new(
-            sendmmsg_result: Result<usize, String>,
-            uring_result: Result<Option<usize>, String>,
-        ) -> Self {
+        fn new(sendmmsg_result: Result<usize, String>) -> Self {
             Self {
                 sendmmsg_result: std::sync::Mutex::new(sendmmsg_result),
-                uring_result: std::sync::Mutex::new(uring_result),
                 sendmmsg_calls: AtomicU64::new(0),
-                uring_calls: AtomicU64::new(0),
             }
         }
     }
@@ -741,21 +940,12 @@ mod tests {
             self.sendmmsg_calls.fetch_add(1, Ordering::Relaxed);
             self.sendmmsg_result.lock().map_err(|e| e.to_string())?.clone()
         }
-
-        fn try_send_connected(
-            &self,
-            _socket_fd: i32,
-            _payload: &[u8],
-        ) -> Result<Option<usize>, String> {
-            self.uring_calls.fetch_add(1, Ordering::Relaxed);
-            self.uring_result.lock().map_err(|e| e.to_string())?.clone()
-        }
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_try_sendmmsg_batch_uses_adapter_and_caps_result() {
-        let adapter = MockHotpathAdapter::new(Ok(99), Ok(None));
+        let adapter = MockHotpathAdapter::new(Ok(99));
         let payloads = vec![&b"one"[..], &b"two"[..], &b"three"[..]];
 
         let sent = try_sendmmsg_batch(&adapter, 0, OutboundDispatch::SendmmsgBatch, &payloads)
@@ -768,7 +958,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_try_sendmmsg_batch_skips_non_sendmmsg_dispatch() {
-        let adapter = MockHotpathAdapter::new(Ok(1), Ok(None));
+        let adapter = MockHotpathAdapter::new(Ok(1));
         let payloads = vec![&b"one"[..], &b"two"[..]];
 
         let sent = try_sendmmsg_batch(&adapter, 0, OutboundDispatch::SocketPerPacket, &payloads)
@@ -780,24 +970,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_try_send_uring_packet_requires_full_datagram_send() {
-        let payload = b"payload";
-        let adapter_ok = MockHotpathAdapter::new(Ok(0), Ok(Some(payload.len())));
-        let sent = try_send_uring_packet(&adapter_ok, 0, OutboundDispatch::UringPerPacket, payload)
-            .expect("uring send");
-        assert!(sent);
-
-        let adapter_partial = MockHotpathAdapter::new(Ok(0), Ok(Some(payload.len() - 1)));
-        let sent =
-            try_send_uring_packet(&adapter_partial, 0, OutboundDispatch::UringPerPacket, payload)
-                .expect("uring send");
-        assert!(!sent);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
     fn test_with_hotpath_adapter_uses_custom_adapter() {
-        let custom_impl = Arc::new(MockHotpathAdapter::new(Ok(2), Ok(None)));
+        let custom_impl = Arc::new(MockHotpathAdapter::new(Ok(2)));
         let custom: Arc<dyn IoHotpathAdapter> = custom_impl.clone();
         let driver = IoDriver::with_hotpath_adapter(IoDriverConfig::default(), custom);
         let payloads = vec![&b"one"[..], &b"two"[..]];

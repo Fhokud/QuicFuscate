@@ -62,12 +62,22 @@ fn telemetry_counters_snapshot() {
         base_len,
         len
     );
-    assert!(
-        pattern_neon > base_pattern_neon,
-        "expected PATTERN_NEON_OPS to increase ({} -> {})",
-        base_pattern_neon,
-        pattern_neon
-    );
+    // NEON is only available on aarch64; on x86_64 the counter stays at zero.
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            pattern_neon > base_pattern_neon,
+            "expected PATTERN_NEON_OPS to increase on aarch64 ({} -> {})",
+            base_pattern_neon,
+            pattern_neon
+        );
+    } else {
+        assert!(
+            pattern_neon >= base_pattern_neon,
+            "PATTERN_NEON_OPS should be monotonic on non-aarch64 ({} -> {})",
+            base_pattern_neon,
+            pattern_neon
+        );
+    }
 
     // SVE2 may be unavailable on the current host; record the observed value for telemetry audit.
     println!(

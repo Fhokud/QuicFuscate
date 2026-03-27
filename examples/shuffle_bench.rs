@@ -120,7 +120,7 @@ fn main() {
 }
 
 fn scalar_shuffle(data: &mut [u32]) {
-    data.shuffle(&mut rand::thread_rng());
+    data.shuffle(&mut rand::rng());
 }
 
 fn bytes_per_second(total_bytes: u64, duration: Duration) -> f64 {

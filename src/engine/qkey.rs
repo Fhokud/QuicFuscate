@@ -11,10 +11,7 @@
 //! QKey-eyJyZW1vdGUiOiIxOTIuMTY4LjEuMTo0NDMzIiwic25pIjoiZXhhbXBsZS5jb20iLCJtZDUiOiJhM2YyYjhjOSJ9
 //! ```
 
-use base64::{
-    engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as BASE64_URLSAFE},
-    Engine as _,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URLSAFE, Engine as _};
 use serde::{Deserialize, Serialize};
 
 /// QKey prefix
@@ -161,26 +158,16 @@ impl QKeyConfig {
 
     /// Validate the checksum.
     pub fn validate(&self) -> bool {
-        if self.md5.trim().is_empty() {
+        let chk = self.md5.trim();
+        let Some(rest) = chk.strip_prefix("s256:") else {
+            return false;
+        };
+        if !Self::is_hex8(rest) {
             return false;
         }
         let data = self.checksum_data();
-        let chk = self.md5.trim();
-        if let Some(rest) = chk.strip_prefix("s256:") {
-            if !Self::is_hex8(rest) {
-                return false;
-            }
-            let expected = Self::sha256_prefix8_hex(data.as_bytes());
-            rest.eq_ignore_ascii_case(&expected)
-        } else {
-            // Legacy checksum: first 8 hex chars of MD5.
-            if !Self::is_hex8(chk) {
-                return false;
-            }
-            let hash = md5::compute(data.as_bytes());
-            let expected = format!("{:x}", hash)[..8].to_string();
-            chk.eq_ignore_ascii_case(&expected)
-        }
+        let expected = Self::sha256_prefix8_hex(data.as_bytes());
+        rest.eq_ignore_ascii_case(&expected)
     }
 }
 
@@ -213,11 +200,7 @@ pub fn parse(qkey: &str) -> Result<QKeyConfig, QKeyError> {
     // Extract base64 part
     let encoded = rest;
 
-    // Decode base64 (accept both URL-safe and standard for backward compatibility).
-    let decoded = BASE64_URLSAFE
-        .decode(encoded)
-        .or_else(|_| BASE64_STD.decode(encoded))
-        .map_err(|_| QKeyError::InvalidBase64)?;
+    let decoded = BASE64_URLSAFE.decode(encoded).map_err(|_| QKeyError::InvalidBase64)?;
 
     if decoded.len() > MAX_DECODED_JSON_BYTES {
         return Err(QKeyError::TooLarge);
@@ -264,15 +247,16 @@ impl From<&crate::engine::EngineConfig> for QKeyConfig {
     fn from(cfg: &crate::engine::EngineConfig) -> Self {
         let stealth = match cfg.stealth.mode {
             crate::engine::StealthMode::Off => None,
-            crate::engine::StealthMode::Auto => Some("auto".to_string()),
-            crate::engine::StealthMode::Max => Some("max".to_string()),
+            crate::engine::StealthMode::Performance => Some("performance".to_string()),
+            crate::engine::StealthMode::Stealth => Some("stealth".to_string()),
+            crate::engine::StealthMode::AntiDpi => Some("anti-dpi".to_string()),
             crate::engine::StealthMode::Manual => Some("manual".to_string()),
+            crate::engine::StealthMode::Auto => Some("auto".to_string()),
         };
 
         let fec = match cfg.fec.mode {
             crate::engine::FecMode::Off => None,
             crate::engine::FecMode::Auto => Some("auto".to_string()),
-            crate::engine::FecMode::Manual => Some("manual".to_string()),
         };
 
         let mut qkey = QKeyConfig::new(&cfg.connection.remote, &cfg.connection.sni);
@@ -341,32 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn test_qkey_legacy_md5_is_still_accepted() {
-        let mut config = QKeyConfig {
-            remote: "legacy.example.com:4433".to_string(),
-            sni: "legacy-sni.example.com".to_string(),
-            stealth: None,
-            fec: None,
-            extra: None,
-            token: None,
-            md5: String::new(),
-        };
-        // Force legacy checksum
-        let data = config.checksum_data();
-        let hash = md5::compute(data.as_bytes());
-        config.md5 = format!("{:x}", hash)[..8].to_string();
-
-        let json = serde_json::to_string(&config).unwrap();
-        let encoded = BASE64_URLSAFE.encode(json.as_bytes());
-        let qkey = format!("{}{}", QKEY_PREFIX, encoded);
-
-        let parsed = parse(&qkey).unwrap();
-        assert_eq!(parsed.remote, config.remote);
-        assert_eq!(parsed.sni, config.sni);
-        assert!(parsed.validate());
-    }
-
-    #[test]
     fn test_qkey_prefix_is_case_insensitive_and_trimmed() {
         let config = QKeyConfig::new("192.168.1.1:4433", "example.com");
         let qkey = generate(&config);
@@ -401,19 +359,6 @@ mod tests {
         assert!(qkey.len() < 200);
         println!("QKey length: {} chars", qkey.len());
         println!("QKey: {}", qkey);
-    }
-
-    #[test]
-    fn test_parse_accepts_standard_base64_legacy() {
-        // Simulate a legacy key generated with standard base64 (may include '=' padding).
-        let config = QKeyConfig::new("legacy.example.com:4433", "legacy-sni.example.com");
-        let json = serde_json::to_string(&config).unwrap();
-        let encoded = BASE64_STD.encode(json.as_bytes());
-        let qkey = format!("{}{}", QKEY_PREFIX, encoded);
-
-        let parsed = parse(&qkey).unwrap();
-        assert_eq!(parsed.remote, "legacy.example.com:4433");
-        assert_eq!(parsed.sni, "legacy-sni.example.com");
     }
 
     #[test]

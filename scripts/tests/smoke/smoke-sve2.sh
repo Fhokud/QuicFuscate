@@ -11,10 +11,9 @@ OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR]"; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac
   shift
 done
@@ -47,7 +46,7 @@ run_test() {
 
 run_test simd-selfcheck run_cargo test --features simd-selfcheck,rust-tests --test rt-simd-selfcheck
 run_test telemetry run_cargo test --features rust-tests --test rt-telemetry-counters
-run_test quic-stream run_cargo test --lib quic_stream_parse
+run_test sve2-varint run_cargo test --lib test_sve2_varint_roundtrip
 
 json_end "$JSON"
 info "all SVE2 smoke tests completed successfully"

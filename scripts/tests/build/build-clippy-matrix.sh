@@ -64,7 +64,7 @@ echo "[INFO] Running clippy matrix..."
 echo ""
 
 run_clippy_check "" "Base configuration"
-run_clippy_check "--features wiedemann" "Wiedemann"
+run_clippy_check "--features internal_wiedemann" "Internal Wiedemann"
 run_clippy_check "--features unsafe_rust" "Unsafe Rust"
 run_clippy_check "--features unsafe_rust,compression_zstd_ffi" "Unsafe Rust + Zstd FFI"
 run_clippy_check "--features simd-selfcheck" "SIMD self-check"

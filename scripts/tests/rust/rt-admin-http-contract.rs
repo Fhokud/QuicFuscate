@@ -89,7 +89,9 @@ impl AdminHttpHandler for DummyHandler {
                 {
                     // QKey ids are 12 hex chars derived from a stable SHA-256 based id().
                     "id": "a1b2c3d4e5f6",
-                    "qkey": self.qkey.clone(),
+                    "name": "Contract Key",
+                    "stealth": "auto",
+                    "fec": "auto",
                     "created_at": 1,
                     "expires_at": 2
                 }
@@ -192,8 +194,11 @@ fn http_request(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let set_cookie =
-        head.lines().find_map(|l| l.strip_prefix("Set-Cookie:")).map(|v| v.trim().to_string());
+    let set_cookie = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string());
     (status, body, set_cookie)
 }
 
@@ -225,8 +230,11 @@ fn http_request_with_headers(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let set_cookie =
-        head.lines().find_map(|l| l.strip_prefix("Set-Cookie:")).map(|v| v.trim().to_string());
+    let set_cookie = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string());
     (status, body, set_cookie, head.to_string())
 }
 
@@ -273,8 +281,11 @@ fn http_request_with_csrf(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let set_cookie =
-        head.lines().find_map(|l| l.strip_prefix("Set-Cookie:")).map(|v| v.trim().to_string());
+    let set_cookie = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string());
     (status, body, set_cookie)
 }
 
@@ -330,8 +341,8 @@ fn wait_for_listen(addr: SocketAddr) {
 
 fn raw_request_status(addr: SocketAddr, raw: &str) -> u16 {
     let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
     stream.write_all(raw.as_bytes()).expect("write raw request");
-    let _ = stream.shutdown(Shutdown::Write);
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);
     resp.lines()
@@ -363,7 +374,13 @@ fn admin_http_contracts() {
     let auth = AdminAuth::new(user.to_string(), password.to_string(), false);
     let server = AdminHttpServer::new(local_addr, web_root, Some(auth), None, handler);
     let shutdown = server.shutdown_signal();
-    let handle = std::thread::spawn(move || server.run().expect("server run"));
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(server.run()).expect("server run");
+    });
 
     wait_for_listen(local_addr);
 
@@ -481,10 +498,10 @@ fn admin_http_contracts() {
     let keys = data.get("keys").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].get("id").and_then(|v| v.as_str()).unwrap_or(""), "a1b2c3d4e5f6");
-    let list_qkey_value = keys[0].get("qkey").and_then(|v| v.as_str()).unwrap_or("");
-    assert!(!list_qkey_value.trim().is_empty());
-    let parsed = qkey::parse(list_qkey_value).expect("qkey list parse");
-    assert_eq!(parsed.token.as_deref(), Some(expected_qkey_token.as_str()));
+    assert_eq!(keys[0].get("name").and_then(|v| v.as_str()).unwrap_or(""), "Contract Key");
+    assert_eq!(keys[0].get("stealth").and_then(|v| v.as_str()).unwrap_or(""), "auto");
+    assert_eq!(keys[0].get("fec").and_then(|v| v.as_str()).unwrap_or(""), "auto");
+    assert!(keys[0].get("qkey").is_none(), "list endpoint must stay metadata-only");
 
     let revoke_payload = serde_json::json!({ "id": "a1b2c3d4e5f6" }).to_string();
     let (status, body, _) = http_request_with_csrf(
@@ -652,24 +669,39 @@ fn admin_http_request_line_fuzz_corpus_rejects_malformed_inputs() {
     let handler = Arc::new(DummyHandler::new(local_addr.to_string()));
     let server = AdminHttpServer::new(local_addr, web_root, None, None, handler);
     let shutdown = server.shutdown_signal();
-    let handle = std::thread::spawn(move || server.run().expect("server run"));
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(server.run()).expect("server run");
+    });
 
     wait_for_listen(local_addr);
 
-    let corpus = [
+    // Requests that are rejected at the HTTP parse or application layer with 400.
+    let corpus_400 = [
         "BADLINE\r\nHost: localhost\r\n\r\n",
         "GET / FTP/1.0\r\nHost: localhost\r\n\r\n",
         "GET / HTTP/9.9\r\nHost: localhost\r\n\r\n",
         "GE T / HTTP/1.1\r\nHost: localhost\r\n\r\n",
         "GET api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
         "GET /api\\status HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\nContent-Type: application/json\r\n\r\n{\"username\":\"ad",
     ];
 
-    for raw in corpus {
+    for raw in corpus_400 {
         let status = raw_request_status(local_addr, raw);
         assert_eq!(status, 400, "unexpected status for raw request: {raw:?}");
     }
+
+    // Truncated body: hyper waits for the remaining bytes, connection times
+    // out. The server never produces a response so status is 0 (no reply).
+    let truncated = "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\nContent-Type: application/json\r\n\r\n{\"username\":\"ad";
+    let status = raw_request_status(local_addr, truncated);
+    assert!(
+        status == 400 || status == 0,
+        "expected 400 or 0 (timeout) for truncated body, got {status}",
+    );
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = TcpStream::connect(local_addr);

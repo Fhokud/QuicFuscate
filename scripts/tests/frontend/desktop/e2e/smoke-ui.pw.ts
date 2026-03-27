@@ -1,8 +1,13 @@
 import { test, expect } from "@playwright/test";
 
+async function waitForHydration(page: any) {
+  await expect(page.locator('#qf-app-stage[data-hydrated="true"]')).toBeVisible();
+}
+
 test.describe("Desktop UI Smoke", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
+    await waitForHydration(page);
   });
 
   test("full interaction smoke [navigation, toggles, dropdowns, pages]", async ({ page }) => {
@@ -13,8 +18,8 @@ test.describe("Desktop UI Smoke", () => {
     await expect(nav.getByRole("button", { name: "About", exact: true })).toBeVisible();
 
     await nav.getByRole("button", { name: "Tunnels", exact: true }).click();
-    await expect(page.getByRole("button", { name: "Create" }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: "Import QKey" }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "Open tunnel composer", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Open QKey vault", exact: true })).toBeVisible();
 
     await nav.getByRole("button", { name: "Configuration", exact: true }).click();
     await expect(page.getByRole("main").getByText("Configuration", { exact: true })).toBeVisible();
@@ -28,7 +33,7 @@ test.describe("Desktop UI Smoke", () => {
     const after = await firstSwitch.getAttribute("aria-checked");
     expect(after).not.toBe(before);
 
-    const logLevel = page.locator("[aria-label='Log level']").first();
+    const logLevel = page.getByRole("button", { name: /^Log level / });
     await logLevel.click();
     await page.waitForTimeout(120);
     await page.locator("[role='option']").filter({ hasText: /^debug$/ }).first().click();
@@ -44,4 +49,3 @@ test.describe("Desktop UI Smoke", () => {
     await expect(page.getByText("Rust + Tokio")).toBeVisible();
   });
 });
-

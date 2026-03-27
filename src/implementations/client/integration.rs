@@ -30,12 +30,6 @@ impl MockServer {
         }
     }
 
-    /// Get the bind address.
-    #[allow(dead_code)]
-    pub fn bind_addr(&self) -> SocketAddr {
-        self.bind_addr
-    }
-
     /// Get shutdown signal.
     pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
         self.shutdown.clone()
@@ -176,12 +170,6 @@ impl TestHarness {
                 MockServer { bind_addr, shutdown, packets_received: packets_recv, packets_sent };
             server.run_echo().await
         }));
-    }
-
-    /// Get the server address.
-    #[allow(dead_code)]
-    pub fn server_addr(&self) -> SocketAddr {
-        self.server.bind_addr
     }
 
     /// Create a test client.

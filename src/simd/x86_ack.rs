@@ -5,7 +5,7 @@
 use std::arch::x86_64::*;
 
 #[inline]
-pub unsafe fn canonical_ack_blocks_avx2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(super) unsafe fn canonical_ack_blocks_avx2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     if ranges.is_empty() {
         return Vec::new();
     }
@@ -38,10 +38,18 @@ pub unsafe fn canonical_ack_blocks_avx2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)
             let mut max_candidate = current_end;
 
             while local + 4 <= len {
+                // SAFETY: `local + 4 <= len` guarantees at least 4 contiguous u64
+                // elements starting at `starts[local]`. Each u64 is 8 bytes, so the
+                // 32-byte AVX2 load from `s_ptr` reads exactly 4 * 8 = 32 bytes within
+                // the Vec allocation. `_mm256_loadu_si256` does not require alignment.
                 let s_ptr = starts.as_ptr().add(local) as *const __m256i;
                 let s_vec = _mm256_loadu_si256(s_ptr);
                 let end_bcast = _mm256_set1_epi64x(current_end as i64);
                 let gt = _mm256_cmpgt_epi64(s_vec, end_bcast);
+                // SAFETY: `__m256i` and `__m256d` have identical size (32 bytes) and
+                // alignment (32 bytes). The transmute reinterprets the comparison
+                // bitmask for `_mm256_movemask_pd` which expects `__m256d`. No value
+                // semantics change - only the lane type interpretation differs.
                 let gt_pd = core::mem::transmute::<__m256i, __m256d>(gt);
                 let mask = _mm256_movemask_pd(gt_pd) as u32; // 1 if start > end
                 let le_mask = (!mask) & 0xF;
@@ -50,8 +58,13 @@ pub unsafe fn canonical_ack_blocks_avx2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)
                 }
                 let count = le_mask.trailing_ones().min(4);
 
+                // SAFETY: Same bounds reasoning as `s_ptr` above - `local + 4 <= len`
+                // guarantees 4 contiguous u64 elements at `ends[local]`.
                 let e_ptr = ends.as_ptr().add(local) as *const __m256i;
                 let e_vec = _mm256_loadu_si256(e_ptr);
+                // SAFETY: `__m256i` (32 bytes) has the same size and layout as
+                // `[u64; 4]` (4 * 8 = 32 bytes). The transmute extracts lane values
+                // for scalar comparison. All bit patterns are valid for u64.
                 let mut tmp: [u64; 4] = core::mem::transmute(e_vec);
                 let mut local_max = max_candidate;
                 for lane in 0..(count as usize) {
@@ -90,7 +103,7 @@ pub unsafe fn canonical_ack_blocks_avx2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)
 }
 
 #[target_feature(enable = "avx512f", enable = "avx512vl")]
-pub unsafe fn canonical_ack_blocks_avx512(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(super) unsafe fn canonical_ack_blocks_avx512(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     if ranges.is_empty() {
         return Vec::new();
     }
@@ -122,6 +135,10 @@ pub unsafe fn canonical_ack_blocks_avx512(ranges: &[(u64, u64)]) -> Vec<(u64, u6
             let mut max_candidate = current_end;
 
             while local + 8 <= len {
+                // SAFETY: `local + 8 <= len` guarantees 8 contiguous u64 elements at
+                // `starts[local]`. Each u64 is 8 bytes, so the 64-byte AVX-512 load
+                // reads exactly 8 * 8 = 64 bytes within the Vec allocation.
+                // `_mm512_loadu_si512` does not require alignment.
                 let s_ptr = starts.as_ptr().add(local) as *const __m512i;
                 let s_vec = _mm512_loadu_si512(s_ptr);
                 let end_bcast = _mm512_set1_epi64(current_end as i64);
@@ -133,8 +150,13 @@ pub unsafe fn canonical_ack_blocks_avx512(ranges: &[(u64, u64)]) -> Vec<(u64, u6
                 }
                 let count = le_mask.trailing_zeros().min(8);
 
+                // SAFETY: Same bounds reasoning as `s_ptr` above - `local + 8 <= len`
+                // guarantees 8 contiguous u64 elements at `ends[local]`.
                 let e_ptr = ends.as_ptr().add(local) as *const __m512i;
                 let e_vec = _mm512_loadu_si512(e_ptr);
+                // SAFETY: `__m512i` (64 bytes) has the same size and layout as
+                // `[u64; 8]` (8 * 8 = 64 bytes). The transmute extracts lane values
+                // for scalar max-finding. All bit patterns are valid for u64.
                 let mut tmp: [u64; 8] = core::mem::transmute(e_vec);
                 let mut local_max = max_candidate;
                 for lane in 0..(count as usize) {

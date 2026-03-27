@@ -1,35 +1,35 @@
-// Legacy compat, redirects to udpfast/uring (inline)
-// Fast-path transport implementations
-// UDP batching, io_uring, GSO/GRO optimizations
+// XDP (AF_XDP) Runtime Path - REMOVED
+//
+// XDP was evaluated as a kernel-bypass receive/transmit path but was removed as a
+// runtime transport. This file retains only:
+//   1. Compatibility type definitions behind `internal_af_xdp_experimental` feature gate
+//   2. GSO/GRO segmentation helpers used by tests
+//
+// The feature gate `internal_af_xdp_experimental` prevents any runtime usage - these
+// types are never compiled into release builds. They exist solely for architectural
+// reference and test compatibility.
+//
+// For production fast-path transport, use:
+//   - `UdpFastPath`       (src/transport/udpfast.rs) - cross-platform UDP batching
 
-#[cfg(all(target_os = "linux", feature = "uring_sys"))]
-use super::uring::*;
 #[cfg(target_os = "linux")]
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::ptr;
+#[cfg(all(target_os = "linux", feature = "internal_af_xdp_experimental"))]
 use std::sync::Arc;
 
-use crate::optimize::{prefetch, PrefetchHint};
-
-// UDP fast path re-export
-#[cfg(feature = "uring_sys")]
-pub use crate::transport::udpfast::*;
-
-#[cfg(all(target_os = "linux", feature = "uring_sys"))]
-pub use super::uring::*;
-
-// Legacy compatibility module (empty)
-#[cfg(target_os = "linux")]
-pub mod linux {
+// Experimental AF_XDP implementation kept behind an explicit feature gate.
+#[cfg(all(target_os = "linux", feature = "internal_af_xdp_experimental"))]
+pub(super) mod linux {
     use super::*;
     use libc::c_void;
 
     const XDP_RING_SIZE: u32 = 2048;
 
-    // Legacy XDP structures removed - using pure UDP/io_uring
+    // AF_XDP structs retained only for the explicit experimental implementation.
     #[repr(C)]
     pub struct SockaddrXdp {
         pub sxdp_family: u16,
@@ -67,8 +67,10 @@ pub mod linux {
         }
     }
 
-    // XDP removed - use UdpFastPath or IoUringTransport instead
+    // XDP runtime path removed. These struct definitions are retained only for the
+    // experimental feature gate. Use UdpFastPath or UringBatchSender for production.
 
+    #[allow(dead_code)]
     pub struct UmemArea {
         pub(crate) addr: *mut u8,
         pub(crate) size: usize,
@@ -76,7 +78,7 @@ pub mod linux {
         pub(crate) frame_count: usize,
     }
 
-    pub struct XdpSocket {
+    pub(super) struct XdpSocket {
         pub(crate) fd: i32,
         pub(crate) umem: Arc<UmemArea>,
         pub(crate) rx_ring: XdpRing,
@@ -86,7 +88,7 @@ pub mod linux {
     }
 
     impl XdpSocket {
-        pub fn new(
+        pub(super) fn new(
             ifindex: u32,
             queue_id: u32,
             frame_size: usize,
@@ -251,400 +253,8 @@ pub mod linux {
     }
 }
 
-// =========================== io_uring UDP Fast Path ===========================
-#[cfg(all(target_os = "linux", feature = "uring_sys"))]
-pub mod uring_udp {
-    use super::*;
-    use io_uring::{opcode, types, IoUring};
-    use libc::{c_void, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
-    use std::io;
-    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-
-    const BUFFER_GROUP_ID: u16 = 0;
-    const BUFFER_SIZE: usize = 4096;
-    const BUFFER_COUNT: usize = 64;
-
-    fn to_raw_sockaddr(
-        addr: &SocketAddr,
-        storage: &mut libc::sockaddr_storage,
-    ) -> (usize, *const sockaddr) {
-        unsafe {
-            std::ptr::write_bytes(
-                storage as *mut _ as *mut u8,
-                0,
-                std::mem::size_of::<libc::sockaddr_storage>(),
-            )
-        };
-        match addr {
-            SocketAddr::V4(v4) => {
-                let mut s: sockaddr_in = unsafe { std::mem::zeroed() };
-                s.sin_family = libc::AF_INET as u16;
-                s.sin_port = v4.port().to_be();
-                s.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &s as *const _ as *const u8,
-                        storage as *const _ as *mut u8,
-                        std::mem::size_of::<sockaddr_in>(),
-                    )
-                };
-                (std::mem::size_of::<sockaddr_in>(), storage as *const _ as *const sockaddr)
-            }
-            SocketAddr::V6(v6) => {
-                let mut s: sockaddr_in6 = unsafe { std::mem::zeroed() };
-                s.sin6_family = libc::AF_INET6 as u16;
-                s.sin6_port = v6.port().to_be();
-                s.sin6_addr = libc::in6_addr { s6_addr: v6.ip().octets() };
-                s.sin6_scope_id = v6.scope_id();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &s as *const _ as *const u8,
-                        storage as *const _ as *mut u8,
-                        std::mem::size_of::<sockaddr_in6>(),
-                    )
-                };
-                (std::mem::size_of::<sockaddr_in6>(), storage as *const _ as *const sockaddr)
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn buffer_select(flags: u32) -> Option<u16> {
-        const IORING_CQE_F_BUFFER: u32 = 1 << 5;
-        if flags & IORING_CQE_F_BUFFER != 0 {
-            let bid = (flags >> 16) as u16;
-            Some(bid)
-        } else {
-            None
-        }
-    }
-
-    pub struct UringUdp {
-        ring: IoUring,
-        fd: RawFd,
-        _registered: bool,
-        buffers_provided: bool,
-        buffer_pool: Option<Vec<Vec<u8>>>,
-        multishot_enabled: bool,
-    }
-
-    impl UringUdp {
-        #[inline(always)]
-        fn zerocopy_enabled() -> bool {
-            std::env::var("QUICFUSCATE_URING_ZEROCOPY")
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(false)
-        }
-
-        #[inline(always)]
-        fn drain_errqueue(fd: RawFd) {
-            // Best-effort: drain error queue created by MSG_ZEROCOPY completions to avoid buildup.
-            // Non-blocking socket: loop until EAGAIN/EWOULDBLOCK.
-            unsafe {
-                let mut cbuf = [0u8; 256];
-                let mut iov = libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-                let mut hdr: libc::msghdr = std::mem::zeroed();
-                hdr.msg_iov = &mut iov;
-                hdr.msg_iovlen = 0;
-                hdr.msg_control = cbuf.as_mut_ptr() as *mut _;
-                hdr.msg_controllen = cbuf.len() as _;
-                loop {
-                    let rc = libc::recvmsg(fd, &mut hdr, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT);
-                    if rc < 0 {
-                        let e = *libc::__errno_location();
-                        if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-                            break;
-                        }
-                        crate::optimize::telemetry::URING_ERRORS.inc();
-                        break;
-                    }
-                    // else: drained one notif; continue
-                }
-            }
-        }
-
-        pub fn new(
-            bind: SocketAddr,
-            peer: SocketAddr,
-            queue_depth: u32,
-            register_buffers: bool,
-        ) -> io::Result<Self> {
-            unsafe {
-                let domain = match bind {
-                    SocketAddr::V4(_) => libc::AF_INET,
-                    SocketAddr::V6(_) => libc::AF_INET6,
-                };
-                let fd = libc::socket(
-                    domain,
-                    libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                    0,
-                );
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // bind
-                let mut bind_storage: libc::sockaddr_storage = std::mem::zeroed();
-                let (blen, bptr) = to_raw_sockaddr(&bind, &mut bind_storage);
-                if libc::bind(fd, bptr, blen as socklen_t) < 0 {
-                    let e = io::Error::last_os_error();
-                    libc::close(fd);
-                    return Err(e);
-                }
-                // connect (so we can use Send/Recv without msg headers)
-                let mut peer_storage: libc::sockaddr_storage = std::mem::zeroed();
-                let (plen, pptr) = to_raw_sockaddr(&peer, &mut peer_storage);
-                if libc::connect(fd, pptr, plen as socklen_t) < 0 {
-                    let e = io::Error::last_os_error();
-                    libc::close(fd);
-                    return Err(e);
-                }
-
-                // Optional: enable SO_ZEROCOPY if requested (best-effort)
-                if std::env::var("QUICFUSCATE_URING_ZEROCOPY")
-                    .map(|v| v != "0" && v.to_lowercase() != "false")
-                    .unwrap_or(false)
-                {
-                    let one: libc::c_int = 1;
-                    let rc = libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ZEROCOPY,
-                        &one as *const _ as *const c_void,
-                        std::mem::size_of_val(&one) as socklen_t,
-                    );
-                    if rc < 0 {
-                        crate::optimize::telemetry::URING_FALLBACKS.inc();
-                    }
-                }
-                let mut ring = IoUring::new(queue_depth as _)?;
-
-                // Setup buffer provisioning if requested
-                let buffers_provided = register_buffers;
-                let mut buffer_pool = None;
-                let multishot = std::env::var("QUICFUSCATE_URING_MULTISHOT")
-                    .map(|v| v != "0" && v.to_lowercase() != "false")
-                    .unwrap_or(false);
-
-                if buffers_provided {
-                    // Allocate buffer pool
-                    let mut pool = Vec::with_capacity(BUFFER_COUNT);
-                    for _ in 0..BUFFER_COUNT {
-                        pool.push(vec![0u8; BUFFER_SIZE]);
-                    }
-
-                    // Provide buffers to io_uring
-                    for (i, buf) in pool.iter().enumerate() {
-                        let provide_e = opcode::ProvideBuffers::new(
-                            buf.as_ptr(),
-                            BUFFER_SIZE as _,
-                            1,
-                            BUFFER_GROUP_ID,
-                            i as u16,
-                        )
-                        .build();
-                        unsafe {
-                            ring.submission().push(&provide_e).map_err(|_| {
-                                io::Error::new(io::ErrorKind::Other, "provide buffers failed")
-                            })?;
-                        }
-                    }
-                    ring.submit()?;
-                    buffer_pool = Some(pool);
-                }
-
-                let me = Self {
-                    ring,
-                    fd,
-                    _registered: false,
-                    buffers_provided,
-                    buffer_pool,
-                    multishot_enabled: multishot,
-                };
-                // Telemetry
-                crate::optimize::telemetry::URING_ACTIVE
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
-                crate::optimize::telemetry::URING_QUEUE_DEPTH.set(queue_depth as i64);
-                Ok(me)
-            }
-        }
-
-        #[inline(always)]
-        pub fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-            let ptr = data.as_ptr();
-            let len = data.len();
-            let mut send = opcode::Send::new(types::Fd(self.fd), ptr, len as _);
-            if Self::zerocopy_enabled() {
-                send = send.flags(libc::MSG_ZEROCOPY as _);
-            }
-            let send_e = send.build().user_data(0x51);
-            unsafe {
-                self.ring
-                    .submission()
-                    .push(&send_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "sq full"))?;
-            }
-            crate::optimize::telemetry::URING_SUBMISSIONS.inc();
-            self.ring.submit_and_wait(1)?;
-            if let Some(cqe) = self.ring.completion().next() {
-                crate::optimize::telemetry::URING_COMPLETIONS.inc();
-                if cqe.result() < 0 {
-                    crate::optimize::telemetry::URING_ERRORS.inc();
-                    return Err(io::Error::from_raw_os_error(-cqe.result()));
-                }
-                let n = cqe.result() as usize;
-                crate::optimize::telemetry::URING_BYTES_SENT.inc_by(n as u64);
-                if Self::zerocopy_enabled() {
-                    Self::drain_errqueue(self.fd);
-                }
-                Ok(n)
-            } else {
-                Err(io::Error::new(io::ErrorKind::Other, "no cqe"))
-            }
-        }
-
-        #[inline(always)]
-        pub fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.buffers_provided && self.multishot_enabled {
-                // Multishot recv with buffer selection
-                let recv_e = opcode::RecvMsg::new(
-                    types::Fd(self.fd),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-                .flags(libc::MSG_DONTWAIT as _)
-                .buf_group(BUFFER_GROUP_ID)
-                .build()
-                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
-                .user_data(0x52);
-                unsafe {
-                    self.ring
-                        .submission()
-                        .push(&recv_e)
-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "sq full"))?;
-                }
-                crate::optimize::telemetry::URING_SUBMISSIONS.inc();
-                self.ring.submit_and_wait(1)?;
-
-                if let Some(cqe) = self.ring.completion().next() {
-                    crate::optimize::telemetry::URING_COMPLETIONS.inc();
-                    if cqe.result() < 0 {
-                        crate::optimize::telemetry::URING_ERRORS.inc();
-                        return Err(io::Error::from_raw_os_error(-cqe.result()));
-                    }
-
-                    let n = cqe.result() as usize;
-                    if n > 0 {
-                        // Extract buffer ID from flags
-                        let bid = buffer_select(cqe.flags()).unwrap_or(0) as usize;
-                        if let Some(ref pool) = self.buffer_pool {
-                            if bid < pool.len() && n <= buf.len() {
-                                buf[..n].copy_from_slice(&pool[bid][..n]);
-                            }
-                        }
-                        // Re-provide the buffer
-                        if let Some(ref pool) = self.buffer_pool {
-                            if bid < pool.len() {
-                                let provide_e = opcode::ProvideBuffers::new(
-                                    pool[bid].as_ptr(),
-                                    BUFFER_SIZE as _,
-                                    1,
-                                    BUFFER_GROUP_ID,
-                                    bid as u16,
-                                )
-                                .build();
-                                unsafe {
-                                    let _ = self.ring.submission().push(&provide_e);
-                                }
-                            }
-                        }
-
-                        #[cfg(test)]
-                        mod tests {
-                            use super::*;
-                            use std::net::SocketAddr;
-
-                            #[test]
-                            fn sockaddr_roundtrip_v4() {
-                                let addr: SocketAddr = "192.0.2.15:4433".parse().unwrap();
-                                let mut storage: libc::sockaddr_storage =
-                                    unsafe { std::mem::zeroed() };
-                                let (len, raw) = super::to_raw_sockaddr(&addr, &mut storage);
-                                assert_eq!(len, std::mem::size_of::<libc::sockaddr_in>());
-                                unsafe {
-                                    let v4 = *(raw as *const libc::sockaddr_in);
-                                    assert_eq!(u16::from_be(v4.sin_port), 4433);
-                                    assert_eq!(v4.sin_family, libc::AF_INET as u16);
-                                    assert_eq!(v4.sin_addr.s_addr.to_ne_bytes(), [192, 0, 2, 15]);
-                                }
-                            }
-
-                            #[test]
-                            fn sockaddr_roundtrip_v6() {
-                                let addr: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
-                                let mut storage: libc::sockaddr_storage =
-                                    unsafe { std::mem::zeroed() };
-                                let (len, raw) = super::to_raw_sockaddr(&addr, &mut storage);
-                                assert_eq!(len, std::mem::size_of::<libc::sockaddr_in6>());
-                                unsafe {
-                                    let v6 = *(raw as *const libc::sockaddr_in6);
-                                    assert_eq!(u16::from_be(v6.sin6_port), 8443);
-                                    assert_eq!(v6.sin6_family, libc::AF_INET6 as u16);
-                                    let expected = match addr {
-                                        SocketAddr::V6(v) => v.ip().octets(),
-                                        _ => unreachable!(),
-                                    };
-                                    assert_eq!(v6.sin6_addr.s6_addr, expected);
-                                }
-                            }
-                        }
-                    }
-
-                    crate::optimize::telemetry::URING_BYTES_RECEIVED.inc_by(n as u64);
-                    Ok(n)
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "no cqe"))
-                }
-            } else {
-                // Standard recv path
-                let ptr = buf.as_mut_ptr();
-                let len = buf.len();
-                let recv_e =
-                    opcode::Recv::new(types::Fd(self.fd), ptr, len as _).build().user_data(0x52);
-                unsafe {
-                    self.ring
-                        .submission()
-                        .push(&recv_e)
-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "sq full"))?;
-                }
-                crate::optimize::telemetry::URING_SUBMISSIONS.inc();
-                self.ring.submit_and_wait(1)?;
-                if let Some(cqe) = self.ring.completion().next() {
-                    crate::optimize::telemetry::URING_COMPLETIONS.inc();
-                    if cqe.result() < 0 {
-                        crate::optimize::telemetry::URING_ERRORS.inc();
-                        return Err(io::Error::from_raw_os_error(-cqe.result()));
-                    }
-                    let n = cqe.result() as usize;
-                    crate::optimize::telemetry::URING_BYTES_RECEIVED.inc_by(n as u64);
-                    Ok(n)
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "no cqe"))
-                }
-            }
-        }
-    }
-
-    impl Drop for UringUdp {
-        fn drop(&mut self) {
-            unsafe {
-                libc::close(self.fd);
-            }
-            crate::optimize::telemetry::URING_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-// GSO/GRO Offload Support
+// GSO/GRO offload helpers retained only for compatibility tests.
+#[cfg(test)]
 pub struct SegmentationOffload {
     gso_enabled: bool,
     gro_enabled: bool,
@@ -654,14 +264,16 @@ pub struct SegmentationOffload {
     adaptive_batching: bool,
 }
 
+#[cfg(test)]
 impl Default for SegmentationOffload {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl SegmentationOffload {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             gso_enabled: Self::detect_gso_support(),
             gro_enabled: Self::detect_gro_support(),
@@ -746,13 +358,6 @@ impl SegmentationOffload {
         while offset < data.len() {
             let segment_size = (data.len() - offset).min(effective_mtu);
 
-            // Prefetch next segment data
-            if offset + effective_mtu < data.len() {
-                unsafe {
-                    prefetch(data.as_ptr().add(offset + effective_mtu), PrefetchHint::T0);
-                }
-            }
-
             let mut segment = Vec::with_capacity(segment_size);
             segment.extend_from_slice(&data[offset..offset + segment_size]);
             segments.push(segment);
@@ -771,10 +376,6 @@ impl SegmentationOffload {
         let mut coalesced = Vec::with_capacity(total_size);
 
         for packet in packets {
-            // Prefetch packet data
-            unsafe {
-                prefetch(packet.as_ptr(), PrefetchHint::T0);
-            }
             let remaining = if self.gro_enabled {
                 self.max_gro_size.saturating_sub(coalesced.len())
             } else {
@@ -794,72 +395,98 @@ impl SegmentationOffload {
     }
 }
 
+#[cfg(test)]
 use std::collections::VecDeque;
-use std::time::Instant;
 
-// Integration with Transport
-pub struct FastPathTransport {
-    pub(crate) udp_fast: Option<crate::transport::udpfast::UdpFastPath>,
-    #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-    pub(crate) uring: Option<uring_udp::UringUdp>,
-    pub(crate) segmentation: SegmentationOffload,
-    pub(crate) mem_pool: Arc<crate::optimize::MemoryPool>,
-    pub(crate) batch_queue: VecDeque<BatchedPacket>,
-    pub(crate) vectored_io_enabled: bool,
-    pub(crate) numa_aware: bool,
-    pub(crate) default_peer: Option<std::net::SocketAddr>,
+/// Compatibility-only fastpath wrapper used by local tests.
+#[cfg(test)]
+struct FastPathTransport {
+    udp_fast: Option<crate::transport::udpfast::UdpFastPath>,
+    #[cfg(test)]
+    segmentation: SegmentationOffload,
+    #[cfg(test)]
+    batch_queue: VecDeque<BatchedPacket>,
+    #[cfg(test)]
+    vectored_io_enabled: bool,
+    default_peer: Option<std::net::SocketAddr>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
-pub struct BatchedPacket {
-    pub data: Vec<u8>,
-    pub addr: std::net::SocketAddr,
-    pub ecn: u8,
-    pub timestamp: Instant,
+struct BatchedPacket {
+    data: Vec<u8>,
+    addr: std::net::SocketAddr,
 }
 
+#[cfg(test)]
 impl FastPathTransport {
-    pub fn new(mem_pool: Arc<crate::optimize::MemoryPool>) -> Self {
+    fn new() -> Self {
         Self {
             udp_fast: None,
-            #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-            uring: None,
+            #[cfg(test)]
             segmentation: SegmentationOffload::new(),
-            mem_pool,
+            #[cfg(test)]
             batch_queue: VecDeque::new(),
+            #[cfg(test)]
             vectored_io_enabled: true,
-            numa_aware: false,
             default_peer: None,
         }
     }
 
     // XDP removed - use UDP fast path or io_uring instead
 
+    #[cfg(test)]
+    fn send_udp_refs_progress(
+        udp: &mut crate::transport::udpfast::UdpFastPath,
+        packet_refs: &[(&[u8], std::net::SocketAddr)],
+    ) -> (usize, Option<std::io::Error>) {
+        let mut sent_total = 0usize;
+        while sent_total < packet_refs.len() {
+            match udp.send_batch(&packet_refs[sent_total..]) {
+                Ok(0) => {
+                    return (
+                        sent_total,
+                        Some(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "UDP fast path sent zero packets",
+                        )),
+                    );
+                }
+                Ok(sent) => {
+                    sent_total += sent;
+                }
+                Err(err) => return (sent_total, Some(err)),
+            }
+        }
+        (sent_total, None)
+    }
+
+    #[cfg(test)]
     fn flush_batch(&mut self) -> Result<(), std::io::Error> {
         if self.batch_queue.is_empty() {
             return Ok(());
         }
 
-        // Allocate from memory pool if NUMA-aware
-        let packets: Vec<_> = if self.numa_aware {
-            self.batch_queue
-                .drain(..)
-                .map(|p| {
-                    let mut block = self.mem_pool.alloc();
-                    let len = p.data.len().min(block.len());
-                    block[..len].copy_from_slice(&p.data[..len]);
-                    (block.to_vec(), p.addr)
-                })
-                .collect()
-        } else {
-            self.batch_queue.drain(..).map(|p| (p.data, p.addr)).collect()
-        };
+        let packets: Vec<BatchedPacket> = self.batch_queue.drain(..).collect();
 
         // Send via UDP fast path if available
         if let Some(ref mut udp) = self.udp_fast {
-            let packet_refs: Vec<_> =
-                packets.iter().map(|(data, addr)| (data.as_ref(), *addr)).collect();
-            udp.send_batch(&packet_refs)?;
+            let (sent_total, send_err) = {
+                let packet_refs: Vec<_> =
+                    packets.iter().map(|p| (p.data.as_slice(), p.addr)).collect();
+                Self::send_udp_refs_progress(udp, &packet_refs)
+            };
+
+            if sent_total < packets.len() {
+                for packet in packets.into_iter().skip(sent_total).rev() {
+                    self.batch_queue.push_front(packet);
+                }
+            }
+
+            if let Some(err) = send_err {
+                return Err(err);
+            }
+
             Ok(())
         } else {
             Err(std::io::Error::new(
@@ -869,44 +496,41 @@ impl FastPathTransport {
         }
     }
 
-    pub fn send_with_gso(&mut self, data: &[u8], mtu: usize) -> Result<(), std::io::Error> {
+    #[cfg(test)]
+    fn send_segmented_fastpath(&mut self, data: &[u8], mtu: usize) -> Result<(), std::io::Error> {
         // Use vectored I/O if enabled for better batching
         if self.vectored_io_enabled {
             let peer = self.default_peer.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "Fast path peer not set")
             })?;
-            let packet = BatchedPacket {
-                data: data.to_vec(),
-                addr: peer,
-                ecn: 0,
-                timestamp: Instant::now(),
-            };
+            let packet = BatchedPacket { data: data.to_vec(), addr: peer };
             self.batch_queue.push_back(packet);
-
-            // Flush if queue is full
-            if self.batch_queue.len() >= 32 {
-                return self.flush_batch();
-            }
-            return Ok(());
+            // Reliability-first semantics: ensure packets are actually emitted per call.
+            // flush_batch still preserves multi-packet handling when queue is already populated.
+            return self.flush_batch();
         }
 
         let segments = self.segmentation.segment_packet(data, mtu);
-
-        // XDP removed
-        #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-        if let Some(ref mut ur) = self.uring {
-            for segment in segments {
-                let _ = ur.send(&segment)?;
-            }
-            return Ok(());
-        }
 
         if let Some(ref mut udp) = self.udp_fast {
             let peer = self.default_peer.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "Fast path peer not set")
             })?;
-            let packet_refs: Vec<_> = segments.iter().map(|seg| (seg.as_ref(), peer)).collect();
-            udp.send_batch(&packet_refs)?;
+            let (sent_total, send_err) = {
+                let packet_refs: Vec<_> = segments.iter().map(|seg| (seg.as_ref(), peer)).collect();
+                Self::send_udp_refs_progress(udp, &packet_refs)
+            };
+            if sent_total < segments.len() {
+                return Err(send_err.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "UDP fast path partial segment batch send",
+                    )
+                }));
+            }
+            if let Some(err) = send_err {
+                return Err(err);
+            }
             return Ok(());
         }
 
@@ -916,96 +540,232 @@ impl FastPathTransport {
         ))
     }
 
-    pub fn recv_with_gro(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        // XDP removed
-        #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-        if let Some(ref mut ur) = self.uring {
-            return ur.recv(_buf);
+    #[cfg(test)]
+    fn send_segmented_compat(&mut self, data: &[u8], mtu: usize) -> Result<(), std::io::Error> {
+        self.send_segmented_fastpath(data, mtu)
+    }
+
+    #[cfg(test)]
+    fn recv_coalesced_fastpath(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        if let Some(ref mut udp) = self.udp_fast {
+            let packets = udp.recv_batch(self.segmentation.current_batch_size.max(1))?;
+            if packets.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "no packets available on UDP fast path",
+                ));
+            }
+
+            let coalesced = self
+                .segmentation
+                .coalesce_packets(packets.into_iter().map(|(data, _)| data).collect());
+            if coalesced.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "coalesced receive buffer is empty",
+                ));
+            }
+
+            let n = coalesced.len().min(buf.len());
+            buf[..n].copy_from_slice(&coalesced[..n]);
+            return Ok(n);
         }
+
         // Fallback
         Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No fast path enabled"))
     }
 
-    #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-    pub fn enable_uring(
+    fn enable_udp_fastpath(
         &mut self,
         bind: std::net::SocketAddr,
         peer: std::net::SocketAddr,
     ) -> Result<(), std::io::Error> {
-        let qd = std::env::var("QUICFUSCATE_URING_QUEUE_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256u32);
-        let reg = std::env::var("QUICFUSCATE_URING_REGISTER_BUFFERS")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(false);
-        let ur = uring_udp::UringUdp::new(bind, peer, qd, reg)?;
-        self.uring = Some(ur);
+        let udp = crate::transport::udpfast::UdpFastPath::new(bind)?;
+        self.udp_fast = Some(udp);
         self.default_peer = Some(peer);
-        log::info!(
-            "io_uring fastpath enabled (bind={}, peer={}, qd={}, reg={})",
-            bind,
-            peer,
-            qd,
-            reg
-        );
+        log::info!("UDP fast path enabled (bind={}, peer={})", bind, peer);
         Ok(())
     }
 
     /// Enable the best available fast-path based on environment configuration.
     ///
-    /// QUICFUSCATE_FASTPATH = "off" | "uring" | "xdp" | "auto" (default: auto)
-    /// Current implementation auto-enables io_uring when available and requested.
+    /// QUICFUSCATE_FASTPATH = "off" | "auto" (default: auto)
+    /// This compat/test shim keeps only the narrowed UDP fastpath coverage
+    /// used by local tests.
     #[inline]
-    pub fn enable_fastpath_from_env(
-        &mut self,
-        bind: std::net::SocketAddr,
-        peer: std::net::SocketAddr,
-    ) {
+    fn enable_fastpath_from_env(&mut self, bind: std::net::SocketAddr, peer: std::net::SocketAddr) {
         self.default_peer = Some(peer);
-        let mode = std::env::var("QUICFUSCATE_FASTPATH")
-            .unwrap_or_else(|_| "auto".to_string())
-            .to_lowercase();
-        match mode.as_str() {
-            "off" => { /* no-op */ }
-            "xdp" => {
-                log::info!(
-                    "XDP requested via env; use enable_xdp(ifindex, queue) explicitly to activate"
-                );
-            }
-            "uring" | "auto" => {
-                #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-                {
-                    if let Err(e) = self.enable_uring(bind, peer) {
-                        log::warn!("io_uring enable failed: {}", e);
-                    }
-                }
-                #[cfg(not(all(target_os = "linux", feature = "uring_sys")))]
-                {
-                    let _ = (bind, peer);
+        match crate::interface::FastpathMode::from_env() {
+            crate::interface::FastpathMode::Off => { /* no-op */ }
+            crate::interface::FastpathMode::Auto => {
+                if let Err(e) = self.enable_udp_fastpath(bind, peer) {
+                    log::warn!("UDP fast path enable failed: {}", e);
                 }
             }
-            _ => {}
         }
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "uring_sys"))]
-mod fastpath_tests {
+#[cfg(test)]
+impl Default for FastPathTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod fastpath_udp_tests {
     use super::FastPathTransport;
+    use crate::transport::udpfast::MAX_BATCH_SIZE;
+    use std::env;
+    use std::net::UdpSocket;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.take() {
+                env::set_var(self.key, prev);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn enable_uring_is_no_longer_unwired_stub() {
-        let mut fp = FastPathTransport::new(crate::optimize::global_pool());
-        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    fn auto_mode_falls_back_to_udp_fastpath_when_uring_unavailable() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvGuard::set("QUICFUSCATE_FASTPATH", "auto");
 
-        if let Err(e) = fp.enable_uring(bind, peer) {
-            assert!(
-                !e.to_string().contains("not wired"),
-                "enable_uring regressed to unwired stub error: {}",
-                e
-            );
+        let mut fp = FastPathTransport::new();
+        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind parse");
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().expect("peer parse");
+        fp.enable_fastpath_from_env(bind, peer);
+
+        assert!(fp.udp_fast.is_some(), "auto mode must enable UDP fastpath");
+    }
+
+    #[test]
+    fn send_segmented_compat_udp_path_sends_all_segments_over_multiple_batches() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).expect("set read timeout");
+        let recv_addr = receiver.local_addr().expect("receiver local addr");
+
+        let mut fp = FastPathTransport::new();
+        fp.enable_udp_fastpath("127.0.0.1:0".parse().expect("bind parse"), recv_addr)
+            .expect("enable udp fastpath");
+        fp.vectored_io_enabled = false;
+
+        let mtu = 1200usize;
+        let expected_segments = MAX_BATCH_SIZE + 5;
+        let payload = vec![0xABu8; mtu * expected_segments];
+
+        fp.send_segmented_compat(&payload, mtu).expect("send_segmented_compat");
+
+        let mut recv_segments = 0usize;
+        let mut recv_bytes = 0usize;
+        while recv_segments < expected_segments {
+            let mut buf = [0u8; 1400];
+            let (n, _) = receiver.recv_from(&mut buf).expect("recv segment");
+            assert!(n <= mtu, "segment larger than mtu");
+            recv_segments += 1;
+            recv_bytes += n;
         }
+
+        assert_eq!(recv_segments, expected_segments, "segment count mismatch");
+        assert_eq!(recv_bytes, payload.len(), "total received bytes mismatch");
+    }
+
+    #[test]
+    fn unsupported_fastpath_value_defaults_to_udp_fastpath_auto_policy() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvGuard::set("QUICFUSCATE_FASTPATH", "legacy-fastpath");
+
+        let mut fp = FastPathTransport::new();
+        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind parse");
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().expect("peer parse");
+        fp.enable_fastpath_from_env(bind, peer);
+
+        assert!(
+            fp.udp_fast.is_some(),
+            "unsupported fastpath values must fall back to the canonical auto policy"
+        );
+    }
+
+    #[test]
+    fn recv_coalesced_fastpath_reads_from_udp_fastpath() {
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_write_timeout(Some(Duration::from_secs(1))).expect("set write timeout");
+
+        let mut fp = FastPathTransport::new();
+        fp.enable_udp_fastpath(
+            "127.0.0.1:0".parse().expect("bind parse"),
+            "127.0.0.1:9".parse().expect("peer parse"),
+        )
+        .expect("enable udp fastpath");
+
+        let recv_addr =
+            fp.udp_fast.as_ref().expect("udp fastpath").local_addr().expect("udp local addr");
+        let payload = b"recv-with-gro-fastpath";
+        sender.send_to(payload, recv_addr).expect("send payload");
+
+        let mut out = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match fp.recv_coalesced_fastpath(&mut out) {
+                Ok(n) => {
+                    assert_eq!(n, payload.len(), "unexpected receive length");
+                    assert_eq!(&out[..n], payload, "payload mismatch");
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for UDP fastpath receive"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("recv_coalesced_fastpath failed: {}", err),
+            }
+        }
+    }
+
+    #[test]
+    fn send_segmented_compat_flushes_single_packet_when_vectored_enabled() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).expect("set read timeout");
+        let recv_addr = receiver.local_addr().expect("receiver local addr");
+
+        let mut fp = FastPathTransport::new();
+        fp.enable_udp_fastpath("127.0.0.1:0".parse().expect("bind parse"), recv_addr)
+            .expect("enable udp fastpath");
+        fp.vectored_io_enabled = true;
+
+        let payload = b"single-packet-flush";
+        fp.send_segmented_compat(payload, 1200).expect("send_segmented_compat");
+
+        let mut buf = [0u8; 128];
+        let (n, _) = receiver.recv_from(&mut buf).expect("recv packet");
+        assert_eq!(n, payload.len(), "unexpected received payload length");
+        assert_eq!(&buf[..n], payload, "received payload mismatch");
+        assert!(
+            fp.batch_queue.is_empty(),
+            "batch queue must be empty after immediate flush semantics"
+        );
     }
 }

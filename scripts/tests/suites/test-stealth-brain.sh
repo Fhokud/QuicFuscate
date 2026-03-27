@@ -16,11 +16,10 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h)
       echo "Usage: $(basename "$0") [options]"; echo "Stealth Brain Comprehensive Suite"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -101,25 +100,27 @@ run_one() {
       }
     }' "$METR" > "$OUTPUT_DIR/brain_kv.txt" || true
     # Compute summary stats for ACK_THR
-    ACK_SUM=0; ACK_CNT=0; ACK_MIN=999999; ACK_MAX=0
+    # Use local variables to avoid clobbering the outer ACK_MAX array
+    local ack_stat_sum=0 ack_stat_cnt=0 ack_stat_min=999999 ack_stat_max=0
     while read -r k v; do
       if [[ "$k" == "ACK_THR" ]]; then
         n=${v%%[^0-9]*}
         [[ -z "$n" ]] && continue
-        (( ACK_SUM += n )); (( ACK_CNT += 1 )); (( n < ACK_MIN )) && ACK_MIN=$n; (( n > ACK_MAX )) && ACK_MAX=$n
+        (( ack_stat_sum += n )); (( ack_stat_cnt += 1 )); (( n < ack_stat_min )) && ack_stat_min=$n; (( n > ack_stat_max )) && ack_stat_max=$n
       fi
     done < "$OUTPUT_DIR/brain_kv.txt"
-    if (( ACK_CNT > 0 )); then ACK_AVG=$((ACK_SUM/ACK_CNT)); else ACK_AVG=0; fi
+    local ack_stat_avg=0
+    if (( ack_stat_cnt > 0 )); then ack_stat_avg=$((ack_stat_sum/ack_stat_cnt)); fi
   else
     echo "(brain_probe example not available or failed)" >>"$LOG_FILE"
-    ACK_MIN=0; ACK_MAX=0; ACK_AVG=0
+    local ack_stat_min=0 ack_stat_max=0 ack_stat_avg=0
   fi
 
   local end=$(date +%s); local dur=$((end-start))
   TOTAL=$((TOTAL+1)); if (( ok )); then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
   if [[ "$FIRST" == "true" ]]; then FIRST=false; else echo "," >> "$RESULTS_JSON"; fi
-  echo -n '  {"ack_max":'$amax',"jitter_us":'$jut',"explore":'$exp',"pad_max":'$pmax',"duration_sec":'$dur',"ok":'$ok',"ack_thr_min":'$ACK_MIN',"ack_thr_max":'$ACK_MAX',"ack_thr_avg":'$ACK_AVG'}' >> "$RESULTS_JSON"
+  echo -n '  {"ack_max":'$amax',"jitter_us":'$jut',"explore":'$exp',"pad_max":'$pmax',"duration_sec":'$dur',"ok":'$ok',"ack_thr_min":'$ack_stat_min',"ack_thr_max":'$ack_stat_max',"ack_thr_avg":'$ack_stat_avg'}' >> "$RESULTS_JSON"
 }
 
 for a in "${ACK_MAX[@]}"; do

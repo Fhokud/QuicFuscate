@@ -1,0 +1,848 @@
+use super::{PaddingStrategy, StealthConfig, StealthManager, StealthMode};
+use crate::{crypto::CryptoManager, optimize::OptimizationManager};
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.prev.as_deref() {
+            Some(value) => unsafe {
+                std::env::set_var(self.key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
+
+fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+}
+
+#[test]
+fn canonical_stealth_modes_keep_padding_ssot() {
+    let stealth = StealthConfig::stealth();
+    assert_eq!(stealth.padding_strategy, PaddingStrategy::Adaptive);
+    assert!(stealth.enable_http3_masquerading);
+    assert!(stealth.use_tls_cover);
+
+    let anti_dpi = StealthConfig::anti_dpi();
+    assert_eq!(anti_dpi.padding_strategy, PaddingStrategy::BrowserMimic);
+    assert!(anti_dpi.enable_http3_masquerading);
+    assert!(anti_dpi.use_tls_cover);
+    assert!(!anti_dpi.enable_realtime_choke);
+}
+
+#[test]
+fn validate_rejects_qpack_without_http3() {
+    let mut cfg = StealthConfig::manual();
+    cfg.use_qpack_headers = true;
+    cfg.enable_http3_masquerading = false;
+    let err = cfg.validate().expect_err("qpack without h3 must be rejected");
+    assert!(err.contains("qpack headers require HTTP/3 masquerading"));
+}
+
+#[test]
+fn validate_rejects_intelligent_without_dynamic() {
+    let mut cfg = StealthConfig::intelligent();
+    cfg.dynamic_enabled = false;
+    let err = cfg.validate().expect_err("intelligent mode without dynamic must be rejected");
+    assert!(err.contains("intelligent mode requires dynamic_enabled"));
+    assert_eq!(cfg.mode, StealthMode::Intelligent);
+}
+
+#[test]
+fn validate_rejects_off_mode_runtime_features() {
+    let mut cfg = StealthConfig::off();
+    cfg.enable_http3_masquerading = true;
+    let err = cfg.validate().expect_err("off mode with runtime stealth features must be rejected");
+    assert!(err.contains("off mode cannot enable stealth transport/runtime features"));
+}
+
+#[test]
+fn runtime_tls_profile_tracks_cover_performance_mode_from_stealth_mode() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+
+    let performance = StealthManager::new(
+        StealthConfig::performance(),
+        Arc::clone(&optimization),
+        Arc::clone(&crypto),
+    );
+    let intelligent = StealthManager::new(
+        StealthConfig::intelligent(),
+        Arc::clone(&optimization),
+        Arc::clone(&crypto),
+    );
+    let stealth = StealthManager::new(
+        StealthConfig::stealth(),
+        Arc::clone(&optimization),
+        Arc::clone(&crypto),
+    );
+
+    let perf_profile = performance.runtime_tls_profile(None);
+    let intelligent_profile = intelligent.runtime_tls_profile(None);
+    let stealth_profile = stealth.runtime_tls_profile(None);
+
+    assert!(perf_profile.cover_performance_mode);
+    assert!(intelligent_profile.cover_performance_mode);
+    assert!(!stealth_profile.cover_performance_mode);
+    assert!(perf_profile.timing_jitter.is_none());
+    assert!(intelligent_profile.timing_jitter.is_none());
+    assert!(stealth_profile.timing_jitter.is_some());
+}
+
+#[test]
+fn brain_runtime_permissions_lock_operator_overrides() {
+    let _env_lock = acquire_env_lock();
+    let _ack = EnvGuard::set("QUICFUSCATE_ACK_THRESHOLD", "5");
+    let _jitter = EnvGuard::set("QUICFUSCATE_STEALTH_JITTER_US", "900");
+    let _padding = EnvGuard::set("QUICFUSCATE_STEALTH_PADDING_STRATEGY", "browser");
+    let _bias = EnvGuard::set("QUICFUSCATE_STEALTH_MIMIC_BIAS", "safari");
+
+    let manager = StealthManager::new(
+        StealthConfig::intelligent(),
+        Arc::new(OptimizationManager::new()),
+        Arc::new(CryptoManager::new()),
+    );
+    let permissions = manager.brain_runtime_permissions();
+
+    assert!(!permissions.ack_threshold);
+    assert!(!permissions.external_pacing);
+    assert!(!permissions.timing);
+    assert!(!permissions.padding);
+    assert!(!permissions.mimic_bias);
+    assert!(!permissions.granularity);
+    assert!(!permissions.cc_profile);
+}
+
+#[test]
+fn intelligent_runtime_policy_prefers_clean_pacing_and_browser_padding() {
+    // Level 0 = clean path: padding must be disabled (near-zero Intelligent overhead guarantee).
+    let policy = StealthManager::derive_intelligent_runtime_policy(
+        crate::stealth::IntelligentStealthInputs {
+            level_hint: 0,
+            ce_ratio_recent: 0.0005,
+            ack_us: 2_400.0,
+            size_div: 0.2,
+            iat_div: 0.3,
+            reorder_ratio: 0.0,
+            rtt_spike_weight: 0.0,
+            signal_tos: 0,
+            signal_other: 0,
+            jitter_max_us: 1_000,
+            pad_max_low: 128,
+            pad_max_high: 640,
+        },
+    );
+
+    assert!(policy.external_pacing);
+    assert!(!policy.timing_enabled);
+    // Level 0 clean path: padding is off.
+    assert!(!policy.padding_enabled);
+    assert_eq!(policy.padding_strategy, 0);
+    assert_eq!(policy.padding_max, 0);
+    assert_eq!(policy.mimic_bias, 4);
+    assert_eq!(policy.cc_profile, crate::transport::recovery::BrowserProfile::Edge);
+}
+
+#[test]
+fn intelligent_runtime_policy_escalates_under_loss_and_divergence() {
+    let policy = StealthManager::derive_intelligent_runtime_policy(
+        crate::stealth::IntelligentStealthInputs {
+            level_hint: 2,
+            ce_ratio_recent: 0.12,
+            ack_us: 14_500.0,
+            size_div: 1.6,
+            iat_div: 1.1,
+            reorder_ratio: 0.03,
+            rtt_spike_weight: 5.0,
+            signal_tos: 1,
+            signal_other: 1,
+            jitter_max_us: 1_200,
+            pad_max_low: 96,
+            pad_max_high: 700,
+        },
+    );
+
+    assert!(!policy.external_pacing);
+    assert!(policy.timing_enabled);
+    assert_eq!(policy.padding_strategy, 1);
+    assert_eq!(policy.padding_max, 96);
+    assert_eq!(policy.mimic_bias, 1);
+    assert_eq!(policy.adaptive_granularity, 32);
+    assert_eq!(policy.cc_profile, crate::transport::recovery::BrowserProfile::Safari);
+}
+
+// --- TLS Cover Tests (TODO-297) ---
+
+#[test]
+fn tls_cover_cipher_suite_tls_id_roundtrip() {
+    use super::TlsCoverCipherSuite;
+    assert_eq!(TlsCoverCipherSuite::Aes128Gcm.tls_id(), 0x1301);
+    assert_eq!(TlsCoverCipherSuite::ChaCha20Poly1305.tls_id(), 0x1303);
+    // Verify as_str matches expected names
+    assert_eq!(TlsCoverCipherSuite::Aes128Gcm.as_str(), "aes-128-gcm");
+    assert_eq!(TlsCoverCipherSuite::ChaCha20Poly1305.as_str(), "chacha20-poly1305");
+}
+
+#[test]
+fn tls_cover_cipher_preference_parse_variants() {
+    use super::TlsCoverCipherPreference;
+    assert_eq!(TlsCoverCipherPreference::parse("auto"), Some(TlsCoverCipherPreference::Auto));
+    assert_eq!(
+        TlsCoverCipherPreference::parse("chacha"),
+        Some(TlsCoverCipherPreference::ChaCha20Poly1305)
+    );
+    assert_eq!(
+        TlsCoverCipherPreference::parse("chacha20poly1305"),
+        Some(TlsCoverCipherPreference::ChaCha20Poly1305)
+    );
+    assert_eq!(TlsCoverCipherPreference::parse("aes"), Some(TlsCoverCipherPreference::Aes128Gcm));
+    assert_eq!(
+        TlsCoverCipherPreference::parse("aes-128-gcm"),
+        Some(TlsCoverCipherPreference::Aes128Gcm)
+    );
+    assert_eq!(TlsCoverCipherPreference::parse(""), Some(TlsCoverCipherPreference::Auto));
+    assert_eq!(TlsCoverCipherPreference::parse("unknown"), None);
+}
+
+#[test]
+fn tls_cover_resolve_cipher_auto_selects_based_on_hardware() {
+    use super::{TlsCoverCipherSuite, TlsCoverProvider};
+    let resolved = TlsCoverProvider::resolve_cipher_suite(super::TlsCoverCipherPreference::Auto);
+    // On any platform, must return a valid variant
+    assert!(
+        resolved == TlsCoverCipherSuite::Aes128Gcm
+            || resolved == TlsCoverCipherSuite::ChaCha20Poly1305
+    );
+}
+
+#[test]
+fn tls_cover_resolve_cipher_explicit_chacha() {
+    use super::{TlsCoverCipherSuite, TlsCoverProvider};
+    let resolved =
+        TlsCoverProvider::resolve_cipher_suite(super::TlsCoverCipherPreference::ChaCha20Poly1305);
+    assert_eq!(resolved, TlsCoverCipherSuite::ChaCha20Poly1305);
+}
+
+#[test]
+fn tls_cover_resolve_cipher_explicit_aes() {
+    use super::{TlsCoverCipherSuite, TlsCoverProvider};
+    let resolved =
+        TlsCoverProvider::resolve_cipher_suite(super::TlsCoverCipherPreference::Aes128Gcm);
+    assert_eq!(resolved, TlsCoverCipherSuite::Aes128Gcm);
+}
+
+#[test]
+fn tls_cover_client_hello_is_valid_tls_record() {
+    use super::{tls_cover::TlsCover, BrowserProfile, OsProfile};
+    for browser in [
+        BrowserProfile::Chrome,
+        BrowserProfile::Firefox,
+        BrowserProfile::Safari,
+        BrowserProfile::Edge,
+    ] {
+        for os in [
+            OsProfile::Windows,
+            OsProfile::MacOS,
+            OsProfile::Linux,
+            OsProfile::IOS,
+            OsProfile::Android,
+        ] {
+            let ch = TlsCover::generate_client_hello(browser, os, Some("example.com"));
+            // TLS record header: 0x16 (Handshake), 0x03 0x03 (TLS 1.2)
+            assert!(ch.len() >= 9, "ClientHello too short for {:?}/{:?}", browser, os);
+            assert_eq!(ch[0], 0x16, "not a TLS Handshake record for {:?}/{:?}", browser, os);
+            assert_eq!(ch[1], 0x03, "wrong TLS major for {:?}/{:?}", browser, os);
+            assert_eq!(ch[2], 0x03, "wrong TLS minor for {:?}/{:?}", browser, os);
+            // Record length
+            let rec_len = u16::from_be_bytes([ch[3], ch[4]]) as usize;
+            assert_eq!(ch.len(), 5 + rec_len, "length mismatch for {:?}/{:?}", browser, os);
+            // Handshake type: 0x01 = ClientHello
+            assert_eq!(ch[5], 0x01, "not a ClientHello handshake for {:?}/{:?}", browser, os);
+        }
+    }
+}
+
+#[test]
+fn tls_cover_client_hello_firefox_has_no_session_id() {
+    use super::{tls_cover::TlsCover, BrowserProfile, OsProfile};
+    let ch = TlsCover::generate_client_hello(BrowserProfile::Firefox, OsProfile::Linux, None);
+    // Skip record header (5) + handshake header (4) + version (2) + random (32) = offset 43
+    let sid_len = ch[43];
+    assert_eq!(sid_len, 0, "Firefox should have empty session ID");
+}
+
+#[test]
+fn tls_cover_client_hello_chrome_has_session_id() {
+    use super::{tls_cover::TlsCover, BrowserProfile, OsProfile};
+    let ch = TlsCover::generate_client_hello(BrowserProfile::Chrome, OsProfile::Windows, None);
+    let sid_len = ch[43];
+    assert_eq!(sid_len, 32, "Chrome should have 32-byte session ID");
+}
+
+#[test]
+fn tls_cover_grease_not_in_safari() {
+    use super::{tls_cover::TlsCover, BrowserProfile, OsProfile};
+    let ch = TlsCover::generate_client_hello(BrowserProfile::Safari, OsProfile::MacOS, None);
+    // Skip to cipher_suites offset: 5 (rec) + 4 (hs) + 2 (ver) + 32 (rand) = 43 + sid_len + 1
+    let sid_len = ch[43] as usize;
+    let cs_offset = 44 + sid_len;
+    let cs_len = u16::from_be_bytes([ch[cs_offset], ch[cs_offset + 1]]) as usize;
+    let cipher_bytes = &ch[cs_offset + 2..cs_offset + 2 + cs_len];
+    // Check no GREASE values (0x?a?a pattern) in cipher suites
+    for pair in cipher_bytes.chunks_exact(2) {
+        let val = u16::from_be_bytes([pair[0], pair[1]]);
+        let is_grease = (val & 0x0F0F) == 0x0A0A;
+        assert!(!is_grease, "Safari should not include GREASE cipher 0x{:04X}", val);
+    }
+}
+
+#[test]
+fn tls_cover_server_hello_cipher_matches_resolved() {
+    use super::{BrowserProfile, FingerprintProfile, OsProfile, TlsCoverProvider};
+    let _env_lock = acquire_env_lock();
+    // Clear env to ensure default Auto behavior
+    let _cipher = EnvGuard::set("QUICFUSCATE_TLS_COVER_CIPHER", "auto");
+
+    let pref = TlsCoverProvider::cipher_preference_from_env();
+    let expected_id = TlsCoverProvider::resolve_cipher_suite(pref).tls_id();
+
+    // Check across all browser/OS combinations
+    for browser in [
+        BrowserProfile::Chrome,
+        BrowserProfile::Firefox,
+        BrowserProfile::Safari,
+        BrowserProfile::Edge,
+    ] {
+        for os in [
+            OsProfile::Windows,
+            OsProfile::MacOS,
+            OsProfile::Linux,
+            OsProfile::IOS,
+            OsProfile::Android,
+        ] {
+            let profile = FingerprintProfile::new(browser, os);
+            let sh = profile
+                .server_hello
+                .as_ref()
+                .unwrap_or_else(|| panic!("no ServerHello for {:?}/{:?}", browser, os));
+            assert_eq!(
+                sh.cipher_suite, expected_id,
+                "ServerHello cipher mismatch for {:?}/{:?}: got 0x{:04X}, expected 0x{:04X}",
+                browser, os, sh.cipher_suite, expected_id
+            );
+        }
+    }
+}
+
+#[test]
+fn tls_cover_server_hello_cipher_respects_explicit_chacha() {
+    use super::{BrowserProfile, FingerprintProfile, OsProfile};
+    let _env_lock = acquire_env_lock();
+    let _cipher = EnvGuard::set("QUICFUSCATE_TLS_COVER_CIPHER", "chacha");
+
+    let profile = FingerprintProfile::new(BrowserProfile::Chrome, OsProfile::Windows);
+    let sh = profile.server_hello.as_ref().expect("no ServerHello");
+    assert_eq!(sh.cipher_suite, 0x1303, "explicit chacha preference must yield 0x1303");
+}
+
+#[test]
+fn tls_cover_server_hello_cipher_respects_explicit_aes() {
+    use super::{BrowserProfile, FingerprintProfile, OsProfile};
+    let _env_lock = acquire_env_lock();
+    let _cipher = EnvGuard::set("QUICFUSCATE_TLS_COVER_CIPHER", "aes");
+
+    let profile = FingerprintProfile::new(BrowserProfile::Chrome, OsProfile::Windows);
+    let sh = profile.server_hello.as_ref().expect("no ServerHello");
+    assert_eq!(sh.cipher_suite, 0x1301, "explicit aes preference must yield 0x1301");
+}
+
+#[test]
+fn tls_cover_extension_helpers_produce_valid_tlv() {
+    use super::tls_cover;
+    // Each extension helper must produce: type(2) + length(2) + payload(length)
+    let alpn = tls_cover::alpn_ext(&["h2", "http/1.1"]);
+    assert!(alpn.len() >= 4);
+    let ext_type = u16::from_be_bytes([alpn[0], alpn[1]]);
+    let ext_len = u16::from_be_bytes([alpn[2], alpn[3]]) as usize;
+    assert_eq!(ext_type, 0x0010, "ALPN extension type");
+    assert_eq!(alpn.len(), 4 + ext_len, "ALPN length mismatch");
+
+    let sni = tls_cover::sni_ext("example.com");
+    assert!(sni.len() >= 4);
+    let sni_type = u16::from_be_bytes([sni[0], sni[1]]);
+    let sni_len = u16::from_be_bytes([sni[2], sni[3]]) as usize;
+    assert_eq!(sni_type, 0x0000, "SNI extension type");
+    assert_eq!(sni.len(), 4 + sni_len, "SNI length mismatch");
+
+    let sv = tls_cover::supported_versions_ext(&[0x0304, 0x0303]);
+    let sv_type = u16::from_be_bytes([sv[0], sv[1]]);
+    let sv_len = u16::from_be_bytes([sv[2], sv[3]]) as usize;
+    assert_eq!(sv_type, 0x002B, "supported_versions extension type");
+    assert_eq!(sv.len(), 4 + sv_len, "supported_versions length mismatch");
+
+    let pad = tls_cover::padding_ext(32);
+    let pad_type = u16::from_be_bytes([pad[0], pad[1]]);
+    let pad_len = u16::from_be_bytes([pad[2], pad[3]]) as usize;
+    assert_eq!(pad_type, 0x0015, "padding extension type");
+    assert_eq!(pad_len, 32, "padding payload size");
+    assert_eq!(pad.len(), 4 + 32, "padding total size");
+    // All padding bytes must be zero
+    assert!(pad[4..].iter().all(|&b| b == 0), "padding must be zeros");
+}
+
+#[test]
+fn tls_cover_padding_ext_clamps_at_256() {
+    use super::tls_cover;
+    let pad = tls_cover::padding_ext(512);
+    let pad_len = u16::from_be_bytes([pad[2], pad[3]]) as usize;
+    assert_eq!(pad_len, 256, "padding must clamp at 256");
+}
+
+#[test]
+fn tls_cover_grease_value_deterministic_and_aligned() {
+    use super::tls_cover::grease_value;
+    for idx in 0..16 {
+        let g = grease_value(idx);
+        // GREASE values follow the pattern 0x?a?a
+        assert_eq!(g & 0x0F0F, 0x0A0A, "grease_value({}) = 0x{:04X} not GREASE-aligned", idx, g);
+    }
+    // Same idx must produce same value
+    assert_eq!(grease_value(3), grease_value(3));
+}
+
+#[test]
+fn tls_cover_ech_grease_ext_has_correct_type() {
+    use super::tls_cover::ech_grease_ext;
+    let ext = ech_grease_ext(42);
+    assert!(ext.len() >= 4);
+    let ext_type = u16::from_be_bytes([ext[0], ext[1]]);
+    assert_eq!(ext_type, 0xFE0D, "ECH GREASE extension type");
+    let ext_len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
+    assert_eq!(ext.len(), 4 + ext_len, "ECH GREASE length mismatch");
+    assert!((8..=40).contains(&ext_len), "ECH GREASE payload out of range: {}", ext_len);
+}
+
+// --- FlowShaper Jitter Tests ---
+
+#[test]
+fn flow_shaper_jitter_stays_in_range() {
+    use super::FlowShaper;
+    let shaper = FlowShaper::new(1000, false);
+    for _ in 0..200 {
+        let d = shaper.apply_jitter();
+        let us = d.as_micros() as u64;
+        // min = max/2 = 500, max = 1000
+        assert!((500..=1000).contains(&us), "jitter {} us out of [500, 1000]", us);
+    }
+}
+
+#[test]
+fn flow_shaper_jitter_min_clamped_to_one() {
+    use super::FlowShaper;
+    // jitter_us = 1 -> max=1, min=max(1/2,1)=1 -> range [1,1]
+    let shaper = FlowShaper::new(1, false);
+    for _ in 0..50 {
+        let d = shaper.apply_jitter();
+        assert_eq!(d.as_micros(), 1, "jitter with max=1 must always be 1us");
+    }
+}
+
+#[test]
+fn flow_shaper_jitter_produces_variation() {
+    use super::FlowShaper;
+    let shaper = FlowShaper::new(5000, false);
+    let mut values: Vec<u64> = (0..100).map(|_| shaper.apply_jitter().as_micros() as u64).collect();
+    values.sort();
+    values.dedup();
+    // With range [2500, 5000] and 100 samples, we expect significant variation
+    assert!(
+        values.len() > 10,
+        "expected variation in jitter, got only {} distinct values",
+        values.len()
+    );
+}
+
+#[test]
+fn flow_shaper_flight_pacing_handshake_is_15ms() {
+    use super::FlowShaper;
+    let shaper = FlowShaper::new(1000, false);
+    let d = shaper.apply_flight_pacing(true);
+    assert_eq!(d.as_millis(), 15);
+    let d2 = shaper.apply_flight_pacing(false);
+    assert_eq!(d2.as_micros(), 0);
+}
+
+// --- Padding Strategy Config Tests ---
+
+#[test]
+fn padding_strategy_defaults_per_mode() {
+    use super::{PaddingStrategy, StealthConfig};
+    assert_eq!(StealthConfig::stealth().padding_strategy, PaddingStrategy::Adaptive);
+    assert_eq!(StealthConfig::anti_dpi().padding_strategy, PaddingStrategy::BrowserMimic);
+    assert_eq!(StealthConfig::performance().padding_strategy, PaddingStrategy::Random);
+    assert_eq!(StealthConfig::manual().padding_strategy, PaddingStrategy::Random);
+    assert_eq!(StealthConfig::intelligent().padding_strategy, PaddingStrategy::Random);
+}
+
+#[test]
+fn padding_strategy_serde_roundtrip() {
+    use super::PaddingStrategy;
+    for strategy in [
+        PaddingStrategy::Random,
+        PaddingStrategy::Fixed,
+        PaddingStrategy::Adaptive,
+        PaddingStrategy::BrowserMimic,
+    ] {
+        let json = serde_json::to_string(&strategy).expect("serialize");
+        let back: PaddingStrategy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(strategy, back, "serde roundtrip failed for {:?}", strategy);
+    }
+}
+
+#[test]
+fn padding_strategy_parse_from_env_values() {
+    use super::PaddingStrategy;
+    // parse_padding_strategy is a private helper, test via StealthConfig
+    fn parse(raw: &str) -> Option<PaddingStrategy> {
+        match raw.to_ascii_lowercase().as_str() {
+            "random" | "1" => Some(PaddingStrategy::Random),
+            "fixed" | "constant" | "2" => Some(PaddingStrategy::Fixed),
+            "adaptive" | "3" => Some(PaddingStrategy::Adaptive),
+            "browser" | "browser_mimic" | "browsermimic" | "4" => {
+                Some(PaddingStrategy::BrowserMimic)
+            }
+            _ => None,
+        }
+    }
+    assert_eq!(parse("random"), Some(PaddingStrategy::Random));
+    assert_eq!(parse("1"), Some(PaddingStrategy::Random));
+    assert_eq!(parse("fixed"), Some(PaddingStrategy::Fixed));
+    assert_eq!(parse("2"), Some(PaddingStrategy::Fixed));
+    assert_eq!(parse("adaptive"), Some(PaddingStrategy::Adaptive));
+    assert_eq!(parse("3"), Some(PaddingStrategy::Adaptive));
+    assert_eq!(parse("browser"), Some(PaddingStrategy::BrowserMimic));
+    assert_eq!(parse("4"), Some(PaddingStrategy::BrowserMimic));
+    assert_eq!(parse("unknown"), None);
+}
+
+#[test]
+fn cover_ping_should_send_respects_interval() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    // Very short interval so the test doesn't have to sleep long
+    cfg.cover_ping_interval_ms = 20;
+    let manager = StealthManager::new(cfg, optimization, crypto);
+
+    // First call: interval elapsed (next_cover_ping initialized to Instant::now())
+    assert!(
+        manager.should_send_cover_ping(),
+        "first call must return true - interval elapsed at init"
+    );
+    // Immediate second call: interval not elapsed yet
+    assert!(
+        !manager.should_send_cover_ping(),
+        "immediate second call must return false - interval not elapsed"
+    );
+    // After sleeping past the interval it should fire again
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    assert!(
+        manager.should_send_cover_ping(),
+        "call after interval elapsed must return true again"
+    );
+}
+
+#[test]
+fn cover_ping_disabled_when_config_off() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let manager = StealthManager::new(StealthConfig::off(), optimization, crypto);
+    // off() preset has enable_cover_ping = false
+    assert!(
+        !manager.should_send_cover_ping(),
+        "off preset must never fire cover ping"
+    );
+}
+
+#[test]
+fn packet_normalize_is_distinct_variant() {
+    // Verify PacketNormalize is a distinct PaddingStrategy variant and that
+    // it can be set and read back on StealthConfig without aliasing other variants.
+    let mut cfg = StealthConfig::performance();
+    cfg.padding_strategy = PaddingStrategy::PacketNormalize;
+    cfg.normalize_target_size = 1400;
+    assert_eq!(cfg.padding_strategy, PaddingStrategy::PacketNormalize);
+    assert_eq!(cfg.normalize_target_size, 1400);
+    // Must not equal any other variant
+    assert_ne!(cfg.padding_strategy, PaddingStrategy::Fixed);
+    assert_ne!(cfg.padding_strategy, PaddingStrategy::BrowserMimic);
+    assert_ne!(cfg.padding_strategy, PaddingStrategy::Adaptive);
+    assert_ne!(cfg.padding_strategy, PaddingStrategy::Random);
+}
+
+// --- RateChoker Tests ---
+
+#[test]
+fn rate_choker_full_bucket_no_wait() {
+    // Bucket starts full (capacity_bytes = target_bps/8 * burst_ms/1000).
+    // A request smaller than the capacity must return ZERO immediately.
+    let mut choker = super::RateChoker::new(1, 100).expect("choker init");
+    let wait = choker.shape(100);
+    assert_eq!(wait, std::time::Duration::ZERO, "fresh bucket must not impose a wait");
+}
+
+#[test]
+fn rate_choker_deficit_causes_positive_wait() {
+    // 1 Mbps, 10ms burst -> capacity = 1_000_000/8 * 0.01 = 1250 bytes.
+    // Drain the bucket completely, then request more - expect a positive wait.
+    let mut choker = super::RateChoker::new(1, 10).expect("choker init");
+    let _ = choker.shape(1250); // drain
+    let wait = choker.shape(1250); // deficit
+    assert!(wait > std::time::Duration::ZERO, "wait after drain must be > 0");
+}
+
+// --- DomainFrontingManager Tests ---
+
+#[test]
+fn domain_fronting_result_always_in_list() {
+    let domains =
+        vec!["alpha.example".to_string(), "beta.example".to_string(), "gamma.example".to_string()];
+    let mgr = super::DomainFrontingManager::new(domains.clone());
+    for _ in 0..30 {
+        let d = mgr.get_fronted_domain();
+        assert!(domains.contains(&d), "returned domain '{}' not in configured list", d);
+    }
+}
+
+#[test]
+fn domain_fronting_ultra_stealth_returns_non_empty() {
+    let mgr = super::DomainFrontingManager::ultra_stealth();
+    let d = mgr.get_fronted_domain();
+    assert!(!d.is_empty(), "ultra_stealth must return a non-empty domain");
+}
+
+// --- Http3Masquerade Tests ---
+
+#[test]
+fn http3_masquerade_pseudo_headers_present() {
+    use super::{BrowserProfile, FingerprintProfile, Http3Masquerade, OsProfile};
+    let masq =
+        Http3Masquerade::new(FingerprintProfile::new(BrowserProfile::Chrome, OsProfile::Windows));
+    let headers = masq.generate_headers("example.com", "/index.html");
+
+    let find = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value().to_vec());
+    assert_eq!(find(b":method"), Some(b"GET".to_vec()), ":method must be GET");
+    assert_eq!(find(b":scheme"), Some(b"https".to_vec()), ":scheme must be https");
+    assert_eq!(find(b":authority"), Some(b"example.com".to_vec()), ":authority mismatch");
+    assert_eq!(find(b":path"), Some(b"/index.html".to_vec()), ":path mismatch");
+    assert!(
+        headers.iter().any(|h| h.name().eq_ignore_ascii_case(b"user-agent")),
+        "user-agent header missing"
+    );
+}
+
+#[test]
+fn http3_masquerade_user_agent_differs_by_browser() {
+    use super::{BrowserProfile, FingerprintProfile, Http3Masquerade, OsProfile};
+    let chrome = Http3Masquerade::new(FingerprintProfile::new(BrowserProfile::Chrome, OsProfile::Windows));
+    let firefox = Http3Masquerade::new(FingerprintProfile::new(BrowserProfile::Firefox, OsProfile::Linux));
+
+    let ua = |headers: &[crate::transport::h3::Header]| {
+        headers
+            .iter()
+            .find(|h| h.name().eq_ignore_ascii_case(b"user-agent"))
+            .map(|h| h.value().to_vec())
+    };
+    let ch = chrome.generate_headers("t.example", "/");
+    let fh = firefox.generate_headers("t.example", "/");
+    assert_ne!(ua(&ch), ua(&fh), "Chrome and Firefox must produce different user-agent values");
+}
+
+// --- FingerprintRotation Tests (via StealthManager) ---
+
+#[test]
+fn fingerprint_rotation_fixed_mode_stable() {
+    use super::{RotationMode, StealthConfig};
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.fingerprint_rotation_mode = RotationMode::Fixed;
+    cfg.enable_fingerprint_rotation = false;
+    cfg.fingerprint_rotation_interval = 0;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+
+    let name_before = mgr.runtime_tls_profile(None).name.clone();
+    for _ in 0..20 {
+        mgr.maybe_rotate_fingerprint();
+    }
+    let name_after = mgr.runtime_tls_profile(None).name;
+    assert_eq!(name_before, name_after, "Fixed mode must not change fingerprint");
+}
+
+#[test]
+fn fingerprint_rotation_all_mode_no_panic_under_load() {
+    use super::{RotationMode, StealthConfig};
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.fingerprint_rotation_mode = RotationMode::All;
+    cfg.enable_fingerprint_rotation = true;
+    // interval=0 causes early-return (guarded), so this tests the guard path
+    cfg.fingerprint_rotation_interval = 0;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+    // Must never panic across many calls
+    for _ in 0..50 {
+        mgr.maybe_rotate_fingerprint();
+    }
+}
+
+// --- ActiveProbeDetector Tests ---
+
+#[test]
+fn active_probe_detector_gfw_tls_pattern_detected() {
+    use super::{ActiveProbeDetector, ProbeResponseMode};
+    let detector = ActiveProbeDetector::new(10, ProbeResponseMode::Fake);
+    let addr = "127.0.0.1:1234".parse().unwrap();
+    // GFW_TLS_Probe pattern: [0x16, 0x03, 0x01, 0x00, 0x00] + trailing bytes
+    let probe = vec![0x16u8, 0x03, 0x01, 0x00, 0x00, 0xAA, 0xBB];
+    let result = detector.check_packet(&probe, addr);
+    assert!(result.is_some(), "GFW TLS probe pattern must be detected");
+}
+
+#[test]
+fn active_probe_detector_dpi_quic_scan_mask_detected() {
+    use super::{ActiveProbeDetector, ProbeResponseMode};
+    let detector = ActiveProbeDetector::new(10, ProbeResponseMode::Block);
+    let addr = "10.0.0.1:5000".parse().unwrap();
+    // DPI_QUIC_Scan: pattern [0xc0, 0x00, 0x00, 0x00, 0x01] mask [0xff,0x00,0x00,0x00,0xff]
+    // Matching packet: byte[0]=0xc0 (& 0xff == 0xc0), byte[4]=0x01 (& 0xff == 0x01)
+    // bytes 1-3 are wildcarded (mask=0x00) so any value works
+    let probe = vec![0xc0u8, 0xDE, 0xAD, 0xBE, 0x01, 0x00];
+    let result = detector.check_packet(&probe, addr);
+    assert!(result.is_some(), "DPI QUIC scan masked pattern must be detected");
+}
+
+#[test]
+fn active_probe_detector_benign_packet_ignored() {
+    use super::{ActiveProbeDetector, ProbeResponseMode};
+    let detector = ActiveProbeDetector::new(10, ProbeResponseMode::Ignore);
+    let addr = "192.168.1.1:443".parse().unwrap();
+    // A typical valid QUIC Initial (long header, version 1): starts with 0xC0 | flags, version...
+    // but byte[0]=0xC0 and byte[4]=0x00 doesn't match DPI_QUIC_Scan (needs byte[4]=0x01)
+    // and doesn't match GFW_TLS_Probe (needs byte[0]=0x16)
+    let benign = vec![0xC0u8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+    let result = detector.check_packet(&benign, addr);
+    assert!(result.is_none(), "benign QUIC packet must not trigger probe detection");
+}
+
+// --- ServerPushState Tests ---
+
+#[test]
+fn server_push_cover_plan_none_after_burst() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::anti_dpi();
+    cfg.enable_server_push_cover = true;
+    cfg.server_push_burst_interval = 30; // 30-second interval
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+
+    // Simulate a burst: observe it, which resets last_burst to now
+    mgr.observe_server_push_burst("/assets/app.js", 3, 0.5, 0, 0);
+    // Immediately after, the interval has not elapsed - plan should be None
+    let plan = mgr.server_push_cover_plan_for_test();
+    assert!(plan.is_none(), "cover plan must be None immediately after a burst resets the timer");
+}
+
+#[test]
+fn server_push_cover_plan_disabled_returns_none() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.enable_server_push_cover = false;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+    let plan = mgr.server_push_cover_plan_for_test();
+    assert!(plan.is_none(), "server_push_cover_plan must be None when cover is disabled");
+}
+
+// ---- Cover stream injection ----
+
+#[test]
+fn cover_stream_disabled_when_cover_ping_off() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.enable_cover_ping = false;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+    assert!(
+        !mgr.should_inject_cover_stream_frame(),
+        "cover stream must be disabled when enable_cover_ping is false"
+    );
+}
+
+#[test]
+fn cover_stream_disabled_when_interval_zero() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.enable_cover_ping = true;
+    cfg.cover_ping_interval_ms = 0;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+    assert!(
+        !mgr.should_inject_cover_stream_frame(),
+        "cover stream must be disabled when cover_ping_interval_ms is 0"
+    );
+}
+
+#[test]
+fn cover_stream_fires_once_then_suppressed() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mut cfg = StealthConfig::stealth();
+    cfg.enable_cover_ping = true;
+    cfg.cover_ping_interval_ms = 100;
+    let mgr = StealthManager::new(cfg, optimization, crypto);
+    // Timer starts at Instant::now() - first call must fire immediately
+    assert!(
+        mgr.should_inject_cover_stream_frame(),
+        "cover stream must fire on first call (timer initialised to now)"
+    );
+    // Second call immediately after must be suppressed (interval = 300ms)
+    assert!(
+        !mgr.should_inject_cover_stream_frame(),
+        "cover stream must be suppressed until 3x interval has elapsed"
+    );
+}
+
+#[test]
+fn cover_stream_data_length_in_range() {
+    let optimization = Arc::new(OptimizationManager::new());
+    let crypto = Arc::new(CryptoManager::new());
+    let mgr = StealthManager::new(StealthConfig::stealth(), optimization, crypto);
+    for _ in 0..32 {
+        let data = mgr.generate_cover_stream_data();
+        assert!(
+            (16..=64).contains(&data.len()),
+            "cover stream payload must be 16..=64 bytes, got {}",
+            data.len()
+        );
+    }
+}

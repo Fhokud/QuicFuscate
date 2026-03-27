@@ -14,13 +14,11 @@ use std::process::Command;
 use std::process::Stdio;
 
 /// Routing manager for VPN server.
-#[allow(dead_code)]
 pub struct RoutingManager {
     tun_name: String,
     server_ip: Ipv4Addr,
     netmask: Ipv4Addr,
     wan_interface: String,
-    setup_complete: bool,
 }
 
 /// Routing errors.
@@ -53,7 +51,7 @@ impl RoutingManager {
         netmask: Ipv4Addr,
         wan_interface: String,
     ) -> Self {
-        Self { tun_name, server_ip, netmask, wan_interface, setup_complete: false }
+        Self { tun_name, server_ip, netmask, wan_interface }
     }
 
     /// Set up routing rules.
@@ -103,7 +101,7 @@ impl RoutingManager {
         let subnet = self.calculate_subnet();
 
         // Remove NAT rules (ignore errors - rules might not exist)
-        let _ = Command::new("iptables")
+        match Command::new("iptables")
             .args([
                 "-t",
                 "nat",
@@ -116,9 +114,18 @@ impl RoutingManager {
                 "-j",
                 "MASQUERADE",
             ])
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                log::debug!("iptables teardown MASQUERADE delete returned status {}", status);
+            }
+            Err(e) => {
+                log::debug!("iptables teardown MASQUERADE delete failed: {}", e);
+            }
+        }
 
-        let _ = Command::new("iptables")
+        match Command::new("iptables")
             .args([
                 "-D",
                 "FORWARD",
@@ -129,9 +136,18 @@ impl RoutingManager {
                 "-j",
                 "ACCEPT",
             ])
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                log::debug!("iptables teardown forward TUN->WAN delete returned status {}", status);
+            }
+            Err(e) => {
+                log::debug!("iptables teardown forward TUN->WAN delete failed: {}", e);
+            }
+        }
 
-        let _ = Command::new("iptables")
+        match Command::new("iptables")
             .args([
                 "-D",
                 "FORWARD",
@@ -146,7 +162,19 @@ impl RoutingManager {
                 "-j",
                 "ACCEPT",
             ])
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                log::debug!(
+                    "iptables teardown forward WAN->TUN established delete returned status {}",
+                    status
+                );
+            }
+            Err(e) => {
+                log::debug!("iptables teardown forward WAN->TUN established delete failed: {}", e);
+            }
+        }
 
         log::info!("Routing rules removed");
 
@@ -156,11 +184,13 @@ impl RoutingManager {
     #[cfg(target_os = "macos")]
     pub fn teardown(&self) -> Result<(), RoutingError> {
         // Best-effort cleanup; keep shutdown robust even if rules were absent.
-        let _ = self.run_command(
+        if let Err(e) = self.run_command(
             "pfctl",
             &["-a", Self::MACOS_PF_ANCHOR, "-F", "all"],
             "pfctl anchor flush",
-        );
+        ) {
+            log::debug!("pfctl teardown anchor flush failed: {}", e);
+        }
         Ok(())
     }
 
@@ -172,7 +202,9 @@ impl RoutingManager {
              Remove-NetNat -Name '{}' -Confirm:$false",
             Self::WINDOWS_NAT_NAME
         );
-        let _ = self.run_powershell(&script, "Remove-NetNat");
+        if let Err(e) = self.run_powershell(&script, "Remove-NetNat") {
+            log::debug!("Windows teardown Remove-NetNat failed: {}", e);
+        }
         Ok(())
     }
 
@@ -390,7 +422,7 @@ impl RoutingManager {
         self.run_powershell(&script, "New-NetNat")
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn calculate_subnet(&self) -> String {
         // Simple CIDR calculation based on netmask
         let mask_bits = self.netmask.octets().iter().map(|b| b.count_ones()).sum::<u32>();
@@ -417,7 +449,7 @@ pub fn detect_wan_interface() -> Option<String> {
     None
 }
 
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 fn parse_wan_interface_from_default_route(route_output: &str) -> Option<String> {
     let parts: Vec<_> = route_output.split_whitespace().collect();
     if parts.is_empty() {

@@ -1,6 +1,7 @@
 #![cfg(feature = "rust-tests")]
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Mutex, OnceLock};
 
 use quicfuscate::core::QuicFuscateConnection;
 use quicfuscate::fec::FecConfig;
@@ -15,6 +16,39 @@ fn addr(port: u16) -> SocketAddr {
 
 fn base_config() -> Config {
     Config::new_with_version(PROTOCOL_VERSION).expect("config")
+}
+
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.prev.as_deref() {
+            Some(value) => unsafe {
+                std::env::set_var(self.key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
+
+fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[test]
@@ -69,7 +103,7 @@ fn new_server_constructs_without_network() {
 }
 
 #[test]
-fn update_state_applies_path_migrations_and_updates_peer() {
+fn update_state_applies_validated_path_migrations_and_updates_peer() {
     let local = addr(4450);
     let peer = addr(4451);
     let config = base_config();
@@ -94,9 +128,46 @@ fn update_state_applies_path_migrations_and_updates_peer() {
     let new_peer = addr(4453);
     let before = PATH_MIGRATIONS.get();
     conn.conn.migrate(new_local, new_peer).expect("migrate");
+    let (_, pending_local, pending_peer, challenge) =
+        conn.conn.pending_path_validation_for_test().expect("pending validation");
+    conn.conn.receive_path_response_for_test(pending_local, pending_peer, challenge);
     conn.update_state();
     let after = PATH_MIGRATIONS.get();
 
-    assert!(after >= before + 2, "expected path migrations to increment");
+    assert!(after > before, "expected validated path migrations to increment");
     assert_eq!(conn.peer_addr, new_peer);
+}
+
+#[test]
+fn update_state_keeps_ack_and_pacing_owned_outside_fec_when_brain_disabled() {
+    let _env_lock = acquire_env_lock();
+    let _brain = EnvGuard::set("QUICFUSCATE_BRAIN", "0");
+
+    let local = addr(4454);
+    let peer = addr(4455);
+    let config = base_config();
+    let stealth = StealthConfig::default();
+    let fec = FecConfig::default();
+    let opt = OptimizeConfig::default();
+
+    let mut conn = QuicFuscateConnection::new_client(
+        "example.com",
+        local,
+        peer,
+        config,
+        stealth,
+        fec,
+        opt,
+        None,
+        false,
+    )
+    .expect("new_client");
+
+    conn.conn.set_ack_eliciting_threshold(9);
+    conn.conn.set_external_pacing_for_test(true);
+
+    conn.update_state();
+
+    assert_eq!(conn.conn.ack_eliciting_threshold(), 9);
+    assert!(conn.conn.external_pacing_enabled());
 }

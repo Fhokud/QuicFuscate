@@ -16,7 +16,7 @@ SIZES=(256B 1KiB 16KiB 1MiB)
 OUTPUT_DIR=""
 DRY_RUN=""
 RUSTFLAGS_EXTRA=""
-CARGO_FEATURES=""
+CARGO_FEATURES="benches"
 JOBS=""
 FAST=0
 
@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --fast) FAST=1;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--iters N] [--sizes <list>]"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 

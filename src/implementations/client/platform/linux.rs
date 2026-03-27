@@ -88,7 +88,9 @@ impl LinuxPlatform {
         if path.exists() {
             std::fs::copy(&path, RESOLV_CONF_PATH)
                 .map_err(|e| PlatformError::DnsError(e.to_string()))?;
-            let _ = std::fs::remove_file(path);
+            if let Err(e) = std::fs::remove_file(path) {
+                log::debug!("Failed to remove resolv.conf backup after restore: {}", e);
+            }
         }
         Ok(())
     }
@@ -106,6 +108,8 @@ impl PlatformBackend for LinuxPlatform {
     }
 
     fn is_elevated(&self) -> bool {
+        // SAFETY: `geteuid()` is always safe to call - it is a simple syscall with no
+        // preconditions and cannot cause undefined behaviour.
         unsafe { libc::geteuid() == 0 }
     }
 
@@ -133,29 +137,45 @@ impl PlatformBackend for LinuxPlatform {
         };
 
         let fd = file.as_raw_fd();
+        // SAFETY: `IfReq` is a `#[repr(C)]` struct whose fields are a fixed-size C char
+        // array and a c_short. Zero is a valid bit pattern for both, so zero-initializing
+        // the struct is well-defined. The fields are overwritten before the ioctl call.
         let mut ifr: IfReq = unsafe { mem::zeroed() };
         ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
         if let Some(ref requested_name) = config.name {
             let c_name = CString::new(requested_name.as_str())
                 .map_err(|e| PlatformError::DeviceError(e.to_string()))?;
             let bytes = c_name.as_bytes_with_nul();
+            // Validate name fits in IFNAMSIZ (16) with null terminator
+            if bytes.len() > ifr.ifr_name.len() {
+                return Err(PlatformError::DeviceError(format!(
+                    "Interface name too long: {} bytes (max {})",
+                    bytes.len() - 1,
+                    ifr.ifr_name.len() - 1
+                )));
+            }
             let len = bytes.len().min(ifr.ifr_name.len());
             for (dst, src) in ifr.ifr_name.iter_mut().zip(bytes.iter()).take(len) {
                 *dst = *src as libc::c_char;
             }
+            // Explicitly null-terminate and zero remaining bytes
+            for byte in ifr.ifr_name.iter_mut().skip(len) {
+                *byte = 0;
+            }
         }
+        // SAFETY: `fd` is a valid file descriptor opened from `/dev/net/tun` or
+        // `/dev/tun` above and is still open at this point. `ifr` is a fully
+        // initialized `#[repr(C)]` struct with the correct layout required by the
+        // TUNSETIFF ioctl. The ioctl request code `TUNSETIFF` expects a pointer to
+        // `struct ifreq`; our `IfReq` has the identical ABI layout.
         let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
         if ret < 0 {
             return Err(PlatformError::DeviceError(std::io::Error::last_os_error().to_string()));
         }
 
-        let mut name = String::new();
-        for &c in &ifr.ifr_name {
-            if c == 0 {
-                break;
-            }
-            name.push(c as u8 as char);
-        }
+        // Reconstruct name from ifr_name with explicit null-terminator search
+        let name_len = ifr.ifr_name.iter().position(|&c| c == 0).unwrap_or(ifr.ifr_name.len());
+        let name: String = ifr.ifr_name[..name_len].iter().map(|&c| c as u8 as char).collect();
         if name.is_empty() {
             return Err(PlatformError::DeviceError(
                 "Kernel did not return a valid tunnel interface name".to_string(),
@@ -192,6 +212,9 @@ impl PlatformBackend for LinuxPlatform {
 
         let c_name =
             CString::new(name.clone()).map_err(|e| PlatformError::DeviceError(e.to_string()))?;
+        // SAFETY: `c_name` is a valid null-terminated C string created from a known-safe
+        // interface name. It lives until the end of the statement. `if_nametoindex` only
+        // reads the string and cannot cause UB regardless of the returned index value.
         let id = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
         self.set_active_tun_name(Some(name.clone()));
 
@@ -199,10 +222,18 @@ impl PlatformBackend for LinuxPlatform {
     }
 
     fn destroy_tun(&self, handle: TunHandle) -> Result<(), PlatformError> {
-        let _ = self.run_ip(&["link", "set", &handle.name, "down"]);
-        let _ = self.run_ip(&["link", "delete", &handle.name]);
+        if let Err(e) = self.run_ip(&["link", "set", &handle.name, "down"]) {
+            log::debug!("Failed to bring TUN {} down during destroy: {}", handle.name, e);
+        }
+        if let Err(e) = self.run_ip(&["link", "delete", &handle.name]) {
+            log::debug!("Failed to delete TUN {} during destroy: {}", handle.name, e);
+        }
 
         // Close file descriptor
+        // SAFETY: `handle.fd` is the raw file descriptor of the TUN device opened in
+        // `create_tun`. Ownership transfers into `TunHandle` at that point, and
+        // `destroy_tun` is the single place where it is closed. The handle is consumed
+        // by value, so it cannot be used again after this call.
         unsafe {
             libc::close(handle.fd);
         }
@@ -242,19 +273,33 @@ impl PlatformBackend for LinuxPlatform {
     fn remove_route(&self, route: &RouteConfig) -> Result<(), PlatformError> {
         match route.destination {
             IpAddr::V4(_) => {
-                let _ = self.run_ip(&[
+                if let Err(e) = self.run_ip(&[
                     "route",
                     "del",
                     &format!("{}/{}", route.destination, route.prefix_len),
-                ]);
+                ]) {
+                    log::debug!(
+                        "Failed to remove IPv4 route {}/{}: {}",
+                        route.destination,
+                        route.prefix_len,
+                        e
+                    );
+                }
             }
             IpAddr::V6(_) => {
-                let _ = self.run_ip(&[
+                if let Err(e) = self.run_ip(&[
                     "-6",
                     "route",
                     "del",
                     &format!("{}/{}", route.destination, route.prefix_len),
-                ]);
+                ]) {
+                    log::debug!(
+                        "Failed to remove IPv6 route {}/{}: {}",
+                        route.destination,
+                        route.prefix_len,
+                        e
+                    );
+                }
             }
         }
         Ok(())
@@ -302,7 +347,9 @@ impl PlatformBackend for LinuxPlatform {
     fn restore_dns(&self) -> Result<(), PlatformError> {
         if self.has_systemd_resolved() {
             if let Ok(name) = self.active_tun_name() {
-                let _ = self.run_command("resolvectl", &["revert", &name]);
+                if let Err(e) = self.run_command("resolvectl", &["revert", &name]) {
+                    log::debug!("Failed to revert resolvectl DNS for {}: {}", name, e);
+                }
             }
         }
         self.restore_resolv_conf_from_backup()?;

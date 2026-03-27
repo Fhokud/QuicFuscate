@@ -1,9 +1,6 @@
 //! ARM NEON/SVE2 helpers for parsing QUIC STREAM frame headers.
 //! Keeps logic minimal and leverages existing SIMD varint decoders.
 
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-
 /// Parse STREAM frame header fields using SIMD varint helpers.
 /// Returns (stream_id, offset, data_len, fin_flag, header_len).
 #[inline(always)]

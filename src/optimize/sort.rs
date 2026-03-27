@@ -1,6 +1,6 @@
 use crate::optimize::telemetry;
 use crate::optimize::FeatureDetector;
-#[allow(unused_imports)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::simd::CpuProfile;
 
 use std::any::TypeId;
@@ -469,7 +469,7 @@ unsafe fn sort_f32_avx2(data: &mut [f32]) {
             data[i] = val;
         }
     } else {
-        data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
 }
 
@@ -664,4 +664,114 @@ unsafe fn argsort_f32_neon_small(data: &[f32]) -> Vec<usize> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sort_u32_correctness_matches_std() {
+        let mut data = vec![42, 7, 100, 3, 88, 1, 55, 29, 12, 64];
+        let mut expected = data.clone();
+        expected.sort_unstable();
+        sort_u32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_u32_empty_slice() {
+        let mut data: Vec<u32> = vec![];
+        sort_u32(&mut data);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_sort_u32_single_element() {
+        let mut data = vec![42u32];
+        sort_u32(&mut data);
+        assert_eq!(data, vec![42]);
+    }
+
+    #[test]
+    fn test_sort_u32_already_sorted() {
+        let mut data: Vec<u32> = (0..100).collect();
+        let expected = data.clone();
+        sort_u32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_u32_reverse_sorted() {
+        let mut data: Vec<u32> = (0..100).rev().collect();
+        let mut expected = data.clone();
+        expected.sort_unstable();
+        sort_u32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_u32_duplicates_preserve_values() {
+        let mut data = vec![5u32, 3, 5, 1, 3, 5, 1, 1, 3, 5];
+        let mut expected = data.clone();
+        expected.sort_unstable();
+        sort_u32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_u32_large_input() {
+        // 2000 elements to exercise radix sort path on AVX512
+        let mut data: Vec<u32> = (0..2000).map(|i| ((i * 7919) % 100_000) as u32).collect();
+        let mut expected = data.clone();
+        expected.sort_unstable();
+        sort_u32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_f32_correctness() {
+        let mut data = vec![std::f32::consts::PI, 1.0, 2.71, 0.5, 9.9, 4.2];
+        let mut expected = data.clone();
+        expected.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sort_f32(&mut data);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_sort_f32_empty() {
+        let mut data: Vec<f32> = vec![];
+        sort_f32(&mut data);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_sort_f32_single() {
+        let mut data = vec![42.0f32];
+        sort_f32(&mut data);
+        assert_eq!(data, vec![42.0]);
+    }
+
+    #[test]
+    fn test_argsort_f32_returns_sorted_indices() {
+        let data = vec![3.0f32, 1.0, 2.0];
+        let indices = argsort(&data);
+        // 1.0 < 2.0 < 3.0 => indices [1, 2, 0]
+        assert_eq!(indices, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_argsort_f64_returns_sorted_indices() {
+        let data = vec![5.0f64, 2.0, 8.0, 1.0];
+        let indices = argsort(&data);
+        // 1.0 < 2.0 < 5.0 < 8.0 => indices [3, 1, 0, 2]
+        assert_eq!(indices, vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn test_argsort_empty() {
+        let data: Vec<f32> = vec![];
+        let indices = argsort(&data);
+        assert!(indices.is_empty());
+    }
 }

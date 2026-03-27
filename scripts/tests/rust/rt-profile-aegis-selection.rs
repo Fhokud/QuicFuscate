@@ -16,9 +16,10 @@ fn aegis_profile_matches_crypto_plan_for_lengths() {
 
 #[test]
 fn aegis_profile_roundtrip_into_crypto_plan() {
-    let mut variants = vec![Aegis128Profile::L_AESNI, Aegis128Profile::Morus1280];
     #[cfg(target_arch = "aarch64")]
-    variants.push(Aegis128Profile::L_NEON);
+    let variants = vec![Aegis128Profile::L_NEON, Aegis128Profile::Morus1280];
+    #[cfg(not(target_arch = "aarch64"))]
+    let variants = vec![Aegis128Profile::L_AESNI, Aegis128Profile::Morus1280];
 
     for v in variants {
         let plan: CryptoAeadPlan = v.into();

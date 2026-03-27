@@ -31,7 +31,7 @@ impl Drop for EnvGuard {
 
 #[test]
 fn reality_targets_rotate_from_env() {
-    let _lock = ENV_LOCK.lock().expect("env lock");
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _g = EnvGuard::set("QUICFUSCATE_REALITY_TARGETS", "127.0.0.1:10001,127.0.0.1:10002");
     let (tx, _rx) = mpsc::channel(1);
     let proxy = RealityProxy::new(tx);
@@ -47,7 +47,7 @@ fn reality_targets_rotate_from_env() {
 
 #[test]
 fn reality_targets_use_default_list_when_env_missing() {
-    let _lock = ENV_LOCK.lock().expect("env lock");
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _g = EnvGuard::clear("QUICFUSCATE_REALITY_TARGETS");
     let (tx, _rx) = mpsc::channel(1);
     let proxy = RealityProxy::new(tx);

@@ -1,11 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 
 import {
   extractBlockedIps,
   mergeBlockedIps,
   optimisticBlock,
   optimisticUnblock,
-} from "../../../../../apps/web-admin-ui/src/lib/ip-access-control";
+} from "../../../../../apps/svelte-admin/src/lib/blocked-ips";
 
 describe("ip access control optimistic helpers", () => {
   test("optimisticBlock adds unique ip", () => {
@@ -39,14 +39,14 @@ describe("ip access control optimistic helpers", () => {
     expect(merged).toEqual(["10.0.0.1", "10.0.0.2"]);
   });
 
-  test("extractBlockedIps supports canonical 'ips' response", () => {
+  test("extractBlockedIps supports canonical ips response", () => {
     const parsed = extractBlockedIps({
       ips: ["10.0.0.1", "10.0.0.2"],
     });
     expect(parsed).toEqual(["10.0.0.1", "10.0.0.2"]);
   });
 
-  test("extractBlockedIps supports legacy 'blocked' response and de-duplicates", () => {
+  test("extractBlockedIps supports legacy blocked response and de-duplicates", () => {
     const parsed = extractBlockedIps({
       blocked: [" 10.0.0.1 ", "10.0.0.1", "10.0.0.2", 123],
     });

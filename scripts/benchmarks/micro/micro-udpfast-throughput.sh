@@ -26,14 +26,13 @@ while [[ $# -gt 0 ]]; do
     --bind) BIND="$2"; shift;;
     --remote) REMOTE="$2"; shift;;
     --fast) FAST=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h)
       echo "Usage: $(basename "$0") [--size N] [--iters N] [--batch N] [--bind IP:PORT] [--remote IP:PORT] [--fast]"
       usage_common_flags 2>/dev/null || true
       exit 0
       ;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac
   shift
 done

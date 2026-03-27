@@ -1,4 +1,4 @@
-use quicfuscate::accelerate::random;
+use quicfuscate::rng;
 use rand::RngCore;
 use std::env;
 use std::time::Instant;
@@ -46,33 +46,33 @@ fn main() {
     let mut buffer = vec![0u8; block_size];
 
     // Warm-up
-    random::random_bytes_secure(&mut buffer);
-    let mut thread_rng = rand::thread_rng();
-    thread_rng.fill_bytes(&mut buffer);
+    rng::fill_secure_or_abort(&mut buffer, "examples::rng_bench::warmup");
+    let mut rand_rng = rand::rng();
+    rand_rng.fill_bytes(&mut buffer);
 
-    // Measure accelerate::random_bytes_secure (AES-CTR on Apple M)
+    // Measure canonical secure entropy API
     let start_simd = Instant::now();
     for _ in 0..iterations {
-        random::random_bytes_secure(&mut buffer);
+        rng::fill_secure_or_abort(&mut buffer, "examples::rng_bench::loop");
     }
     let dur_simd = start_simd.elapsed();
     let throughput_simd = bytes_per_second(effective_bytes, dur_simd);
 
-    // Measure rand::thread_rng fallback
+    // Measure rand::rng fallback
     let start_scalar = Instant::now();
     for _ in 0..iterations {
-        thread_rng.fill_bytes(&mut buffer);
+        rand_rng.fill_bytes(&mut buffer);
     }
     let dur_scalar = start_scalar.elapsed();
     let throughput_scalar = bytes_per_second(effective_bytes, dur_scalar);
 
     println!(
-        "accelerate::random_bytes_secure: {:.2} MB/s (elapsed {:.3}s)",
+        "rng::fill_secure_or_abort: {:.2} MB/s (elapsed {:.3}s)",
         throughput_simd / (1024.0 * 1024.0),
         dur_simd.as_secs_f64()
     );
     println!(
-        "rand::thread_rng::fill_bytes: {:.2} MB/s (elapsed {:.3}s)",
+        "rand::rng::fill_bytes: {:.2} MB/s (elapsed {:.3}s)",
         throughput_scalar / (1024.0 * 1024.0),
         dur_scalar.as_secs_f64()
     );

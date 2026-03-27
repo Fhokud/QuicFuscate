@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 [[ -f "$SCRIPT_DIR/../../tests/lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../../tests/lib/lib-common.sh"
 
-OUTPUT_DIR=""; RUSTFLAGS_EXTRA="-C target-cpu=native"; FAST=0; SIZES="64k 256k 1m"; JSON=""; JOBS=""; FEATURES=""; DRY_RUN="";
+OUTPUT_DIR=""; RUSTFLAGS_EXTRA="-C target-cpu=native"; FAST=0; SIZES="64k 256k 1m"; JSON=""; JOBS=""; FEATURES="";
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
@@ -16,7 +16,6 @@ while [[ $# -gt 0 ]]; do
     --sizes) SIZES="$2"; shift;;
     --features) FEATURES="$2"; shift;;
     --jobs) JOBS="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h)
       echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--fast] [--sizes '64k 256k 1m'] [--features STR] [--jobs N]"; exit 0;;

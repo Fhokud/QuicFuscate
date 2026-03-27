@@ -23,10 +23,10 @@ QuicFuscate is a monolithic Rust crate with a small, carefully curated `scripts/
 ## Project Architecture
 - Single crate under `src/`
   - `src/core.rs` - QUIC session and I/O core
-  - `src/crypto.rs` - AEAD, cipher, key exchange glue
-  - `src/fec.rs` - fully inlined FEC (encoder/decoder/adaptive/GF tables). No submodules.
-  - `src/stealth.rs` - DoH, HTTP/3 masquerading, TLS Cover, fingerprinting, domain fronting, QPACK helpers
-  - TLS fingerprints: deterministic in-memory ClientHello synthesis in `src/stealth.rs` (no on-disk profiles required). Optional external base64 dumps under top-level `browser_profiles/` are used by the TLS utility scripts for auditing only.
+  - `src/crypto/` - AEAD, cipher, key exchange glue (mod.rs + aegis, aes, chacha, morus, hkdf)
+  - `src/fec/` - FEC (encoder/decoder/adaptive/GF tables, mod.rs + internal, gf_tables, fountain_codes, etc.)
+  - `src/stealth/` - DoH, HTTP/3 masquerading, TLS Cover, fingerprinting, domain fronting, QPACK helpers (mod.rs + tls_cover)
+  - TLS fingerprints: deterministic in-memory ClientHello synthesis in `src/stealth/` (no on-disk profiles required). Optional external base64 dumps under top-level `browser_profiles/` are used by the TLS utility scripts for auditing only.
 - Script workflow
   - Consolidated build/test/audit/bench scripts under `scripts/{build,benchmarks,tests,utils}/`
   - Audit entrypoints are under `scripts/tests/audits/`
@@ -34,14 +34,14 @@ QuicFuscate is a monolithic Rust crate with a small, carefully curated `scripts/
   - `docs/DOCUMENTATION.md` - single file of truth
   - `docs/changelog.md` - change log (add new entries at the top; do not rewrite old entries)
 
-The design favors consolidation and zero duplication. Do not re-introduce scattered module trees (e.g., `src/fec/*`).
+The design favors consolidation into well-organized module directories (`src/fec/`, `src/crypto/`, `src/stealth/`, `src/optimize/`, `src/transport/`). Each directory has a `mod.rs` root with focused sub-modules. Do not duplicate logic across modules or introduce parallel implementations.
 
 
 ## Getting Started
 Prerequisites:
-- Rust stable (latest)
+- Rust 1.93.0 stable (pinned in `rust-toolchain.toml`)
 - Git, Bash
-- bun (for React UIs under `apps/`)
+- bun (for frontend apps under `apps/` and shared packages under `packages/`)
 - python3 (required by some scripts, for example `scripts/tests/suites/test-e2e-admin-web.sh`)
 
 Bootstrap build & verify via scripts:
@@ -52,14 +52,14 @@ Bootstrap build & verify via scripts:
 ```
 Build the crate:
 ```bash
-cargo build --release
+cargo build
 ```
 
 
 ## Local Build & Tests
-- Build: `cargo build` or `cargo build --release`
-- Tests: `cargo test`
-- Lints: `cargo clippy --all-targets -- -D warnings`
+- Build: `cargo build` (use `--release` only for final deployment builds)
+- Tests: `cargo test --features rust-tests`
+- Lints: `cargo clippy --workspace --all-targets -- -D warnings`
 - Crypto suite: `./scripts/tests/suites/test-crypto.sh`
 - Static hardening audit: run via `./scripts/tests/audits/audit-all-comprehensive.sh`
 
@@ -76,7 +76,7 @@ A modular script architecture is provided to streamline common developer tasks (
 
 ```bash
 # Build workflows:
-./scripts/tests/build/build-release.sh
+./scripts/build/build-pgo-release.sh
 ./scripts/tests/build/build-check.sh
 
 # Test workflows:
@@ -101,7 +101,8 @@ Before opening a PR, all of the following must be true:
 - No panics or stubs in runtime code: no `unwrap/expect/panic!/todo!/unimplemented!`
 - No debug prints in runtime code: no `dbg!/println!/eprintln!`
 - Proper error handling and logging (`log` macros) with actionable messages
-- `cargo clippy` clean with warnings denied
+- `cargo test --features rust-tests` clean
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
 - Crypto suite: `./scripts/tests/suites/test-crypto.sh`
 - Static hardening audit: run via `./scripts/tests/audits/audit-all-comprehensive.sh`
 - CI builds on Linux/macOS/Windows (GitHub Actions)
@@ -118,12 +119,32 @@ Before opening a PR, all of the following must be true:
 
 
 ## Module Boundaries & Layout
-- Keep the FEC logic consolidated in `src/fec.rs`. Do not add new submodules
-- Stealth functionality belongs in `src/stealth.rs` (DoH, TLS Cover, HTTP/3 masquerading, domain fronting, QPACK)
+- Keep the FEC logic consolidated in `src/fec/`. New submodules only when extracting large inline blocks
+- Stealth functionality belongs in `src/stealth/` (DoH, TLS Cover, HTTP/3 masquerading, domain fronting, QPACK)
 - QUIC stream/session internals stay in `src/core.rs`
-- TLS fingerprint handling belongs to `src/stealth.rs` (in-memory generation + caching)
+- TLS fingerprint handling belongs to `src/stealth/` (in-memory generation + caching)
 
 When adding new functionality, integrate with the closest primary module. Avoid duplicative helpers; prefer cohesive, well-named internal functions.
+
+
+## Frontend Development
+
+The Svelte 5 frontends and shared packages use Bun as package manager and runtime:
+
+- **Web Admin**: `cd apps/svelte-admin && bun install && bun run dev --port 1430`
+- **Desktop**: `cd apps/svelte-desktop && bun install && bun run dev`
+- **Shared UI**: `packages/ui` (Svelte 5 components), `packages/theme` (CSS tokens)
+
+Quality gates (run before PRs):
+- `bun run check` - Svelte/TS type checking per app
+- `bun run test:unit` - Vitest unit tests per app (test files live under `scripts/tests/frontend/`)
+- E2E: `bunx playwright test` via configs in `apps/svelte-admin/playwright.config.ts` and `apps/svelte-desktop/playwright.config.ts`
+
+Component conventions:
+- One component per `.svelte` file, PascalCase naming
+- Shared presentational components go in `packages/ui/`
+- App-specific components in `apps/<app>/src/lib/components/`
+- Tests mirror source structure under `scripts/tests/frontend/<app>/unit/`
 
 
 ## Stealth Profiles & Fingerprints
@@ -151,7 +172,8 @@ When adding new functionality, integrate with the closest primary module. Avoid 
 ## Pull Request Checklist
 Please verify before opening a PR:
 - [ ] Code compiles on all targets supported by CI
-- [ ] `cargo test`, `cargo clippy -D warnings` pass locally
+- [ ] `cargo test --features rust-tests` passes locally
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes locally
 - [ ] Static hardening audit passes via `./scripts/tests/audits/audit-all-comprehensive.sh`; no `unwrap/expect/dbg!/println!/panic!/todo!/unimplemented!`
   - [ ] `docs/DOCUMENTATION.md` updated (flags, env, config, behavior)
   - [ ] `docs/changelog.md` updated with a brief, precise summary
@@ -163,7 +185,7 @@ PRs that break the consolidation principles (e.g., re-adding `src/fec/*` trees) 
 
 
 ### Issue Reporting & Repro Steps
-- Use descriptive titles, include platform, CPU arch, and relevant features/modes (e.g., FEC mode, MASQUE, io_uring/XDP)
+- Use descriptive titles, include platform, CPU arch, and relevant features/modes (e.g., FEC mode, MASQUE, `io_uring`, internal AF_XDP experimental builds)
 - Provide exact commands and configs used (`config/quicfuscate.toml` snippet or flags)
 - Attach logs if possible (sanitize secrets)
 - For performance regressions, include throughput/latency numbers and hardware

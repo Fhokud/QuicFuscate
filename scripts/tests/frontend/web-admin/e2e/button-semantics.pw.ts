@@ -12,7 +12,6 @@ const CONFIG_TOML = [
   "mode = \"manual\"",
   "enable_domain_fronting = true",
   "enable_http3_masquerading = true",
-  "enable_xor_obfuscation = true",
   "use_tls_cover = true",
   "use_qpack_headers = true",
   "enable_traffic_padding = false",
@@ -24,7 +23,7 @@ const CONFIG_TOML = [
   "initial_mode = \"normal\"",
   "",
   "[transport]",
-  "cc_algorithm = \"cubic\"",
+  "cc_algorithm = \"bbr3\"",
   "mtu = 1400",
   "",
 ].join("\n");
@@ -35,6 +34,11 @@ function bump(counters: Map<string, number>, key: string) {
 
 function count(counters: Map<string, number>, key: string): number {
   return counters.get(key) ?? 0;
+}
+
+async function selectLogMode(page: Page, modeLabel: "Verbose" | "Normal" | "Minimal" | "No-Log"): Promise<void> {
+  const modeKey = modeLabel.toLowerCase().replace(/[^a-z]+/g, "-");
+  await page.getByTestId(`log-mode-${modeKey}`).click();
 }
 
 async function stubApi(page: Page, state: StubState, counters: Map<string, number>): Promise<void> {
@@ -284,14 +288,12 @@ test.describe("Button Semantics", () => {
     const configBase = {
       status: count(counters, "GET /api/status"),
       config: count(counters, "GET /api/config"),
-      qkeys: count(counters, "GET /api/qkeys"),
       auth: count(counters, "GET /api/admin/auth"),
     };
     await configRefresh.click();
     await expect(page.getByTestId("toast-message").first()).toContainText("Refreshed");
     await expect.poll(() => count(counters, "GET /api/status")).toBeGreaterThan(configBase.status);
     await expect.poll(() => count(counters, "GET /api/config")).toBeGreaterThan(configBase.config);
-    await expect.poll(() => count(counters, "GET /api/qkeys")).toBeGreaterThan(configBase.qkeys);
     await expect.poll(() => count(counters, "GET /api/admin/auth")).toBeGreaterThan(configBase.auth);
 
     const configSaveBase = count(counters, "POST /api/config");
@@ -316,7 +318,7 @@ test.describe("Button Semantics", () => {
     await expect.poll(() => count(counters, "GET /api/logs")).toBeGreaterThan(logsBase.logs);
 
     const logsSaveBase = count(counters, "POST /api/config/logging");
-    await page.locator("label:has-text('Verbose')").first().click();
+    await selectLogMode(page, "Verbose");
     await page.locator("main button.action-save-btn:has-text('Save')").first().click();
     await expect(page.getByTestId("toast-message").first()).toContainText("Changes saved");
     await expect.poll(() => count(counters, "POST /api/config/logging")).toBeGreaterThan(logsSaveBase);

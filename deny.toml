@@ -6,13 +6,13 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  "RUSTSEC-2024-0436",
-]
+ignore = []
 
 [licenses]
 version = 2
-confidence-threshold = 0.8
+# Raised from 0.8 to 0.93 to reduce false-positive license detection while still
+# allowing minor ambiguity in SPDX expression parsing (e.g. dual-licensed crates).
+confidence-threshold = 0.93
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
@@ -31,7 +31,32 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "allow"
+multiple-versions = "deny"
+# Known intentional duplicates (different major versions required by dependency tree):
+skip = [
+    # password-hash 0.5 transitively pulls rand_core 0.6; rand 0.9 uses rand_core 0.9
+    { crate = "rand_core" },
+    # Transitive dep version splits from mixed dependency tree (tokio, reqwest, rustls, etc.)
+    { crate = "base64" },
+    { crate = "core-foundation" },
+    { crate = "crypto-common" },
+    { crate = "getrandom" },
+    { crate = "socket2" },
+    { crate = "webpki-roots" },
+    { crate = "windows-link" },
+    { crate = "windows-result" },
+    { crate = "windows-strings" },
+    { crate = "windows-sys" },
+    { crate = "windows-targets" },
+    { crate = "windows_aarch64_gnullvm" },
+    { crate = "windows_aarch64_msvc" },
+    { crate = "windows_i686_gnu" },
+    { crate = "windows_i686_gnullvm" },
+    { crate = "windows_i686_msvc" },
+    { crate = "windows_x86_64_gnu" },
+    { crate = "windows_x86_64_gnullvm" },
+    { crate = "windows_x86_64_msvc" },
+]
 wildcards = "allow"
 highlight = "all"
 

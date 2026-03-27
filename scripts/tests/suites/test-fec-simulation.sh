@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 [[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
 
-OUTPUT_DIR=""; FAST=0; COMPACT=1; DRY_RUN=""; RUSTFLAGS_EXTRA=""; CARGO_FEATURES=""; JOBS=""
+OUTPUT_DIR=""; FAST=0; COMPACT=1; RUSTFLAGS_EXTRA=""; CARGO_FEATURES=""; JOBS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
@@ -17,11 +17,10 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h)
       echo "Usage: $(basename "$0") [options]"; echo "FEC Simulation Comprehensive Suite"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -31,7 +30,7 @@ BASE_NAME="$(basename "$0" .sh)"
 mkdir -p "$OUTPUT_DIR"; LOG_FILE="$OUTPUT_DIR/${BASE_NAME}.log"
 
 echo "===============================================================" | tee -a "$LOG_FILE"
-echo "  FEC Simulation Comprehensive Suite" | tee -a "$LOG_FILE"
+echo "  FEC Internal Machine-Room Simulation Suite" | tee -a "$LOG_FILE"
 echo "===============================================================" | tee -a "$LOG_FILE"
 print_system_banner | tee -a "$LOG_FILE"
 
@@ -197,14 +196,6 @@ MATRIX_JSON="$OUTPUT_DIR/matrix.json"
   echo '}'
 } > "$MATRIX_JSON"
 
-# Optional: E2E fec_sim (one pass per key mode)
-for m in normal streaming extreme; do
-  echo -e "\n> E2E fec_sim example (mode=$m)" | tee -a "$LOG_FILE"
-  if run_cargo_logged "QUICFUSCATE_FEC_INITIAL_MODE=${m}" run --release --example fec_sim -- --size 1200 --k 64 --loss 0.15 >>"$OUTPUT_DIR/fec_sim_${m}.txt" 2>&1; then
-    grep '^METRIC ' "$OUTPUT_DIR/fec_sim_${m}.txt" || true
-  else
-    echo "(fec_sim example unavailable)" | tee -a "$LOG_FILE"
-  fi
-done
+# fec_sim e2e tests moved to test-fec-e2e-loss.sh (TODO-370)
 
 exit $(( FAIL > 0 ))

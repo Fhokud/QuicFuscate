@@ -1,0 +1,20 @@
+{
+  "name": "quicfuscate-desktop",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "cd ../svelte-desktop && bun run dev",
+    "build": "cd ../svelte-desktop && bun run build",
+    "preview": "cd ../svelte-desktop && bun run preview",
+    "tauri": "CI=true bunx @tauri-apps/cli",
+    "check": "cd ../svelte-desktop && bun run check",
+    "test": "cd ../svelte-desktop && bun run test",
+    "test:unit": "cd ../svelte-desktop && bun run test:unit",
+    "test:unit:watch": "cd ../svelte-desktop && bun run test:unit:watch",
+    "test:e2e": "cd ../svelte-desktop && bun run test:e2e",
+    "test:e2e:ui": "cd ../svelte-desktop && bun run test:e2e:ui",
+    "test:e2e:debug": "cd ../svelte-desktop && bun run test:e2e:debug",
+    "serve:codex": "cd ../svelte-desktop && bun run serve:codex"
+  }
+}

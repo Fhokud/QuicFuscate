@@ -97,7 +97,8 @@ fn send_command(socket_path: &str, cmd: &str) -> Result<(), Box<dyn std::error::
     reader.read_line(&mut response)?;
 
     // Parse and format response
-    let resp: serde_json::Value = serde_json::from_str(&response)?;
+    let resp: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|e| format!("Malformed server response (not valid JSON): {}", e))?;
 
     if resp["success"].as_bool().unwrap_or(false) {
         if let Some(data) = resp.get("data") {
@@ -175,7 +176,10 @@ fn format_output(data: &serde_json::Value) {
     }
 
     // Default: pretty print JSON
-    println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+    match serde_json::to_string_pretty(data) {
+        Ok(json) => println!("{}", json),
+        Err(e) => eprintln!("Warning: could not serialize response data: {}", e),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

@@ -1,0 +1,203 @@
+/* Layout and Spacing System */
+
+/* Pane spacing (right-side content panels) */
+.pane-header {
+  padding-left: 1.25rem;
+  padding-right: 1.25rem;
+  padding-top: 1rem;
+  padding-bottom: 1.25rem;
+}
+
+.pane-body {
+  padding-left: 1.25rem;
+  padding-right: 1.25rem;
+  padding-bottom: 1.25rem;
+}
+
+.pane-heading-gap {
+  margin-bottom: 1.25rem;
+}
+
+.pane-first-item-offset {
+  padding-top: 0.5rem;
+}
+
+.app-pane-scroll {
+  width: 100%;
+  overflow-x: hidden;
+  scrollbar-gutter: stable both-edges;
+}
+
+/* Dialog spacing */
+.dialog-header-pad {
+  padding: 1rem 1.25rem 0.75rem;
+}
+
+.dialog-body-pad {
+  padding: 0 1.25rem 1rem;
+}
+
+.dialog-footer-pad {
+  padding: 0 1.25rem 1.25rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* Desktop stage (Tauri window) */
+.desktop-stage {
+  width: 900px;
+  min-width: 900px;
+  height: 937px;
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* Tunnel card constraints */
+.tunnel-card-shell {
+  min-height: 88px;
+}
+
+.tunnel-card-header {
+  min-height: 64px;
+}
+
+.tunnel-card-indicator {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: #5f67f6;
+  pointer-events: none;
+}
+
+/* Metric accent override */
+.metric-value-accent {
+  color: var(--color-accent) !important;
+  font-weight: 700 !important;
+}
+
+/* Typography classes */
+.content-typography {
+  font-family: var(--font-content);
+  color: var(--color-text-primary);
+}
+
+.content-typography .text-text-primary,
+.content-typography .text-text-secondary,
+.content-typography .text-text-tertiary,
+.content-typography .text-text-ghost,
+.content-typography [class*="text-text-primary"],
+.content-typography [class*="text-text-secondary"],
+.content-typography [class*="text-text-tertiary"],
+.content-typography [class*="text-text-ghost"] {
+  color: #000000 !important;
+}
+
+.content-typography :is(button, [role="button"], input, select, textarea) {
+  font-family: var(--font-sans);
+}
+
+/* Dialog typography - force sans-serif and black text inside dialogs */
+.dialog-typography {
+  font-family: var(--font-sans) !important;
+}
+
+.dialog-typography * {
+  font-family: var(--font-sans) !important;
+}
+
+.dialog-typography .text-text-primary,
+.dialog-typography .text-text-secondary,
+.dialog-typography .text-text-tertiary,
+.dialog-typography .text-text-ghost,
+.dialog-typography [class*="text-text-primary"],
+.dialog-typography [class*="text-text-secondary"],
+.dialog-typography [class*="text-text-tertiary"],
+.dialog-typography [class*="text-text-ghost"] {
+  color: #000000 !important;
+}
+
+.dashboard-heading-sans {
+  font-family: var(--font-sans);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.qkey-text-input {
+  font-family: var(--font-sans);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  unicode-bidi: plaintext;
+}
+
+/* Screen reader only */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* IP scroll column with auto-hiding scrollbar */
+.ip-scroll-col {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.3s ease;
+}
+
+.ip-scroll-col:hover {
+  scrollbar-color: rgba(0, 0, 0, 0.12) transparent;
+}
+
+.ip-scroll-col::-webkit-scrollbar {
+  width: 4px;
+}
+
+.ip-scroll-col::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ip-scroll-col::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+}
+
+.ip-scroll-col:hover::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+/* Toast notification - prevent global style leaking into toast card */
+.qf-notify-host :is(div, p, svg, path) {
+  color: inherit !important;
+}
+
+.qf-notify-card {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.qf-notify-host .qf-notify-card .qf-notify-text {
+  color: var(--qf-notify-color) !important;
+}
+
+.qf-notify-icon,
+.qf-notify-icon * {
+  color: currentColor !important;
+}
+
+/* Force near-black text for configuration panel readability */
+.config-black-text .text-text-primary,
+.config-black-text .text-text-secondary,
+.config-black-text .text-text-tertiary,
+.config-black-text .text-text-ghost {
+  color: #0f1012 !important;
+}

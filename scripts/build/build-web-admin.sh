@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Description: Build the React web-admin UI and publish bundle to assets/web-admin.
+# Description: Build the Svelte web-admin UI and publish bundle to assets/web-admin.
 set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
   cat <<'EOF'
 Usage: build-web-admin.sh
 
-Builds apps/web-admin-ui with Bun and copies dist/* to assets/web-admin.
+Builds apps/svelte-admin with Bun and copies build/* to assets/web-admin.
 By default, existing assets/web-admin content is replaced without archiving.
 To archive existing assets first:
   - pass --archive-existing
@@ -37,22 +37,22 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-REACT_APP_DIR="$PROJECT_ROOT/apps/web-admin-ui"
+SVELTE_APP_DIR="$PROJECT_ROOT/apps/svelte-admin"
 
-if [ ! -d "$REACT_APP_DIR" ] || [ ! -f "$REACT_APP_DIR/package.json" ]; then
-  echo "React web-admin UI not found at: $REACT_APP_DIR" >&2
+if [ ! -d "$SVELTE_APP_DIR" ] || [ ! -f "$SVELTE_APP_DIR/package.json" ]; then
+  echo "Svelte web-admin UI not found at: $SVELTE_APP_DIR" >&2
   exit 1
 fi
 
 if ! command -v bun >/dev/null 2>&1; then
-  echo "bun not found. Install Bun to build the React web-admin UI." >&2
+  echo "bun not found. Install Bun to build the Svelte web-admin UI." >&2
   exit 1
 fi
 
-cd "$REACT_APP_DIR"
+cd "$SVELTE_APP_DIR"
 bun install --no-progress
 bun run build
-SOURCE="$REACT_APP_DIR/dist"
+SOURCE="$SVELTE_APP_DIR/build"
 DEST="$PROJECT_ROOT/assets/web-admin"
 
 if [ ! -d "$SOURCE" ]; then

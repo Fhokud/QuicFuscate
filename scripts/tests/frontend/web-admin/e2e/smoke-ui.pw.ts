@@ -5,7 +5,6 @@ const CONFIG_TOML = [
   "mode = \"manual\"",
   "enable_domain_fronting = true",
   "enable_http3_masquerading = true",
-  "enable_xor_obfuscation = true",
   "use_tls_cover = true",
   "use_qpack_headers = true",
   "enable_traffic_padding = false",
@@ -17,7 +16,7 @@ const CONFIG_TOML = [
   "initial_mode = \"normal\"",
   "",
   "[transport]",
-  "cc_algorithm = \"cubic\"",
+  "cc_algorithm = \"bbr3\"",
   "mtu = 1400",
   "",
 ].join("\n");
@@ -226,7 +225,7 @@ test.describe("Web Admin UI Smoke", () => {
     await dialog.getByLabel("Port [1-65535]", { exact: true }).fill("4433");
     await expect(dialogGenerate).toBeEnabled();
 
-    const sniSelectButton = dialog.getByRole("button", { name: /Domain Fronting \[SNI\]/ });
+    const sniSelectButton = dialog.getByRole("button", { name: "Domain Fronting mode", exact: true });
     await expect(sniSelectButton).toBeVisible();
     await expect(sniSelectButton).toContainText("Auto [Rotating]");
     await dialog.getByRole("button", { name: "Cancel" }).click();

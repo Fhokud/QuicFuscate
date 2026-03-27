@@ -13,7 +13,7 @@ fn connection_datagram_queues_and_thresholds() {
 
     conn.set_ack_eliciting_threshold(5);
     assert_eq!(conn.ack_eliciting_threshold(), 5);
-    conn.set_external_pacing(true);
+    conn.set_external_pacing_for_test(true);
     assert!(conn.external_pacing_enabled());
 
     conn.enable_datagrams(0, 1);
@@ -39,12 +39,91 @@ fn connection_migrate_emits_path_events_in_order() {
     assert!(path_id > 0);
 
     let ev1 = conn.path_event_next().expect("event 1");
+    assert!(matches!(ev1, PathEvent::New(_, _)));
+    assert!(conn.path_event_next().is_none());
+    assert_eq!(conn.path_stats().next().expect("path stats").peer_addr, peer);
+
+    let (_, pending_local, pending_peer, challenge) =
+        conn.pending_path_validation_for_test().expect("pending validation");
+    assert_eq!(pending_local, new_local);
+    assert_eq!(pending_peer, new_peer);
+
+    conn.receive_path_response_for_test(new_local, new_peer, challenge);
+
     let ev2 = conn.path_event_next().expect("event 2");
     let ev3 = conn.path_event_next().expect("event 3");
-    assert!(matches!(ev1, PathEvent::New(_, _)));
     assert!(matches!(ev2, PathEvent::Validated(_, _)));
     assert!(matches!(ev3, PathEvent::PeerMigrated(_, _)));
     assert!(conn.path_event_next().is_none());
+    assert_eq!(conn.path_stats().next().expect("path stats").peer_addr, new_peer);
+}
+
+#[test]
+fn connection_migrate_ignores_mismatched_path_response() {
+    let mut cfg = Config::new_with_version(PROTOCOL_VERSION).expect("config");
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().expect("local");
+    let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("peer");
+    let scid = ConnectionId::from_ref(&[3u8; 8]);
+    let mut conn = packet::connect(None, scid.as_ref(), local, peer, &mut cfg).expect("connect");
+
+    let new_local: std::net::SocketAddr = "127.0.0.1:4444".parse().expect("new local");
+    let new_peer: std::net::SocketAddr = "127.0.0.1:5555".parse().expect("new peer");
+    conn.migrate(new_local, new_peer).expect("migrate");
+    let (_, pending_local, pending_peer, challenge) =
+        conn.pending_path_validation_for_test().expect("pending validation");
+    let mut wrong = challenge;
+    wrong[0] ^= 0x5a;
+
+    conn.receive_path_response_for_test(pending_local, pending_peer, wrong);
+
+    assert!(conn.path_event_next().is_some());
+    assert!(conn.path_event_next().is_none());
+    assert_eq!(conn.path_stats().next().expect("path stats").peer_addr, peer);
+    assert!(conn.pending_path_validation_for_test().is_some());
+}
+
+#[test]
+fn connection_migrate_times_out_pending_validation() {
+    let mut cfg = Config::new_with_version(PROTOCOL_VERSION).expect("config");
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().expect("local");
+    let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("peer");
+    let scid = ConnectionId::from_ref(&[4u8; 8]);
+    let mut conn = packet::connect(None, scid.as_ref(), local, peer, &mut cfg).expect("connect");
+
+    let new_local: std::net::SocketAddr = "127.0.0.1:4444".parse().expect("new local");
+    let new_peer: std::net::SocketAddr = "127.0.0.1:5555".parse().expect("new peer");
+    conn.migrate(new_local, new_peer).expect("migrate");
+    conn.expire_pending_path_validation_for_test();
+
+    let ev1 = conn.path_event_next().expect("event 1");
+    let ev2 = conn.path_event_next().expect("event 2");
+    assert!(matches!(ev1, PathEvent::New(_, _)));
+    assert!(matches!(ev2, PathEvent::FailedValidation(_, _)));
+    assert!(conn.path_event_next().is_none());
+    assert!(conn.pending_path_validation_for_test().is_none());
+    assert_eq!(conn.path_stats().next().expect("path stats").peer_addr, peer);
+}
+
+#[test]
+fn connection_migrate_enforces_post_validation_cooldown() {
+    let mut cfg = Config::new_with_version(PROTOCOL_VERSION).expect("config");
+    let local: std::net::SocketAddr = "127.0.0.1:0".parse().expect("local");
+    let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("peer");
+    let scid = ConnectionId::from_ref(&[5u8; 8]);
+    let mut conn = packet::connect(None, scid.as_ref(), local, peer, &mut cfg).expect("connect");
+
+    let first_local: std::net::SocketAddr = "127.0.0.1:4444".parse().expect("first local");
+    let first_peer: std::net::SocketAddr = "127.0.0.1:5555".parse().expect("first peer");
+    conn.migrate(first_local, first_peer).expect("migrate");
+    let (_, pending_local, pending_peer, challenge) =
+        conn.pending_path_validation_for_test().expect("pending validation");
+    conn.receive_path_response_for_test(pending_local, pending_peer, challenge);
+
+    let second_peer: std::net::SocketAddr = "127.0.0.1:6666".parse().expect("second peer");
+    let err = conn
+        .migrate(first_local, second_peer)
+        .expect_err("cooldown should block immediate re-migration");
+    assert!(matches!(err, ConnectionError::InvalidState));
 }
 
 #[test]

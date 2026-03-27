@@ -20,10 +20,9 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --iters) ITERS="$2"; shift;;
     --sizes) shift; SIZES=( ); while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^-- ]]; do SIZES+=("$1"); shift; done; continue;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--iters N] [--sizes <list>]"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 

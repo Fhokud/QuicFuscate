@@ -14,10 +14,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --strict) STRICT=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [options]"; echo "Comprehensive Security & Quality Audit"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -210,7 +209,7 @@ echo -e "\n> Checking allocations in hot paths..."
 HOT_PATH_ALLOCS=$(
 python3 - <<'PY'
 import pathlib, re
-files = ["src/transport/connection.rs", "src/transport/packet.rs", "src/crypto.rs"]
+files = ["src/transport/connection.rs", "src/transport/packet.rs", "src/crypto/mod.rs"]
 alloc = re.compile(r"\b(Vec::new|String::new|Box::new|to_vec\()")
 loop = re.compile(r"\b(for|while|loop)\b")
 comment = re.compile(r"^\s*//")
@@ -251,6 +250,17 @@ else
     log_info "Clippy warnings acceptable: $CLIPPY_WARNINGS"
 fi
 
+echo -e "\n> Checking for commented-out code blocks..."
+COMMENTED_CODE_RE='^\s*//\s*(pub\s+(struct|enum|trait|mod|fn|const|type)\b|fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(|impl\b|let\s+[A-Za-z_][A-Za-z0-9_]*\s*=|if\s*\(|for\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b|while\s+|match\s+[A-Za-z_0-9_:]+\s*\{|use\s+[A-Za-z_][A-Za-z0-9_:]*(\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*;|mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;)'
+COMMENTED_CODE_LOCATIONS="$(rg -n --no-heading -e "$COMMENTED_CODE_RE" src -g '*.rs' -g '!**/tests/**' || true)"
+COMMENTED_CODE_COUNT=$(printf "%s\n" "$COMMENTED_CODE_LOCATIONS" | sed '/^$/d' | count_lines)
+if [ "$COMMENTED_CODE_COUNT" -gt 0 ]; then
+    log_warning "Commented-out code detected: $COMMENTED_CODE_COUNT locations"
+    printf "%s\n" "$COMMENTED_CODE_LOCATIONS" | head -5 | tee -a "$AUDIT_LOG" || true
+else
+    log_info "No commented-out code patterns detected in src/"
+fi
+
 echo -e "\n> Checking documentation coverage..."
 DOC_OUTPUT=$(cargo doc --no-deps 2>&1 || true)
 MISSING_DOCS=$(echo "$DOC_OUTPUT" | grep -c "missing documentation" || true)
@@ -271,6 +281,13 @@ else
 fi
 if [[ $JSON_FIRST_RUN -eq 0 ]]; then echo "," >> "$JSON"; fi; JSON_FIRST_RUN=0
 echo -n '  {"unsafe_in_prod":'"$UNSAFE_IN_PROD"',"unwrap_calls":'"$UNWRAP_COUNT"',"panic_macros":'"$PANIC_COUNT"',"secrets":'"$SECRET_COUNT"',"leak_patterns":'"$LEAK_COUNT"',"simd_features":'"$SIMD_FEATURES"',"test_coverage_percent":'"$TEST_COVERAGE"'}' >> "$JSON"
+
+echo -e "\n> Running runtime guardrails..."
+if "$SCRIPT_DIR/audit-runtime-guardrails.sh" --output-dir "$OUTPUT_DIR/runtime-guardrails"; then
+    log_info "Runtime guardrails passed"
+else
+    log_critical "Runtime guardrails failed (see $OUTPUT_DIR/runtime-guardrails)"
+fi
 
 # Complexity Audit
 echo -e "\n+===============================================================+"

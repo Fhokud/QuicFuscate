@@ -13,34 +13,63 @@ pub fn derive_hp_key(secret: &[u8]) -> [u8; 16] {
     hp
 }
 
+/// Long header form bit (0x80) - set for long headers, clear for short headers.
 pub const FORM_BIT: u8 = 0x80;
+/// Fixed bit (0x40) - must be set in all QUIC packets except Version Negotiation.
 pub const FIXED_BIT: u8 = 0x40;
+/// Key phase bit (0x04) in short header first byte.
 pub const KEY_PHASE_BIT: u8 = 0x04;
+/// Packet type mask (0x30) for long header type field extraction.
 pub const TYPE_MASK: u8 = 0x30;
+/// Packet number length mask (0x03) - low 2 bits encode PN length minus 1.
 pub const PKT_NUM_MASK: u8 = 0x03;
 
+/// Maximum Connection ID length per RFC 9000 (20 bytes).
 pub const MAX_CID_LEN: usize = 20;
+/// Maximum packet number encoding length (4 bytes).
 pub const MAX_PKT_NUM_LEN: usize = 4;
 /// Bytes of sample used for HP
 pub const SAMPLE_LEN: usize = 16;
 
 /// Header protection trait for masking packet numbers
 pub trait HeaderProtector {
+    /// Derives a 5-byte HP mask from a 16-byte sample.
     fn new_mask(&self, sample: &[u8]) -> [u8; 5];
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum PacketType {
-    Initial,
-    Retry,
-    Handshake,
-    ZeroRTT,
-    VersionNegotiation,
-    Short,
+fn trace_handshake_hp(label: &str, sample: &[u8], mask: [u8; 5]) {
+    log::trace!(
+        "[pkt] {} sample={:02x}{:02x}{:02x}{:02x} mask={:02x}{:02x}{:02x}{:02x}{:02x}",
+        label,
+        sample[0],
+        sample[1],
+        sample[2],
+        sample[3],
+        mask[0],
+        mask[1],
+        mask[2],
+        mask[3],
+        mask[4]
+    );
 }
+
+fn trace_open_failure(hdr: &Header, aad_len: usize, payload_len: usize) {
+    log::trace!(
+        "[pkt] open fail ty={:?} pn={} pn_len={} aad_len={} payload_len={}",
+        hdr.ty,
+        hdr.pkt_num,
+        hdr.pkt_num_len,
+        aad_len,
+        payload_len
+    );
+}
+
+// PacketType is defined once in transport.rs; re-export for local convenience.
+pub use super::PacketType;
 
 // Connection establishment functions (moved from transport.rs to externalize packet module API)
 
+/// Creates a new client-side QUIC connection with the given parameters.
 pub fn connect(
     _sni: Option<&str>,
     scid: &[u8],
@@ -72,6 +101,7 @@ pub fn connect(
     Ok(conn)
 }
 
+/// Creates a new server-side QUIC connection accepting a client handshake.
 pub fn accept(
     scid: &[u8],
     odcid: Option<&[u8]>,
@@ -101,16 +131,26 @@ pub fn accept(
     Ok(conn)
 }
 
+/// Parsed QUIC packet header (Vec-based variant used during packet processing).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Header {
+    /// Packet type.
     pub ty: PacketType,
+    /// QUIC version (0 for short header or Version Negotiation).
     pub version: u32,
+    /// Destination Connection ID bytes.
     pub dcid: Vec<u8>,
+    /// Source Connection ID bytes (empty for short headers).
     pub scid: Vec<u8>,
+    /// Decoded packet number.
     pub pkt_num: u64,
+    /// On-wire packet number encoding length in bytes (1-4).
     pub pkt_num_len: usize,
+    /// Token from Initial or Retry packets.
     pub token: Option<Vec<u8>>,
+    /// Supported versions from Version Negotiation packets.
     pub versions: Option<Vec<u32>>,
+    /// Key phase bit for 1-RTT key rotation.
     pub key_phase: bool,
 }
 
@@ -355,12 +395,8 @@ fn unprotect_and_decrypt_with_key(
     let pn_len;
     if buf.len() >= sample_off + 16 {
         let mask = hp.new_mask(&buf[sample_off..sample_off + 16]);
-        if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() && hdr.ty == PacketType::Handshake {
-            let s = &buf[sample_off..sample_off + 16];
-            eprintln!(
-                "[pkt] hp open hs sample={:02x}{:02x}{:02x}{:02x} mask={:02x}{:02x}{:02x}{:02x}{:02x}",
-                s[0], s[1], s[2], s[3], mask[0], mask[1], mask[2], mask[3], mask[4]
-            );
+        if hdr.ty == PacketType::Handshake {
+            trace_handshake_hp("hp open hs", &buf[sample_off..sample_off + 16], mask);
         }
         if hdr.ty == PacketType::Short {
             buf[0] ^= mask[0] & 0x1f;
@@ -414,12 +450,7 @@ fn unprotect_and_decrypt_with_key(
     let plaintext_len = match aead.open_with_u64_counter(hdr.pkt_num, aad, payload_buf) {
         Ok(n) => n,
         Err(e) => {
-            if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                eprintln!(
-                    "[pkt] open fail ty={:?} pn={} pn_len={} aad_len={} payload_len={}",
-                    hdr.ty, hdr.pkt_num, hdr.pkt_num_len, aad_len, payload_len
-                );
-            }
+            trace_open_failure(&hdr, aad_len, payload_len);
             return Err(e);
         }
     };
@@ -483,7 +514,7 @@ pub fn unprotect_and_decrypt(
                 return Err(ConnectionError::Done);
             }
             let original = if candidates.len() > 1 { Some(buf.to_vec()) } else { None };
-            let mut last_err = ConnectionError::CryptoFail;
+            let mut last_err = ConnectionError::CryptoError("crypto failure".into());
             for (i, (hp, aead)) in candidates.into_iter().enumerate() {
                 if i > 0 {
                     if let Some(orig) = original.as_ref() {
@@ -692,7 +723,7 @@ mod tests {
     }
 }
 
-/// Minimal header formatting to get PN offset and header fields
+/// Applies header protection to an outgoing packet (masks first byte and PN).
 pub fn protect_header(
     crypto: &CryptoContext,
     buf: &mut [u8],
@@ -721,12 +752,8 @@ pub fn protect_header(
     }
 
     let mask = hp.new_mask(&buf[sample_off..sample_off + 16]);
-    if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() && pkt_type == PacketType::Handshake {
-        let s = &buf[sample_off..sample_off + 16];
-        eprintln!(
-            "[pkt] hp protect hs sample={:02x}{:02x}{:02x}{:02x} mask={:02x}{:02x}{:02x}{:02x}{:02x}",
-            s[0], s[1], s[2], s[3], mask[0], mask[1], mask[2], mask[3], mask[4]
-        );
+    if pkt_type == PacketType::Handshake {
+        trace_handshake_hp("hp protect hs", &buf[sample_off..sample_off + 16], mask);
     }
 
     // Mask the first byte
@@ -795,6 +822,7 @@ pub fn encrypt_and_protect(
     Ok(hdr_len + ciphertext_len)
 }
 
+/// Formats a Version Negotiation packet into `out`.
 pub fn negotiate_version(
     scid: &[u8],
     dcid: &[u8],
@@ -834,6 +862,7 @@ pub fn negotiate_version(
     Ok(off)
 }
 
+/// Appends a Retry Integrity Tag to a Retry packet buffer (RFC 9001 Section 5.8).
 pub fn append_retry_tag(buf: &mut Vec<u8>, _odcid: &[u8], _version: u32) {
     let hdr_len = buf.len();
     let mut pseudo = Vec::with_capacity(1 + _odcid.len() + hdr_len);
@@ -854,6 +883,7 @@ pub fn append_retry_tag(buf: &mut Vec<u8>, _odcid: &[u8], _version: u32) {
     buf.extend_from_slice(&tag);
 }
 
+/// Verifies the Retry Integrity Tag of a received Retry packet.
 pub fn verify_retry_tag(packet: &[u8], odcid: &[u8], _version: u32) -> Result<(), ConnectionError> {
     if packet.len() < 16 {
         return Err(ConnectionError::BufferTooShort);
@@ -882,7 +912,7 @@ pub fn verify_retry_tag(packet: &[u8], odcid: &[u8], _version: u32) -> Result<()
     if diff == 0 {
         Ok(())
     } else {
-        Err(ConnectionError::CryptoFail)
+        Err(ConnectionError::CryptoError("crypto failure".into()))
     }
 }
 
@@ -1027,6 +1057,7 @@ pub struct CryptoStream {
 }
 
 impl CryptoStream {
+    /// Creates a new empty CryptoStream.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1091,6 +1122,7 @@ impl CryptoStream {
         self.recv_buf.contains_key(&self.recv_off)
     }
 
+    /// Resets all buffers and offsets to initial state.
     pub fn reset(&mut self) {
         self.send_buf.clear();
         self.send_off = 0;
@@ -1100,10 +1132,12 @@ impl CryptoStream {
     }
 }
 
-// Internal TLS Cover cipher helper (ChaCha20-Poly1305 or AES-128-GCM)
+/// Identifies the AEAD algorithm used for TLS Cover traffic encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsCoverCipherKind {
+    /// ChaCha20-Poly1305 AEAD.
     ChaCha20Poly1305,
+    /// AES-128-GCM AEAD.
     Aes128Gcm,
 }
 
@@ -1123,7 +1157,7 @@ impl TlsCoverCipher {
     ) -> Result<usize, ConnectionError> {
         match self {
             TlsCoverCipher::ChaCha(cipher) => {
-                crate::crypto::aead_legacy::AeadSeal::seal_with_u64_counter(
+                crate::crypto::aead::AeadSeal::seal_with_u64_counter(
                     cipher,
                     counter,
                     aad,
@@ -1147,7 +1181,7 @@ impl TlsCoverCipher {
     fn open(&self, counter: u64, aad: &[u8], buffer: &mut [u8]) -> Result<usize, ConnectionError> {
         match self {
             TlsCoverCipher::ChaCha(cipher) => {
-                crate::crypto::aead_legacy::AeadOpen::open_with_u64_counter(
+                crate::crypto::aead::AeadOpen::open_with_u64_counter(
                     cipher, counter, aad, buffer,
                 )
             }
@@ -1172,47 +1206,70 @@ struct PreviousRead1RttKey {
     open: Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>,
 }
 
-// --- Crypto context with direct AEGIS integration ---
+/// Per-connection cryptographic state (AEAD keys, HP keys, TLS Cover cipher, CryptoStreams).
 #[derive(Default)]
 pub struct CryptoContext {
-    // Initial/Handshake must use AES-GCM for compatibility
+    /// AEAD open (decrypt) key for Initial packets (AES-GCM).
     pub open_initial: Option<Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>>,
+    /// AEAD open (decrypt) key for Handshake packets (AES-GCM).
     pub open_handshake: Option<Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>>,
-    // 0-RTT and 1-RTT use CPU-selected AEAD (AEGIS-128L when hardware AES is available, otherwise MORUS).
+    /// AEAD open (decrypt) key for 0-RTT packets (forked data-plane AEAD).
     pub open_0rtt: Option<Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>>,
+    /// AEAD open (decrypt) key for 1-RTT packets (forked data-plane AEAD).
     pub open_1rtt: Option<Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>>,
+    /// AEAD seal (encrypt) key for Initial packets.
     pub seal_initial: Option<Box<dyn crate::crypto::aead::AeadSeal + Send + Sync>>,
+    /// AEAD seal (encrypt) key for Handshake packets.
     pub seal_handshake: Option<Box<dyn crate::crypto::aead::AeadSeal + Send + Sync>>,
+    /// AEAD seal (encrypt) key for 0-RTT packets.
     pub seal_0rtt: Option<Box<dyn crate::crypto::aead::AeadSeal + Send + Sync>>,
+    /// AEAD seal (encrypt) key for 1-RTT packets.
     pub seal_1rtt: Option<Box<dyn crate::crypto::aead::AeadSeal + Send + Sync>>,
+    /// Header protection key for outgoing Initial packets.
     pub hp_initial: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for outgoing Handshake packets.
     pub hp_handshake: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for outgoing 0-RTT packets.
     pub hp_0rtt: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for outgoing 1-RTT packets.
     pub hp_1rtt: Option<Box<dyn HeaderProtector + Send + Sync>>,
-    // Separate header protection keys for inbound packets.
-    // QUIC derives distinct keys per direction; using a single HP key breaks interop.
+    /// Header protection key for incoming Initial packets (direction-specific).
     pub hp_initial_open: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for incoming Handshake packets (direction-specific).
     pub hp_handshake_open: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for incoming 0-RTT packets (direction-specific).
     pub hp_0rtt_open: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Header protection key for incoming 1-RTT packets (direction-specific).
     pub hp_1rtt_open: Option<Box<dyn HeaderProtector + Send + Sync>>,
+    /// Current 1-RTT read secret for key update derivation.
     pub read_secret_1rtt: Option<Vec<u8>>,
+    /// Current 1-RTT write secret for key update derivation.
     pub write_secret_1rtt: Option<Vec<u8>>,
+    /// Current 1-RTT read key generation counter.
     pub read_generation_1rtt: u64,
+    /// Current 1-RTT write key generation counter.
     pub write_generation_1rtt: u64,
+    /// Whether 0-RTT early data is enabled for this context.
     pub zero_rtt_enabled: bool,
     previous_read_1rtt: VecDeque<PreviousRead1RttKey>,
     seal_tls_cover: Option<TlsCoverCipher>,
     open_tls_cover: Option<TlsCoverCipher>,
+    /// TLS Cover write sequence number.
     pub tls_cover_write_seq: u64,
+    /// TLS Cover read sequence number.
     pub tls_cover_read_seq: u64,
-    // CryptoStreams for each encryption level
+    /// CRYPTO frame stream for Initial encryption level.
     pub crypto_initial: CryptoStream,
+    /// CRYPTO frame stream for 0-RTT encryption level.
     pub crypto_0rtt: CryptoStream,
+    /// CRYPTO frame stream for Handshake encryption level.
     pub crypto_handshake: CryptoStream,
+    /// CRYPTO frame stream for Application encryption level.
     pub crypto_application: CryptoStream,
 }
 
 impl CryptoContext {
+    /// Installs 0-RTT read and write keys from the given TLS secrets.
     pub fn install_0rtt_keys(&mut self, read_secret: &[u8], write_secret: &[u8]) {
         self.zero_rtt_enabled = true;
         let (read_key, read_iv) = derive_key_iv(read_secret);
@@ -1227,6 +1284,7 @@ impl CryptoContext {
 }
 
 impl CryptoContext {
+    /// Enables or disables 0-RTT key installation for this crypto context.
     pub fn set_zero_rtt_enabled(&mut self, enabled: bool) {
         self.zero_rtt_enabled = enabled;
     }
@@ -1248,6 +1306,7 @@ impl CryptoContext {
     }
 
     #[inline]
+    /// Returns the TLS Cover cipher algorithm in use, if configured.
     pub fn tls_cover_cipher_kind(&self) -> Option<TlsCoverCipherKind> {
         self.seal_tls_cover.as_ref().map(|cipher| cipher.kind())
     }
@@ -1258,7 +1317,10 @@ impl CryptoContext {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ConnectionError> {
-        let cipher = self.seal_tls_cover.as_ref().ok_or(ConnectionError::CryptoFail)?;
+        let cipher = self
+            .seal_tls_cover
+            .as_ref()
+            .ok_or(ConnectionError::CryptoError("crypto failure".into()))?;
 
         let seq = self.tls_cover_write_seq;
         self.tls_cover_write_seq = self.tls_cover_write_seq.wrapping_add(1);
@@ -1287,7 +1349,10 @@ impl CryptoContext {
         aad: &[u8],
         ciphertext: &mut [u8],
     ) -> Result<usize, ConnectionError> {
-        let cipher = self.open_tls_cover.as_ref().ok_or(ConnectionError::CryptoFail)?;
+        let cipher = self
+            .open_tls_cover
+            .as_ref()
+            .ok_or(ConnectionError::CryptoError("crypto failure".into()))?;
 
         let seq = self.tls_cover_read_seq;
         self.tls_cover_read_seq = self.tls_cover_read_seq.wrapping_add(1);
@@ -1360,6 +1425,7 @@ impl CryptoContext {
         }
     }
 
+    /// Rotates the 1-RTT read key, pushing the old key into the read window.
     pub fn rotate_1rtt_read_keypair(
         &mut self,
         open: Box<dyn crate::crypto::aead::AeadOpen + Send + Sync>,
@@ -1372,6 +1438,7 @@ impl CryptoContext {
         self.read_secret_1rtt = None;
     }
 
+    /// Rotates the 1-RTT write key, replacing the current sealer.
     pub fn rotate_1rtt_write_keypair(
         &mut self,
         seal: Box<dyn crate::crypto::aead::AeadSeal + Send + Sync>,
@@ -1381,6 +1448,7 @@ impl CryptoContext {
         self.write_secret_1rtt = None;
     }
 
+    /// Derives the next 1-RTT read secret and rotates the opener.
     pub fn key_update_1rtt_read(&mut self) -> bool {
         let Some(cur) = self.read_secret_1rtt.as_deref() else {
             return false;
@@ -1397,6 +1465,7 @@ impl CryptoContext {
         true
     }
 
+    /// Derives the next 1-RTT write secret and rotates the sealer.
     pub fn key_update_1rtt_write(&mut self) -> bool {
         let Some(cur) = self.write_secret_1rtt.as_deref() else {
             return false;

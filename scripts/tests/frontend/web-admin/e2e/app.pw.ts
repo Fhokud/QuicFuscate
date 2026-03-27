@@ -9,6 +9,14 @@ import { test, expect } from "@playwright/test";
  */
 
 test.describe("Web Admin UI", () => {
+  function appStage(page: any) {
+    return page.locator("#qf-app-stage");
+  }
+
+  async function waitForHydration(page: any) {
+    await expect(page.locator('#qf-app-stage[data-hydrated="true"]')).toBeVisible();
+  }
+
   async function ensureLoggedInIfPrompted(page: any) {
     const loginDialog = page.getByRole("dialog").first();
     const visible = await loginDialog.isVisible().catch(() => false);
@@ -64,13 +72,24 @@ test.describe("Web Admin UI", () => {
     expect(r.bottom).toBeLessThanOrEqual(stage.bottom + marginPx);
   }
 
+  async function selectLogMode(page: any, modeLabel: "Verbose" | "Normal" | "Minimal" | "No-Log") {
+    const modeKey = modeLabel.toLowerCase().replace(/[^a-z]+/g, "-");
+    await page.getByTestId(`log-mode-${modeKey}`).click();
+  }
+
+  async function setInputValue(locator: any, value: string) {
+    await locator.evaluate((el: HTMLInputElement, next: string) => {
+      el.value = next;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }, value);
+  }
+
   test.beforeEach(async ({ page }) => {
     let serverConfig = [
       "[stealth]",
       "mode = \"intelligent\"",
       "enable_domain_fronting = false",
       "enable_http3_masquerading = false",
-      "enable_xor_obfuscation = false",
       "use_tls_cover = false",
       "use_qpack_headers = false",
       "enable_traffic_padding = false",
@@ -157,6 +176,14 @@ test.describe("Web Admin UI", () => {
         }),
       });
     });
+    await page.route("**/api/csrf", async (route) => {
+      await route.fulfill({
+        status: 204,
+        headers: {
+          "X-CSRF-Token": "test-csrf-token",
+        },
+      });
+    });
     await page.route("**/api/config", async (route) => {
       const req = route.request();
       if (req.method() === "POST") {
@@ -234,13 +261,14 @@ test.describe("Web Admin UI", () => {
     });
 
     await page.goto("/");
+    await waitForHydration(page);
     await ensureLoggedInIfPrompted(page);
   });
 
   test.describe("App Shell", () => {
     test("page loads and renders main container", async ({ page }) => {
       // Main app container should exist
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
 
     test("renders sidebar navigation", async ({ page }) => {
@@ -271,6 +299,7 @@ test.describe("Web Admin UI", () => {
         });
       });
       await page.goto("/");
+      await waitForHydration(page);
     });
 
     test("shows login modal when not authenticated", async ({ page }) => {
@@ -298,6 +327,37 @@ test.describe("Web Admin UI", () => {
       await password.fill("123456");
       await expect(dialog.getByRole("button", { name: "Login" })).toBeDisabled();
     });
+
+    test("invalid login triggers motion feedback without inline error copy or layout shift", async ({ page }) => {
+      await page.unroute("**/api/login");
+      await page.route("**/api/login", async (route) => {
+        await route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          body: JSON.stringify({ success: false, message: "Invalid credentials" }),
+        });
+      });
+
+      const dialog = page.getByRole("dialog").first();
+      const username = dialog.locator('input[name="username"]');
+      const password = dialog.getByLabel("Password", { exact: true });
+
+      await setInputValue(username, "admin");
+      await setInputValue(password, "wrong-password");
+      await page.waitForTimeout(100);
+
+      const before = await dialog.boundingBox();
+      expect(before).not.toBeNull();
+
+      await dialog.getByRole("button", { name: "Login" }).click();
+
+      await expect(dialog).toHaveAttribute("data-auth-feedback", "reject");
+      await expect(page.getByText("Invalid credentials", { exact: true })).toHaveCount(0);
+      await expect(password).toBeFocused();
+
+      await page.waitForTimeout(650);
+      await expect(dialog).toBeVisible();
+    });
   });
 
   test.describe("Navigation", () => {
@@ -317,7 +377,7 @@ test.describe("Web Admin UI", () => {
       await page.waitForTimeout(300);
 
       // App should still be functional
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
   });
 
@@ -494,6 +554,7 @@ test.describe("Web Admin UI", () => {
     test("Save is disabled until config is dirty", async ({ page }) => {
       const nav = page.getByRole("navigation", { name: "Primary" });
       await nav.getByRole("button", { name: "Configuration" }).click();
+      await expect(page.getByRole("main").getByText("Configuration", { exact: true })).toBeVisible();
 
       const save = page.getByRole("button", { name: "Save" }).first();
       await expect(save).toBeDisabled();
@@ -884,16 +945,26 @@ test.describe("Web Admin UI", () => {
   });
 
   test.describe("QKeys", () => {
+    let issuedName: string | null = null;
+    const issuedQKey = "QKey-TEST-123";
+    const issuedId = "a1b2c3d4e5f6";
+    let created = false;
+    let revoked = false;
+
     test.beforeEach(async ({ page }) => {
-      let created = false;
-      let revoked = false;
+      created = false;
+      revoked = false;
+      issuedName = null;
       await page.unroute("**/api/qkey");
       await page.route("**/api/qkey", async (route) => {
+        const body = route.request().postDataJSON() as { name?: unknown };
+        const name = typeof body.name === "string" ? body.name.trim() : "";
+        issuedName = name.length > 0 ? name : null;
         created = true;
         await route.fulfill({
           status: 200,
           contentType: "application/json",
-          body: JSON.stringify({ success: true, data: { qkey: "QKey-TEST-123", created_at: 0, expires_at: null } }),
+          body: JSON.stringify({ success: true, data: { qkey: issuedQKey, created_at: 0, expires_at: null } }),
         });
       });
       await page.unroute("**/api/qkeys/revoke");
@@ -914,7 +985,7 @@ test.describe("Web Admin UI", () => {
             success: true,
             data: {
               keys: created && !revoked
-                ? [{ id: "k1", name: "Team Berlin", qkey: "QKey-TEST-123", stealth: "auto", fec: "auto", expires_at: null, created_at: 0 }]
+                ? [{ id: issuedId, name: issuedName, stealth: "auto", fec: "auto", expires_at: null, created_at: 0 }]
                 : [],
             },
           }),
@@ -945,36 +1016,48 @@ test.describe("Web Admin UI", () => {
       expect(postedBody).toEqual({ name: "Team Berlin", sni_strategy: "auto_rotating" });
     });
 
-    test("Generate updates issued list row", async ({ page }) => {
+    test("Generate shows a one-time reveal and metadata-only list row", async ({ page }) => {
       await page.getByRole("button", { name: "Generate" }).first().click();
-      await page.getByRole("dialog").getByRole("button", { name: "Generate" }).click();
-      await expect(page.getByText("Team Berlin", { exact: true })).toBeVisible();
-      await expect(page.getByText("QKey-TEST-123", { exact: true })).toBeVisible();
-      await expect(page.getByRole("button", { name: "Copy" }).first()).toBeVisible();
+      await page.getByLabel("Name of the Connection", { exact: true }).fill("Team Berlin");
+      await page.getByRole("dialog", { name: "Generate QKey" }).getByRole("button", { name: "Generate" }).click();
+      const issuedDialog = page.getByRole("dialog", { name: "Issued QKey" });
+      await expect(issuedDialog).toBeVisible();
+      await expect(issuedDialog.getByText("Team Berlin", { exact: true })).toBeVisible();
+      await expect(issuedDialog.getByText(issuedQKey, { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: /Team Berlin Registry ID/ })).toBeVisible();
+      await expect(page.getByText(issuedId, { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Copy QKey" })).toHaveCount(1);
     });
 
-    test("Generate accepts empty name and still creates a key", async ({ page }) => {
+    test("Generate accepts empty name and still reveals the credential", async ({ page }) => {
       await page.getByRole("button", { name: "Generate" }).first().click();
-      await page.getByRole("dialog").getByRole("button", { name: "Generate" }).click();
-      await expect(page.getByText("QKey-TEST-123", { exact: true })).toBeVisible();
+      await page.getByRole("dialog", { name: "Generate QKey" }).getByRole("button", { name: "Generate" }).click();
+      const issuedDialog = page.getByRole("dialog", { name: "Issued QKey" });
+      await expect(issuedDialog).toBeVisible();
+      await expect(issuedDialog.getByText(issuedQKey, { exact: true })).toBeVisible();
     });
 
-    test("Copy toggles inline feedback icon", async ({ page }) => {
+    test("Copy is available only inside the one-time reveal dialog", async ({ page }) => {
       await page.getByRole("button", { name: "Generate" }).first().click();
-      await page.getByRole("dialog").getByRole("button", { name: "Generate" }).click();
-      const copyBtn = page.getByRole("button", { name: "Copy" }).first();
+      await page.getByRole("dialog", { name: "Generate QKey" }).getByRole("button", { name: "Generate" }).click();
+      const issuedDialog = page.getByRole("dialog", { name: "Issued QKey" });
+      const copyBtn = issuedDialog.getByRole("button", { name: "Copy QKey" });
       await copyBtn.click();
       await expect(copyBtn).toBeVisible();
+      await issuedDialog.getByRole("button", { name: "Done" }).click();
+      await expect(page.getByRole("button", { name: "Copy QKey" })).toHaveCount(0);
       await expect(page.getByRole("alert")).toHaveCount(0);
     });
 
-    test("Revoke removes the issued key from the list", async ({ page }) => {
+    test("Revoke removes the issued metadata row from the list", async ({ page }) => {
       await page.getByRole("button", { name: "Generate" }).first().click();
-      await page.getByRole("dialog").getByRole("button", { name: "Generate" }).click();
-      await expect(page.getByText("QKey-TEST-123").first()).toBeVisible();
-
-      await expect(page.getByText("Team Berlin", { exact: true })).toBeVisible();
-      await page.getByRole("button", { name: "Revoke" }).first().click();
+      await page.getByLabel("Name of the Connection", { exact: true }).fill("Team Berlin");
+      await page.getByRole("dialog", { name: "Generate QKey" }).getByRole("button", { name: "Generate" }).click();
+      await page.getByRole("dialog", { name: "Issued QKey" }).getByRole("button", { name: "Done" }).click();
+      const row = page.getByTestId("qkey-row").filter({ hasText: issuedId }).first();
+      await expect(row).toBeVisible();
+      await expect(page.getByText(issuedId, { exact: true })).toBeVisible();
+      await row.getByRole("button", { name: "Revoke" }).click();
 
       await expect(page.getByText("No Keys created", { exact: true })).toBeVisible();
     });
@@ -990,11 +1073,14 @@ test.describe("Web Admin UI", () => {
       });
 
       await page.getByRole("button", { name: "Generate" }).first().click();
-      await page.getByRole("dialog").getByRole("button", { name: "Generate" }).click();
-      await expect(page.getByText("Team Berlin", { exact: true })).toBeVisible();
-      await page.getByRole("button", { name: "Revoke" }).first().click();
+      await page.getByLabel("Name of the Connection", { exact: true }).fill("Team Berlin");
+      await page.getByRole("dialog", { name: "Generate QKey" }).getByRole("button", { name: "Generate" }).click();
+      await page.getByRole("dialog", { name: "Issued QKey" }).getByRole("button", { name: "Done" }).click();
+      const row = page.getByTestId("qkey-row").filter({ hasText: issuedId }).first();
+      await expect(row).toBeVisible();
+      await row.getByRole("button", { name: "Revoke" }).click();
 
-      await expect(page.getByText("Team Berlin", { exact: true })).toBeVisible();
+      await expect(page.getByTestId("qkey-row").filter({ hasText: issuedId }).first()).toBeVisible();
       await expect(page.getByRole("alert")).toHaveCount(0);
     });
   });
@@ -1039,7 +1125,7 @@ test.describe("Web Admin UI", () => {
     });
 
     test("mode selection can be changed and saved", async ({ page }) => {
-      await page.locator("label").filter({ hasText: "Minimal" }).first().click();
+      await selectLogMode(page, "Minimal");
       await page.getByRole("button", { name: "Save" }).first().click();
       await expect(page.getByText("Changes saved", { exact: true })).toBeVisible();
     });
@@ -1063,7 +1149,7 @@ test.describe("Web Admin UI", () => {
         });
       });
 
-      await page.locator("label").filter({ hasText: "Minimal" }).first().click();
+      await selectLogMode(page, "Minimal");
       const save = page.getByRole("button", { name: "Save" }).first();
       await expect(save).toBeEnabled();
       await save.click();
@@ -1073,7 +1159,7 @@ test.describe("Web Admin UI", () => {
     });
 
     test("No-log mode hides output and shows help text", async ({ page }) => {
-      await page.locator("label").filter({ hasText: "No-Log" }).first().click();
+      await selectLogMode(page, "No-Log");
       await expect(page.getByText("Zero-Log Privacy Modus", { exact: true })).toBeVisible();
       await expect(
         page.getByText("Log output is disabled in No-Log mode. Switch to Normal or Verbose to view server logs.", { exact: true }),
@@ -1139,9 +1225,9 @@ test.describe("Web Admin UI", () => {
       const dialog = page.getByRole("dialog", { name: "Change Password" });
       await expect(dialog).toBeVisible();
 
-      await dialog.getByLabel("Current Password", { exact: true }).fill("123");
-      await dialog.getByLabel("New Password", { exact: true }).fill("abcdef");
-      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcdef");
+      await setInputValue(dialog.locator('input[name="admin-change-current-password"]'), "123");
+      await setInputValue(dialog.locator('input[name="admin-change-new-password"]'), "abcd");
+      await setInputValue(dialog.locator('input[name="admin-change-confirm-password"]'), "abcd");
       const postReqPromise = page.waitForRequest((req) => {
         return req.url().includes("/api/admin/auth") && req.method() === "POST";
       });
@@ -1150,7 +1236,7 @@ test.describe("Web Admin UI", () => {
       const postReq = await postReqPromise;
       expect(JSON.parse(postReq.postData() || "{}")).toEqual({
         current_password: "123",
-        new_password: "abcdef",
+        new_password: "abcd",
       });
 
       // A successful password update forces re-login.
@@ -1195,8 +1281,8 @@ test.describe("Web Admin UI", () => {
       const dialog = page.getByRole("dialog", { name: "Change Username" });
       await expect(dialog).toBeVisible();
 
-      await dialog.getByLabel("New Username", { exact: true }).fill("root");
-      await dialog.getByLabel("Current Password", { exact: true }).fill("123");
+      await setInputValue(dialog.locator('input[name="admin-change-username"]'), "root");
+      await setInputValue(dialog.locator('input[name="admin-change-username-current-password"]'), "123");
 
       const postReqPromise = page.waitForRequest((req) => {
         return req.url().includes("/api/admin/auth") && req.method() === "POST";
@@ -1255,11 +1341,11 @@ test.describe("Web Admin UI", () => {
       await expect(dialog).toBeVisible();
 
       await dialog.getByLabel("Current Password", { exact: true }).fill("123");
-      await dialog.getByLabel("New Password", { exact: true }).fill("abcdef");
-      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcdef");
+      await dialog.getByLabel("New Password", { exact: true }).fill("abcd");
+      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcd");
       await dialog.getByRole("button", { name: "Save" }).click();
 
-      await expect(page.getByText("Too many attempts. Try again in 10 seconds.")).toBeVisible();
+      await expect(dialog.getByText("Too many attempts. Try again in 10 seconds.", { exact: true })).toBeVisible();
       const toast = page.getByTestId("toast").first();
       await expect(toast).toBeVisible();
       await expect(page.getByTestId("toast-message").first()).toContainText("Too many attempts. Try again in 10 seconds.");
@@ -1271,8 +1357,8 @@ test.describe("Web Admin UI", () => {
       await expect(dialog).toBeVisible();
 
       await dialog.getByLabel("Current Password", { exact: true }).fill("123");
-      await dialog.getByLabel("New Password", { exact: true }).fill("abcdef");
-      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcdeg");
+      await dialog.getByLabel("New Password", { exact: true }).fill("abcd");
+      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abce");
       await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
     });
 
@@ -1282,9 +1368,20 @@ test.describe("Web Admin UI", () => {
       await expect(dialog).toBeVisible();
 
       await dialog.getByLabel("Current Password", { exact: true }).fill("123");
-      await dialog.getByLabel("New Password", { exact: true }).fill("abcde");
-      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcde");
+      await dialog.getByLabel("New Password", { exact: true }).fill("abc");
+      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abc");
       await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+
+    test("Change password Save enables at the four-character minimum", async ({ page }) => {
+      await page.getByRole("button", { name: "Change Password" }).click();
+      const dialog = page.getByRole("dialog", { name: "Change Password" });
+      await expect(dialog).toBeVisible();
+
+      await dialog.getByLabel("Current Password", { exact: true }).fill("123");
+      await dialog.getByLabel("New Password", { exact: true }).fill("abcd");
+      await dialog.getByLabel("Confirm Password", { exact: true }).fill("abcd");
+      await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
     });
 
     test("logout on dirty config asks confirmation and can be cancelled", async ({ page }) => {
@@ -1399,21 +1496,21 @@ test.describe("Web Admin UI", () => {
       await page.setViewportSize({ width: 1280, height: 720 });
       await page.waitForTimeout(200);
 
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
 
     test("renders correctly on tablet viewport", async ({ page }) => {
       await page.setViewportSize({ width: 768, height: 1024 });
       await page.waitForTimeout(200);
 
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
 
     test("renders correctly on mobile viewport", async ({ page }) => {
       await page.setViewportSize({ width: 375, height: 667 });
       await page.waitForTimeout(200);
 
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
   });
 
@@ -1505,7 +1602,7 @@ test.describe("Web Admin UI", () => {
       // Check for basic document structure
       await expect(page.locator("html")).toBeVisible();
       await expect(page.locator("body")).toBeVisible();
-      await expect(page.locator("#root")).toBeVisible();
+      await expect(appStage(page)).toBeVisible();
     });
 
     test("interactive elements are keyboard accessible", async ({ page }) => {

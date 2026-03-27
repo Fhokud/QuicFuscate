@@ -1,0 +1,58 @@
+/* QuicFuscate Design System - Single Source of Truth */
+
+@import "./tokens.css";
+@import "./glass.css";
+@import "./buttons.css";
+@import "./layout.css";
+@import "./animations.css";
+@import "./scrollbar.css";
+
+/* Base typography and document setup */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.55;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: text;
+}
+
+body {
+  background:
+    radial-gradient(ellipse 80% 60% at 12% 35%, rgba(127, 60, 220, 0.14) 0%, transparent 58%),
+    radial-gradient(ellipse 70% 55% at 88% 22%, rgba(236, 72, 153, 0.12) 0%, transparent 55%),
+    radial-gradient(ellipse 65% 50% at 55% 82%, rgba(168, 85, 247, 0.10) 0%, transparent 55%),
+    radial-gradient(ellipse 50% 40% at 72% 55%, rgba(244, 114, 182, 0.08) 0%, transparent 50%),
+    radial-gradient(ellipse 40% 35% at 35% 65%, rgba(219, 39, 119, 0.05) 0%, transparent 45%),
+    linear-gradient(155deg, #ece4f8 0%, #f2e6f4 18%, #f8ecf0 38%, #f5eaf5 55%, #f1e7f5 72%, #eee5f2 100%);
+  background-attachment: fixed;
+}
+
+/* Selection styling */
+::selection {
+  background: var(--color-accent-muted);
+  color: var(--color-text-primary);
+}
+
+/* Focus indicators (WCAG 2.1 AA/AAA) */
+*:focus-visible {
+  outline: 2px solid var(--color-accent, #6366f1);
+  outline-offset: 2px;
+}
+
+/* Number input spinner removal */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+}

@@ -46,7 +46,7 @@ fn make_dataset(kind: DatasetKind, size: usize) -> Vec<u8> {
         }
         DatasetKind::Binary => {
             let mut out = vec![0u8; size];
-            rand::thread_rng().fill_bytes(&mut out);
+            rand::rng().fill_bytes(&mut out);
             out
         }
     }

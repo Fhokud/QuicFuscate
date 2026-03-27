@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Public, stable QKey id used as the QUIC Initial token.
 ///
@@ -49,8 +49,6 @@ pub struct QKeyEntry {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub qkey: Option<String>,
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
@@ -66,12 +64,6 @@ pub struct QKeyRecord {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    // Deprecated: we no longer persist secrets at rest. Kept for backwards compatible loading.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub qkey: String,
-    // Deprecated: legacy plaintext token (hex). Kept for backwards compatible loading.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub token: String,
     /// SHA-256 of the 32-byte QKey token. This is the capability verifier (post-handshake).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token_sha256: String,
@@ -122,79 +114,15 @@ impl QKeyRegistry {
         };
         let mut seen = std::collections::HashSet::new();
         let mut filtered = Vec::new();
-        let mut migrated = false;
+        let mut updated = false;
         for mut entry in entries.drain(..) {
-            let has_legacy_qkey = !entry.qkey.trim().is_empty();
-
-            // If a legacy QKey is present, require that it is parseable. This protects us from
-            // persisting corrupt/tampered secrets and also lets us extract the token and policy.
-            let parsed = if has_legacy_qkey {
-                match crate::engine::qkey::parse(entry.qkey.trim()) {
-                    Ok(cfg) => Some(cfg),
-                    Err(_) => continue,
-                }
-            } else {
-                None
-            };
-
-            if has_legacy_qkey {
-                // For legacy entries we can still derive a stable id from the full QKey.
-                // This also deduplicates entries that were persisted with incorrect ids.
-                let id = qkey_id(entry.qkey.trim());
-                if entry.id != id {
-                    entry.id = id;
-                    migrated = true;
-                }
-            } else if entry.id.trim().is_empty() {
+            if entry.id.trim().is_empty() || entry.token_sha256.trim().is_empty() {
                 continue;
             }
-
-            // Prefer new storage. If missing, derive from legacy token or the embedded token.
-            if entry.token_sha256.trim().is_empty() {
-                let mut token_hex: Option<String> = None;
-                if !entry.token.trim().is_empty() {
-                    token_hex = Some(entry.token.trim().to_lowercase());
-                } else if let Some(cfg) = parsed.as_ref() {
-                    if let Some(ref token) = cfg.token {
-                        token_hex = Some(token.trim().to_lowercase());
-                    }
-                }
-                let Some(token_hex) = token_hex else {
-                    continue;
-                };
-                let Some(hash_hex) = token_sha256_hex_from_token_hex(&token_hex) else {
-                    continue;
-                };
-                entry.token_sha256 = hash_hex;
-                migrated = true;
-            }
-
-            // If no policy is stored, extract it from the legacy QKey.
-            if entry.stealth.is_none() || entry.fec.is_none() {
-                if let Some(parsed) = parsed.as_ref() {
-                    let (stealth, fec) = policy_from_parsed_qkey(parsed);
-                    if entry.stealth.is_none() && stealth.is_some() {
-                        entry.stealth = stealth;
-                        migrated = true;
-                    }
-                    if entry.fec.is_none() && fec.is_some() {
-                        entry.fec = fec;
-                        migrated = true;
-                    }
-                }
-            }
-
             if entry.created_at == 0 {
                 entry.created_at = current_epoch_secs();
-                migrated = true;
+                updated = true;
             }
-
-            // Redact legacy plaintext token from persisted storage (best effort migration).
-            if !entry.token.is_empty() {
-                entry.token.clear();
-                migrated = true;
-            }
-
             if !seen.insert(entry.id.clone()) {
                 continue;
             }
@@ -209,7 +137,7 @@ impl QKeyRegistry {
         filtered.retain(|entry| !is_expired(entry.expires_at, now));
         let removed = before != filtered.len();
         self.entries = filtered;
-        if removed || migrated {
+        if removed || updated {
             self.persist();
         }
     }
@@ -236,7 +164,6 @@ impl QKeyRegistry {
             return Ok(QKeyEntry {
                 id: existing.id,
                 name: existing.name,
-                qkey: if existing.qkey.is_empty() { None } else { Some(existing.qkey) },
                 created_at: existing.created_at,
                 expires_at: existing.expires_at,
                 stealth: existing.stealth,
@@ -254,8 +181,6 @@ impl QKeyRegistry {
         let record = QKeyRecord {
             id,
             name,
-            qkey,
-            token: String::new(),
             token_sha256,
             stealth,
             fec,
@@ -271,7 +196,6 @@ impl QKeyRegistry {
         Ok(QKeyEntry {
             id: record.id,
             name: record.name,
-            qkey: if record.qkey.is_empty() { None } else { Some(record.qkey) },
             created_at: record.created_at,
             expires_at: record.expires_at,
             stealth: record.stealth,
@@ -287,7 +211,6 @@ impl QKeyRegistry {
             .map(|entry| QKeyEntry {
                 id: entry.id,
                 name: entry.name,
-                qkey: if entry.qkey.is_empty() { None } else { Some(entry.qkey) },
                 created_at: entry.created_at,
                 expires_at: entry.expires_at,
                 stealth: entry.stealth,
@@ -324,10 +247,31 @@ impl QKeyRegistry {
         !self.entries.is_empty()
     }
 
+    /// Prune expired QKey entries based on their TTL (expires_at field).
+    ///
+    /// TTL enforcement (todo-180): QKey entries have an optional `expires_at` epoch timestamp.
+    /// When set, the key is considered expired once `current_time >= expires_at`. Expired keys
+    /// are removed from the registry and the change is persisted to disk.
+    ///
+    /// TTL is set during insertion via `insert_with_ttl()` or from `default_ttl_secs` in the
+    /// registry config. A TTL of 0 or None means the key never expires.
+    ///
+    /// This method is called on every registry access (list, lookup, insert, revoke, has_entries)
+    /// to ensure expired keys are never returned to callers.
     fn prune_expired(&mut self) {
         let before = self.entries.len();
         let now = current_epoch_secs();
-        self.entries.retain(|entry| !is_expired(entry.expires_at, now));
+        self.entries.retain(|entry| {
+            let expired = is_expired(entry.expires_at, now);
+            if expired {
+                log::info!(
+                    "QKey expired and removed: id={}, expires_at={:?}",
+                    entry.id,
+                    entry.expires_at
+                );
+            }
+            !expired
+        });
         if before != self.entries.len() {
             self.persist();
         }
@@ -350,7 +294,12 @@ impl QKeyRegistry {
                 return;
             }
         };
-        if let Err(e) = atomic_write_file(path, &payload, Some(0o600)) {
+        if let Err(e) = super::fsutil::atomic_write_file(
+            path,
+            &payload,
+            Some(0o600),
+            "qkey_registry::persist_tmp_nonce",
+        ) {
             log::warn!("qkey registry write failed ({}): {}", path.display(), e);
         }
     }
@@ -374,6 +323,7 @@ fn current_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Hash a 64-char hex token string by decoding to 32 binary bytes first, then SHA256.
 pub fn token_sha256_hex_from_token_hex(token_hex: &str) -> Option<String> {
     let token_hex = token_hex.trim();
     if token_hex.len() != 64 {
@@ -382,13 +332,20 @@ pub fn token_sha256_hex_from_token_hex(token_hex: &str) -> Option<String> {
     if !token_hex.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    // Hash the canonical (lowercased) hex string. We do not need to decode to bytes for security.
-    // The token is already a random 32-byte capability; this hash is only to avoid storing it at rest.
     let canonical = token_hex.to_ascii_lowercase();
+    let binary = hex::decode(&canonical).ok()?;
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
+    hasher.update(&binary);
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Check if a token matches a stored hash.
+/// Returns `true` if the SHA-256 of the decoded 32-byte token matches the stored hash.
+pub fn token_matches_hash(token_hex: &str, stored_hash: &str) -> bool {
+    token_sha256_hex_from_token_hex(token_hex)
+        .map(|h| h.eq_ignore_ascii_case(stored_hash))
+        .unwrap_or(false)
 }
 
 fn policy_from_parsed_qkey(
@@ -423,39 +380,11 @@ fn is_expired(expires_at: Option<u64>, now: u64) -> bool {
     matches!(expires_at, Some(ts) if ts <= now)
 }
 
-fn atomic_write_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let tmp_name = format!(".{file_name}.tmp-{}", fastrand::u64(..));
-    let tmp_path = parent.join(tmp_name);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    {
-        let mut f =
-            std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode));
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::qkey;
+    use std::path::Path;
 
     fn mk_token_hex(ch: char) -> String {
         std::iter::repeat_n(ch, 64).collect()
@@ -493,8 +422,6 @@ mod tests {
 
         let got = reg.lookup_initial_id_token(id.as_bytes()).expect("record must exist");
         assert_eq!(got.id, id);
-        assert_eq!(got.qkey, qkey_value);
-        assert!(got.token.is_empty());
         assert_eq!(got.token_sha256, token_sha);
 
         assert!(reg.lookup_initial_id_token(b"").is_none());
@@ -574,66 +501,52 @@ mod tests {
     }
 
     #[test]
-    fn load_filters_invalid_and_repairs_missing_fields() {
+    fn load_filters_invalid_entries() {
         let path = mk_temp_path("qkeys-load");
         let _ = std::fs::remove_file(&path);
 
         let token_hex = mk_token_hex('d');
         let qkey_value = mk_qkey_with_token(&token_hex);
         let id = qkey_id(&qkey_value);
+        let sha = token_sha256_hex_from_token_hex(&token_hex).expect("sha");
         let now = current_epoch_secs();
 
         let records = vec![
+            // Empty id - dropped
             QKeyRecord {
-                id: "wrong".to_string(),
+                id: "".to_string(),
                 name: None,
-                qkey: qkey_value.clone(),
-                token: "".to_string(),
+                token_sha256: sha.clone(),
+                stealth: None,
+                fec: None,
+                created_at: now,
+                expires_at: None,
+            },
+            // Empty token_sha256 - dropped
+            QKeyRecord {
+                id: "no-sha".to_string(),
+                name: None,
                 token_sha256: "".to_string(),
                 stealth: None,
                 fec: None,
                 created_at: now,
                 expires_at: None,
             },
+            // Expired - dropped
             QKeyRecord {
                 id: "expired".to_string(),
                 name: None,
-                qkey: qkey_value.clone(),
-                token: token_hex.clone(),
-                token_sha256: "".to_string(),
+                token_sha256: sha.clone(),
                 stealth: None,
                 fec: None,
                 created_at: now,
                 expires_at: Some(now.saturating_sub(1)),
             },
-            QKeyRecord {
-                id: "".to_string(),
-                name: None,
-                qkey: "".to_string(),
-                token: "".to_string(),
-                token_sha256: "".to_string(),
-                stealth: None,
-                fec: None,
-                created_at: now,
-                expires_at: None,
-            },
-            QKeyRecord {
-                id: "bad".to_string(),
-                name: None,
-                qkey: "QKey-not-a-real-qkey".to_string(),
-                token: mk_token_hex('e'),
-                token_sha256: "".to_string(),
-                stealth: None,
-                fec: None,
-                created_at: now,
-                expires_at: None,
-            },
+            // Valid - kept
             QKeyRecord {
                 id: id.clone(),
                 name: None,
-                qkey: qkey_value.clone(),
-                token: token_hex.clone(),
-                token_sha256: "".to_string(),
+                token_sha256: sha.clone(),
                 stealth: None,
                 fec: None,
                 created_at: now,
@@ -647,9 +560,7 @@ mod tests {
         let reg = QKeyRegistry::new(200, Some(path.clone()), None);
         assert_eq!(reg.entries.len(), 1);
         assert_eq!(reg.entries[0].id, id);
-        assert_eq!(reg.entries[0].qkey, qkey_value);
-        assert!(reg.entries[0].token.is_empty());
-        assert!(!reg.entries[0].token_sha256.is_empty());
+        assert_eq!(reg.entries[0].token_sha256, sha);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,0 +1,8 @@
+@import "tailwindcss";
+@source "../../../packages/ui";
+@import "@quicfuscate/theme";
+
+/* Desktop stage override: 640px height (shared theme uses 937px for admin) */
+.desktop-stage {
+  height: 640px;
+}

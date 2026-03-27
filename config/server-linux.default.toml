@@ -1,65 +1,173 @@
-# QuicFuscate server config (Linux-friendly defaults)
+# ==============================================================================
+# QuicFuscate Server Configuration - Linux Default Template
+# ==============================================================================
 #
-# Used by:
-# - server CLI: `quicfuscate server --config /etc/quicfuscate/quicfuscate.toml`
-# - admin panel: /api/config (read/write) + /api/reload (apply)
-#
-# Notes:
-# - QUIC listen/bind, TLS cert/key and admin web bind are CLI/systemd concerns.
-# - This file focuses on runtime behavior (stealth, adaptive FEC tuning, optimize).
+# This is a comprehensive server configuration template for Linux deployments.
+# All values shown are the defaults. Uncomment and modify as needed.
+# See also: config/quicfuscate.toml for the full canonical reference.
+
+# ==============================================================================
+# ENGINE
+# ==============================================================================
+
+[engine]
+mode = "server"
+# log_level = "info"           # Options: "error", "warn", "info", "debug", "trace"
+# auto_start = false
+# shutdown_timeout_ms = 5000   # Graceful shutdown timeout in milliseconds
+
+# ==============================================================================
+# CONNECTION (server listen and TLS)
+# ==============================================================================
+
+[connection]
+remote = "0.0.0.0:4433"        # Server listen address
+# verify_peer = true
+# cert_file = ""               # Path to TLS certificate (required for server)
+# key_file = ""                # Path to TLS private key (required for server)
+# alpn = ["h3", "quicfuscate"]
+# idle_timeout_ms = 30000      # Connection idle timeout (0 = no timeout)
+# enable_0rtt = true           # WARNING: 0-RTT data can be replayed
+# max_streams_bidi = 100
+# max_streams_uni = 100
+# enable_migration = true   # candidate paths must validate before activation
+
+# ==============================================================================
+# 0-RTT ANTI-REPLAY PROTECTION
+# ==============================================================================
+
+[anti_replay]
+# Enable anti-replay protection for 0-RTT early data (server mode only).
+# Required when connection.enable_0rtt = true to prevent replay attacks
+# (RFC 8446 Section 8, RFC 9001 Section 9.2).
+enabled = true
+# max_ticket_age_secs = 10     # Reject 0-RTT tickets older than this
+# max_entries = 100000         # Strike register capacity (~5 MB at 100k entries)
+# max_early_data_size = 16384  # Max 0-RTT bytes per connection (16 KB)
+
+# ==============================================================================
+# CRYPTO
+# ==============================================================================
+
+# [crypto]
+# aead_preference = "auto"     # Options: "auto", "aegis-128l", "morus"
+# force_aead = ""              # Override AEAD selection
+
+# ==============================================================================
+# STEALTH
+# ==============================================================================
 
 [stealth]
-# Supported values include: "off", "auto", "max", "manual", "intelligent", "stealth", "performance"
-mode = "manual"
+mode = "performance"
+# Options: "off", "performance", "stealth", "anti-dpi", "intelligent", "manual"
+# - off:          no stealth features
+# - performance:  minimal fingerprinting, costly features off (alias: "base")
+# - stealth:      balanced features with minimal overhead
+# - anti-dpi:     ultra stealth with aggressive settings (alias: "max")
+# - intelligent:  adaptive mode, escalates on probe detection (alias: "auto")
+# - manual:       custom (use settings below)
 
-enable_domain_fronting = true
-enable_http3_masquerading = true
-enable_xor_obfuscation = true
-use_tls_cover = true
-use_qpack_headers = true
-enable_protocol_mimicry = true
+# Manual mode settings (only used when mode = "manual"):
+# enable_domain_fronting = true
+# enable_http3_masquerading = true
+# use_tls_cover = true
+# use_qpack_headers = true
+# enable_traffic_padding = false
+# enable_timing_obfuscation = false
+# enable_protocol_mimicry = true
+# enable_doh = true
+# doh_provider = "https://cloudflare-dns.com/dns-query"
+# padding_strategy = "adaptive"    # Options: "random", "fixed", "adaptive", "browser_mimic"
+# max_padding_size = 256           # bytes
+# fronting_domains = []
+# initial_browser = "chrome"       # chrome, firefox, safari, edge
+# initial_os = "linux"             # windows, macos, linux, android, ios
 
-enable_doh = true
-doh_provider = "https://cloudflare-dns.com/dns-query"
+# ==============================================================================
+# FINGERPRINT ROTATION
+# ==============================================================================
 
-# Keep empty to allow internal rotation/derivation (if enabled).
-fronting_domains = []
+# [fingerprint_rotation]
+# enabled = false
+# interval_secs = 300          # Rotation interval (0 = disabled)
+# mode = "fixed"               # Options: "fixed", "slots", "all"
+# profile_slots = ["chrome:linux", "firefox:linux"]
 
-# -----------------------------------------------------------------------------
-# FEC (server and client runtime)
-# -----------------------------------------------------------------------------
-enable_traffic_padding = true
-enable_timing_obfuscation = true
-enable_noble_timing_obfuscation = true
-[fec]
-mode = "manual"
-# Initial mode for runtime AdaptiveFec.
-# Accepted: dynamic/static/bursty/streaming and explicit zero/light/normal/medium/strong/extreme.
-initial_mode = "zero"
-window_excellent = 0
-window_good = 16
-window_fair = 64
-window_poor = 512
-enable_partial = true
-enable_pid = true
-enable_hysteresis = true
-enable_kalman = false
-stream_every = 5
+# ==============================================================================
+# FEC (Forward Error Correction)
+# ==============================================================================
 
-# -----------------------------------------------------------------------------
-# Optimization
-# -----------------------------------------------------------------------------
-[optimization]
-cpu_features_mode = "auto"
-memory_pool_size = 4194304
-memory_pool_alignment = 64
-num_worker_threads = 0
+# [fec]
+# mode = "auto"                # Options: "auto", "off"
+# window_excellent = 0         # No FEC when network is excellent
+# window_good = 10
+# window_fair = 30
+# window_poor = 50
+# enable_partial = true
+# enable_pid = true
+# enable_hysteresis = true
+# enable_kalman = true
+# stream_every = 5             # Streaming emission period (packets)
 
-# -----------------------------------------------------------------------------
-# Transport
-# -----------------------------------------------------------------------------
-# Note: This controls the QUIC transport layer behavior used for new connections.
-[transport]
-cc_algorithm = "reno"
-mtu = 1309
-enable_pacing = true
+# ==============================================================================
+# TRANSPORT
+# ==============================================================================
+
+# [transport]
+# cc_algorithm = "bbr3"        # Options: "reno", "bbr2", "bbr3"
+# mtu = 1400
+# max_udp_payload = 1350
+# max_idle_timeout = 30000
+# initial_rtt_ms = 100
+# enable_pacing = true
+# initial_max_data = 10000000
+# initial_max_stream_data_bidi_local = 1000000
+# initial_max_stream_data_bidi_remote = 1000000
+# initial_max_stream_data_uni = 1000000
+# initial_max_streams_bidi = 100
+# initial_max_streams_uni = 100
+# enable_early_data = false
+# dgram_recv_queue_len = 1024
+# dgram_send_queue_len = 1024
+# disable_pmtud = false
+
+# ==============================================================================
+# PERFORMANCE OPTIMIZATION
+# ==============================================================================
+
+# [optimization]
+# memory_pool_size = 67108864  # 64MB
+# memory_pool_alignment = 64   # Cache line alignment
+# num_worker_threads = 0       # 0 = auto-detect
+
+# ==============================================================================
+# INTERFACE
+# ==============================================================================
+
+# [interface]
+# type = "tun"                 # Options: "tun", "tap", "xdp", "raw_socket"
+# tun_name = "quicfuse0"
+# tun_mtu = 1500
+# enable_gso = true
+# enable_gro = true
+# xdp_mode = "disabled"        # disabled | native | generic
+# xdp_flags = 0
+
+# ==============================================================================
+# TELEMETRY AND LOGGING
+# ==============================================================================
+
+# [telemetry]
+# enabled = true
+# export_interval = 60
+# collect_packet_stats = true
+# collect_stream_stats = true
+# collect_congestion_stats = true
+# collect_fec_stats = true
+# collect_stealth_stats = true
+
+[logging]
+level = "info"
+# log_to_file = false
+# log_file_path = "/var/log/quicfuscate.log"
+# log_to_stdout = true

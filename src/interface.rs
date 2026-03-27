@@ -20,50 +20,34 @@
 //!   may drive it from threads or async runtimes as needed.
 
 use crate::optimize::MemoryPool;
-use crate::telemetry_metrics::TELEMETRY_ENABLED;
+use crate::telemetry::TELEMETRY_ENABLED;
 use aligned_box::AlignedBox;
 use std::io::{self};
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-// use std::path::Path; // Unused import
 
 /// Application configuration module
 pub mod app_config {
-    use crate::engine::{
-        EngineConfig, FecMode as EngineFecMode, InterfaceType as EngineInterfaceType,
-        StealthMode as EngineStealthMode,
-    };
-    use crate::fec::{FecConfig, FecMode as RuntimeFecMode};
+    use crate::engine::{EngineConfig, StealthMode as EngineStealthMode};
+    use crate::fec::FecConfig;
     use crate::optimize::OptimizeConfig;
     use crate::stealth::{BrowserProfile, OsProfile, PaddingStrategy, StealthConfig};
-    use toml::Value;
-    // use std::path::Path; // Unused import
 
     /// Unified configuration structure parsed from a TOML file.
     #[derive(Clone)]
     pub struct AppConfig {
+        /// Forward error correction settings.
         pub fec: FecConfig,
+        /// Stealth and obfuscation settings.
         pub stealth: StealthConfig,
+        /// Memory pool and optimization settings.
         pub optimize: OptimizeConfig,
+        /// 0-RTT anti-replay protection settings.
+        pub anti_replay: crate::engine::AntiReplaySection,
     }
 
     impl AppConfig {
-        fn parse_runtime_fec_mode(raw: &str) -> Option<RuntimeFecMode> {
-            match raw.trim().to_ascii_lowercase().as_str() {
-                "zero" | "off" => Some(RuntimeFecMode::Zero),
-                "light" => Some(RuntimeFecMode::Light),
-                "normal" | "on" | "dynamic" | "auto" => Some(RuntimeFecMode::Normal),
-                "medium" => Some(RuntimeFecMode::Medium),
-                "strong" | "static" => Some(RuntimeFecMode::Strong),
-                "extreme" | "bursty" | "burst" => Some(RuntimeFecMode::Extreme),
-                "ultra" => Some(RuntimeFecMode::Ultra),
-                "fountain" => Some(RuntimeFecMode::Fountain),
-                "streaming" => Some(RuntimeFecMode::Streaming),
-                _ => None,
-            }
-        }
-
         fn parse_padding_strategy(raw: &str) -> Option<PaddingStrategy> {
             match raw.trim().to_ascii_lowercase().as_str() {
                 "random" | "1" => Some(PaddingStrategy::Random),
@@ -80,41 +64,18 @@ pub mod app_config {
             let parsed = EngineConfig::from_toml(s)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-            let mut fec = FecConfig::default();
-            fec.kalman_enabled = parsed.fec.enable_kalman;
-            fec.window_sizes.insert(RuntimeFecMode::Zero, parsed.fec.window_excellent);
-            fec.window_sizes.insert(RuntimeFecMode::Light, parsed.fec.window_good);
-            fec.window_sizes.insert(RuntimeFecMode::Normal, parsed.fec.window_fair.max(1));
-            fec.window_sizes.insert(
-                RuntimeFecMode::Medium,
-                parsed.fec.window_fair.max(parsed.fec.window_good).max(1),
-            );
-            fec.window_sizes.insert(RuntimeFecMode::Strong, parsed.fec.window_poor.max(1));
-            fec.window_sizes.insert(
-                RuntimeFecMode::Extreme,
-                parsed.fec.window_poor.saturating_mul(2).max(parsed.fec.window_poor).max(1),
-            );
-            fec.window_sizes.insert(RuntimeFecMode::Streaming, parsed.fec.window_fair.max(1));
-
-            let mapped_initial = Self::parse_runtime_fec_mode(&parsed.fec.initial_mode)
-                .unwrap_or(RuntimeFecMode::Normal);
-            fec.initial_mode = match parsed.fec.mode {
-                EngineFecMode::Off => RuntimeFecMode::Zero,
-                EngineFecMode::Auto => mapped_initial,
-                EngineFecMode::Manual => mapped_initial,
-            };
-            fec.force_on = matches!(parsed.fec.mode, EngineFecMode::Manual)
-                && fec.initial_mode != RuntimeFecMode::Zero;
+            let fec = FecConfig::from_engine_section(&parsed.fec);
 
             let mut stealth = match parsed.stealth.mode {
                 EngineStealthMode::Off => StealthConfig::off(),
-                EngineStealthMode::Auto => StealthConfig::stealth(),
-                EngineStealthMode::Max => StealthConfig::anti_dpi(),
+                EngineStealthMode::Performance => StealthConfig::performance(),
+                EngineStealthMode::Stealth => StealthConfig::stealth(),
+                EngineStealthMode::AntiDpi => StealthConfig::anti_dpi(),
                 EngineStealthMode::Manual => StealthConfig::manual(),
+                EngineStealthMode::Auto => StealthConfig::intelligent(),
             };
             stealth.enable_domain_fronting = parsed.stealth.enable_domain_fronting;
             stealth.enable_http3_masquerading = parsed.stealth.enable_http3_masquerading;
-            stealth.enable_xor_obfuscation = parsed.stealth.enable_xor_obfuscation;
             stealth.use_tls_cover = parsed.stealth.use_tls_cover;
             stealth.use_qpack_headers = parsed.stealth.use_qpack_headers;
             stealth.enable_traffic_padding = parsed.stealth.enable_traffic_padding;
@@ -135,54 +96,22 @@ pub mod app_config {
             }
             stealth.enable_fingerprint_rotation = parsed.fingerprint_rotation.enabled;
             stealth.fingerprint_rotation_interval = parsed.fingerprint_rotation.interval_secs;
+            stealth.fingerprint_rotation_mode = match parsed.fingerprint_rotation.mode {
+                crate::engine::RotationMode::Fixed => crate::stealth::RotationMode::Fixed,
+                crate::engine::RotationMode::Slots => crate::stealth::RotationMode::Slots,
+                crate::engine::RotationMode::All => crate::stealth::RotationMode::All,
+            };
 
             let default_block_size = 65_536usize;
             let pool_capacity = (parsed.optimization.memory_pool_size / default_block_size).max(1);
-            let optimize = OptimizeConfig {
-                pool_capacity,
-                block_size: default_block_size,
-                enable_xdp: matches!(parsed.interface.interface_type, EngineInterfaceType::Xdp),
-            };
+            let optimize = OptimizeConfig { pool_capacity, block_size: default_block_size };
 
-            Ok(Self { fec, stealth, optimize })
+            Ok(Self { fec, stealth, optimize, anti_replay: parsed.anti_replay })
         }
 
         /// Load configuration from a TOML string.
         pub fn from_toml(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
-            let doc: Value = toml::from_str(s)?;
-            let has_legacy_sections =
-                doc.get("adaptive_fec").is_some() || doc.get("optimize").is_some();
-            let has_engine_sections = doc.get("engine").is_some()
-                || doc.get("connection").is_some()
-                || doc.get("crypto").is_some()
-                || doc.get("transport").is_some()
-                || doc.get("fec").is_some()
-                || doc.get("optimization").is_some()
-                || doc.get("interface").is_some()
-                || doc.get("telemetry").is_some()
-                || doc.get("logging").is_some()
-                || doc.get("fingerprint_rotation").is_some();
-
-            if has_engine_sections && !has_legacy_sections {
-                return Self::from_engine_toml(s);
-            }
-
-            let fec = if doc.get("adaptive_fec").is_some() {
-                FecConfig::from_toml(s)?
-            } else {
-                FecConfig::default()
-            };
-            let stealth = if doc.get("stealth").is_some() || doc.get("compression").is_some() {
-                StealthConfig::from_toml(s)?
-            } else {
-                StealthConfig::default()
-            };
-            let optimize = if doc.get("optimize").is_some() {
-                OptimizeConfig::from_toml(s)?
-            } else {
-                OptimizeConfig::default()
-            };
-            Ok(Self { fec, stealth, optimize })
+            Self::from_engine_toml(s)
         }
 
         /// Load configuration from a file path.
@@ -204,8 +133,11 @@ pub mod app_config {
 /// Errors produced by the TUN layer.
 #[derive(Debug)]
 pub enum TunError {
+    /// TUN is not supported on the current platform.
     Unsupported,
+    /// Operating system I/O error.
     Io(io::Error),
+    /// Configuration or prerequisite error (e.g., missing factory, MTU too low).
     Config(&'static str),
 }
 
@@ -218,9 +150,13 @@ impl From<io::Error> for TunError {
 /// Configuration for creating a TUN device.
 #[derive(Clone, Debug)]
 pub struct TunConfig {
+    /// Requested TUN device name (None for OS-assigned).
     pub name: Option<String>,
+    /// Static IP address to assign to the TUN interface.
     pub ip: Option<IpAddr>,
+    /// Netmask for the TUN interface IP.
     pub netmask: Option<IpAddr>,
+    /// Maximum transmission unit for the TUN device.
     pub mtu: u16,
     /// If true, consumers should prefer memory-pool backed I/O.
     pub zero_copy: bool,
@@ -248,30 +184,32 @@ pub struct TunCapabilities {
 /// Shared runtime fastpath selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FastpathMode {
+    /// Disable fastpath optimization, use direct syscalls.
     Off,
-    Uring,
-    Xdp,
+    /// Automatically use best available fastpath (sendmmsg on Linux).
     Auto,
 }
 
 impl FastpathMode {
+    /// Parse a fastpath mode from a string ("off" or "auto").
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
-            "uring" => Self::Uring,
-            "xdp" => Self::Xdp,
             _ => Self::Auto,
         }
     }
 
+    /// Read fastpath mode from the QUICFUSCATE_FASTPATH environment variable.
     pub fn from_env() -> Self {
         let raw = std::env::var("QUICFUSCATE_FASTPATH").unwrap_or_else(|_| "auto".to_string());
-        Self::parse(&raw)
-    }
-
-    #[inline]
-    pub fn allows_uring(self) -> bool {
-        matches!(self, Self::Auto | Self::Uring)
+        let mode = Self::parse(&raw);
+        if mode == Self::Auto && !raw.trim().eq_ignore_ascii_case("auto") {
+            log::warn!(
+                "Unsupported QUICFUSCATE_FASTPATH='{}'; using canonical fastpath policy 'auto'",
+                raw
+            );
+        }
+        mode
     }
 }
 
@@ -303,10 +241,15 @@ pub fn validate_tun_runtime_requirements() -> Result<(), TunError> {
 
 /// Basic TUN device contract.
 pub trait TunDevice: Send + Sync {
+    /// Returns the OS-level device name (e.g., "utun3", "quicfuse0").
     fn name(&self) -> &str;
+    /// Returns the configured MTU for this device.
     fn mtu(&self) -> u16;
+    /// Reads one IP packet into `buf`, returning the number of bytes read.
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Writes one IP packet from `buf`, returning the number of bytes written.
     fn write(&self, buf: &[u8]) -> io::Result<usize>;
+    /// Returns the raw file descriptor for io_uring or epoll integration (Unix only).
     #[cfg(unix)]
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         None
@@ -332,12 +275,6 @@ impl std::fmt::Debug for TunInterface {
         }
         dbg.finish()
     }
-}
-
-#[cfg(target_os = "linux")]
-fn tun_fastpath_mode() -> FastpathMode {
-    static MODE: OnceLock<FastpathMode> = OnceLock::new();
-    *MODE.get_or_init(FastpathMode::from_env)
 }
 
 impl TunInterface {
@@ -426,101 +363,29 @@ impl TunInterface {
 
     /// Write a packet to the TUN device with hardware acceleration
     pub fn write_packet(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Parse IP header with BMI2 if available
-        let profile = crate::optimize::FeatureDetector::instance().profile();
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = profile;
-
+        // Parse IP header with BMI2 on supported x86 profiles, otherwise scalar.
         #[cfg(target_arch = "x86_64")]
-        match profile {
-            crate::optimize::CpuProfile::X86_P2b
-            | crate::optimize::CpuProfile::X86_P3a
-            | crate::optimize::CpuProfile::X86_P3b
-            | crate::optimize::CpuProfile::X86_P3c
-            | crate::optimize::CpuProfile::X86_P3d
-            | crate::optimize::CpuProfile::X86_P3e
-            | crate::optimize::CpuProfile::X86_P4a
-            | crate::optimize::CpuProfile::X86_P4b => unsafe {
-                self.parse_ip_header_bmi2(buf);
-            },
-            _ => {
-                // Lightweight scalar sampling for IP header (IPv4/IPv6)
-                if buf.len() >= 1 {
-                    let ver_ihl = buf[0];
-                    let version = ver_ihl >> 4;
-                    if version == 4 {
-                        let ihl = ver_ihl & 0x0F;
-                        let tos = if buf.len() > 1 { buf[1] } else { 0 };
-                        let total_len =
-                            if buf.len() > 4 { u16::from_be_bytes([buf[2], buf[3]]) } else { 0 };
-                        self.process_ip_info(version, ihl, tos, total_len);
-                    } else if version == 6 && buf.len() >= 2 {
-                        // IPv6 Traffic Class: 8 bits across first two bytes
-                        // tc = (b0 low 4 bits << 4) | (b1 high 4 bits)
-                        let tc = ((buf[0] & 0x0F) << 4) | ((buf[1] & 0xF0) >> 4);
-                        use std::sync::atomic::Ordering;
-                        crate::optimize::telemetry::IP_V6_PACKETS.fetch_add(1, Ordering::Relaxed);
-                        // ECN bits are the lowest 2 bits of Traffic Class
-                        if (tc & 0b11) == 0b11 {
-                            crate::optimize::telemetry::STEALTH_SIGNAL_ECN_CE
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Heuristische TOS-Anomalie: hohe DSCP-Klassen deuten oft auf spezielles Marking
-                        let dscp = tc >> 2;
-                        if dscp >= 0x30 {
-                            crate::optimize::telemetry::STEALTH_SIGNAL_TOS_ANOM
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+        {
+            let profile = crate::optimize::FeatureDetector::instance().profile();
+            match profile {
+                crate::optimize::CpuProfile::X86_P2b
+                | crate::optimize::CpuProfile::X86_P3a
+                | crate::optimize::CpuProfile::X86_P3b
+                | crate::optimize::CpuProfile::X86_P3c
+                | crate::optimize::CpuProfile::X86_P3d
+                | crate::optimize::CpuProfile::X86_P3e
+                | crate::optimize::CpuProfile::X86_P4a
+                | crate::optimize::CpuProfile::X86_P4b => unsafe {
+                    self.parse_ip_header_bmi2(buf);
+                },
+                _ => self.parse_ip_header_scalar(buf),
             }
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            // Try io_uring batch write only when zero-copy fastpath is enabled.
-            let fastpath_mode = tun_fastpath_mode();
-            if self.zero_copy && fastpath_mode.allows_uring() {
-                crate::optimize::telemetry::TUN_FASTPATH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-                match self.write_packet_io_uring(buf) {
-                    Ok(n) => {
-                        crate::optimize::telemetry::TUN_FASTPATH_URING_SUCCESS
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Ok(n);
-                    }
-                    Err(_) => {
-                        crate::optimize::telemetry::TUN_FASTPATH_URING_FALLBACKS
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            } else {
-                crate::optimize::telemetry::TUN_FASTPATH_DIRECT_WRITES
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.parse_ip_header_scalar(buf);
 
         self.dev.write(buf)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn write_packet_io_uring(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let fd = match self.dev.raw_fd() {
-            Some(fd) => fd,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "TUN device does not expose raw file descriptor",
-                ));
-            }
-        };
-        match crate::transport::uring::try_send_connected(fd, buf) {
-            Ok(Some(n)) => Ok(n),
-            Ok(None) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "io_uring path unavailable for this descriptor",
-            )),
-            Err(e) => Err(e),
-        }
     }
 
     /// Parse IP header with BMI2 PEXT/PDEP - 2x faster
@@ -549,7 +414,34 @@ impl TunInterface {
         self.process_ip_info(version as u8, ihl as u8, tos as u8, total_len as u16);
     }
 
-    #[allow(dead_code)]
+    #[inline(always)]
+    fn parse_ip_header_scalar(&self, buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
+
+        let ver_ihl = buf[0];
+        let version = ver_ihl >> 4;
+        if version == 4 {
+            let ihl = ver_ihl & 0x0F;
+            let tos = if buf.len() > 1 { buf[1] } else { 0 };
+            let total_len = if buf.len() > 4 { u16::from_be_bytes([buf[2], buf[3]]) } else { 0 };
+            self.process_ip_info(version, ihl, tos, total_len);
+        } else if version == 6 && buf.len() >= 2 {
+            // tc = (b0 low 4 bits << 4) | (b1 high 4 bits)
+            let tc = ((buf[0] & 0x0F) << 4) | ((buf[1] & 0xF0) >> 4);
+            use std::sync::atomic::Ordering;
+            crate::optimize::telemetry::IP_V6_PACKETS.fetch_add(1, Ordering::Relaxed);
+            if (tc & 0b11) == 0b11 {
+                crate::optimize::telemetry::STEALTH_SIGNAL_ECN_CE.fetch_add(1, Ordering::Relaxed);
+            }
+            let dscp = tc >> 2;
+            if dscp >= 0x30 {
+                crate::optimize::telemetry::STEALTH_SIGNAL_TOS_ANOM.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn process_ip_info(&self, version: u8, ihl: u8, tos: u8, total_len: u16) {
         let _ = ihl;
         let _ = total_len;
@@ -645,6 +537,7 @@ mod linux_tun {
         ifr_flags: libc::c_short,
     }
 
+    /// Linux TUN device using /dev/net/tun (IFF_TUN | IFF_NO_PI).
     pub struct LinuxTun {
         name: Arc<str>,
         fd: RawFd,
@@ -652,6 +545,7 @@ mod linux_tun {
     }
 
     impl LinuxTun {
+        /// Open a Linux TUN device with the given configuration.
         pub fn open(cfg: &TunConfig) -> io::Result<Self> {
             // Try canonical path first, fallback to /dev/tun (Android)
             let mut file = match OpenOptions::new().read(true).write(true).open("/dev/net/tun") {
@@ -751,6 +645,7 @@ mod linux_tun {
         }
     }
 
+    /// Open the platform-native Linux TUN device.
     pub fn open_platform_tun(cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         Ok(Box::new(LinuxTun::open(cfg)?))
     }
@@ -784,6 +679,7 @@ mod macos_tun {
         sc_reserved: [u32; 5],
     }
 
+    /// macOS utun device via PF_SYSTEM/SYSPROTO_CONTROL.
     pub struct MacTun {
         fd: RawFd,
         name: Arc<str>,
@@ -791,6 +687,7 @@ mod macos_tun {
     }
 
     impl MacTun {
+        /// Open a macOS utun device with the given configuration.
         pub fn open(cfg: &TunConfig) -> io::Result<Self> {
             let fd = unsafe { libc::socket(libc::AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
             if fd < 0 {
@@ -937,6 +834,7 @@ mod macos_tun {
         }
     }
 
+    /// Open the platform-native macOS utun device.
     pub fn open_platform_tun(cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         Ok(Box::new(MacTun::open(cfg)?))
     }
@@ -945,6 +843,7 @@ mod macos_tun {
 #[cfg(target_os = "ios")]
 mod ios_tun {
     use super::*;
+    /// iOS stub - requires external factory via NetworkExtension.
     pub fn open_platform_tun(_cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         // iOS requires NetworkExtension. Applications must register a factory
         // that returns a TunDevice backed by NEPacketTunnel flow.
@@ -957,6 +856,7 @@ mod ios_tun {
 #[cfg(target_os = "windows")]
 mod windows_tun {
     use super::*;
+    /// Windows stub - requires Wintun via external factory.
     #[cfg(feature = "tun-windows")]
     pub fn open_platform_tun(_cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         // Placeholder: Wintun integration is expected to be provided by
@@ -967,6 +867,7 @@ mod windows_tun {
         ))
     }
 
+    /// Windows stub - tun-windows feature not enabled.
     #[cfg(not(feature = "tun-windows"))]
     pub fn open_platform_tun(_cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         Err(TunError::Config(
@@ -998,6 +899,7 @@ mod other_tun {
             Err(io::Error::new(io::ErrorKind::Other, "TUN unsupported on this platform"))
         }
     }
+    /// Unsupported platform stub - always returns `TunError::Unsupported`.
     pub fn open_platform_tun(_cfg: &TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
         Err(TunError::Unsupported)
     }
@@ -1094,28 +996,10 @@ mod tests {
         assert_eq!(written, expected_len);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn write_packet_uring_fallback_increments_telemetry_when_fd_missing() {
-        let pool = crate::optimize::global_pool();
-        let before =
-            crate::optimize::telemetry::TUN_FASTPATH_URING_FALLBACKS.load(Ordering::Relaxed);
-        let mut tun = TunInterface::from_device_for_test(
-            Box::new(DummyTun::with_reads(Vec::new())),
-            pool,
-            true,
-        );
-        let payload = vec![0u8; 128];
-        let written =
-            tun.write_packet(&payload).expect("write_packet must fallback to direct write");
-        assert_eq!(written, payload.len());
-        let after =
-            crate::optimize::telemetry::TUN_FASTPATH_URING_FALLBACKS.load(Ordering::Relaxed);
-        assert!(
-            after >= before + 1,
-            "expected uring fallback counter increment (before={}, after={})",
-            before,
-            after
-        );
+    fn fastpath_mode_space_is_off_auto_only() {
+        assert_eq!(FastpathMode::parse("auto"), FastpathMode::Auto);
+        assert_eq!(FastpathMode::parse("off"), FastpathMode::Off);
+        assert_eq!(FastpathMode::parse("legacy-token"), FastpathMode::Auto);
     }
 }

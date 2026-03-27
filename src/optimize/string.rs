@@ -5,169 +5,14 @@
 use crate::optimize::CpuProfile;
 use crate::optimize::FeatureDetector;
 
-/// Fast string comparison with AVX2/NEON - 8x faster
-#[inline(always)]
-pub fn string_equals(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { string_equals_avx2(a.as_bytes(), b.as_bytes()) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A2 => unsafe {
-            return string_equals_sve2(a.as_bytes(), b.as_bytes());
-        },
-        CpuProfile::ARM_A0
-        | CpuProfile::ARM_A1a
-        | CpuProfile::ARM_A1b
-        | CpuProfile::ARM_A1c
-        | CpuProfile::ARM_A1d => unsafe {
-            return string_equals_neon(a.as_bytes(), b.as_bytes());
-        },
-        CpuProfile::Apple_M => unsafe {
-            return string_equals_neon(a.as_bytes(), b.as_bytes());
-        },
-        _ => {}
-    }
-
-    a == b
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn string_equals_avx2(a: &[u8], b: &[u8]) -> bool {
-    use std::arch::x86_64::*;
-
-    let len = a.len();
-    let mut i = 0;
-
-    // Compare 32 bytes at a time
-    while i + 32 <= len {
-        let a_vec = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-        let b_vec = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
-
-        let cmp = _mm256_cmpeq_epi8(a_vec, b_vec);
-        let mask = _mm256_movemask_epi8(cmp);
-
-        if mask != -1 {
-            return false;
-        }
-
-        i += 32;
-    }
-
-    // Compare remaining bytes
-    while i < len {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-
-    true
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn string_equals_neon(a: &[u8], b: &[u8]) -> bool {
-    use std::arch::aarch64::*;
-
-    let len = a.len();
-    let mut i = 0;
-
-    // Compare 16 bytes at a time
-    while i + 16 <= len {
-        let a_vec = vld1q_u8(a.as_ptr().add(i));
-        let b_vec = vld1q_u8(b.as_ptr().add(i));
-
-        let cmp = vceqq_u8(a_vec, b_vec);
-        let min = vminvq_u8(cmp);
-
-        if min != 0xFF {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Compare remaining
-    while i < len {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-
-    true
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn string_equals_sve2(a: &[u8], b: &[u8]) -> bool {
-    #[cfg(target_feature = "sve2")]
-    {
-        string_equals_sve2_impl(a, b)
-    }
-
-    #[cfg(not(target_feature = "sve2"))]
-    {
-        string_equals_neon(a, b)
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-#[target_feature(enable = "sve2")]
-unsafe fn string_equals_sve2_impl(a: &[u8], b: &[u8]) -> bool {
-    use std::arch::aarch64::*;
-
-    let len = a.len();
-    let mut offset = 0usize;
-    let pg_all = svptrue_b8();
-
-    while offset < len {
-        let pg = svwhilelt_b8(offset as u64, len as u64);
-        if !svptest_any(pg_all, pg) {
-            break;
-        }
-
-        let a_vec = svld1_u8(pg, a.as_ptr().add(offset));
-        let b_vec = svld1_u8(pg, b.as_ptr().add(offset));
-        let cmp = svcmpeq_u8(pg, a_vec, b_vec);
-        if !svptest_all(pg, cmp) {
-            return false;
-        }
-
-        offset += svcntb() as usize;
-    }
-
-    true
-}
-
-/// Fast string search with AVX2/AVX512 - 10x faster
+/// Runtime-owned accelerated substring search used by stealth/runtime paths.
 #[inline(always)]
 pub fn string_contains(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return needle.is_empty();
     }
 
-    #[allow(unused_variables)]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let profile = FeatureDetector::instance().profile();
 
     #[cfg(target_arch = "x86_64")]
@@ -328,327 +173,9 @@ unsafe fn string_search_sve2(haystack: &[u8], needle: &[u8]) -> bool {
     }
 }
 
-/// Fast UTF-8 validation with AVX2/NEON - 5x faster
+/// Rust parity/test-only accelerated base64 encoding helper.
 #[inline(always)]
-pub fn validate_utf8(data: &[u8]) -> bool {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { validate_utf8_avx2(data) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A2 => {
-            return unsafe { validate_utf8_sve2(data) };
-        }
-        CpuProfile::ARM_A0
-        | CpuProfile::ARM_A1a
-        | CpuProfile::ARM_A1b
-        | CpuProfile::ARM_A1c
-        | CpuProfile::ARM_A1d
-        | CpuProfile::Apple_M => {
-            return unsafe { validate_utf8_neon(data) };
-        }
-        _ => {}
-    }
-
-    std::str::from_utf8(data).is_ok()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn validate_utf8_avx2(data: &[u8]) -> bool {
-    use std::arch::x86_64::*;
-
-    let mut i = 0;
-
-    // Ultra-sophisticated UTF-8 validation using lookup tables
-    // Based on "Validating UTF-8 In Less Than One Instruction Per Byte" paper
-
-    // Error detection masks
-    let error = _mm256_setzero_si256();
-    let prev_input = _mm256_setzero_si256();
-    let prev_first = _mm256_setzero_si256();
-
-    while i + 32 <= data.len() {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
-
-        // Fast ASCII check
-        let ascii_mask = _mm256_movemask_epi8(chunk);
-        if ascii_mask == 0 {
-            // Pure ASCII - fastest path
-            i += 32;
-            continue;
-        }
-
-        // Full UTF-8 validation with SIMD
-        // Step 1: Check for invalid bytes
-        let byte_0xC0 = _mm256_set1_epi8(0xC0u8 as i8);
-        let byte_0x80 = _mm256_set1_epi8(0x80u8 as i8);
-        let byte_0xE0 = _mm256_set1_epi8(0xE0u8 as i8);
-        let byte_0xF0 = _mm256_set1_epi8(0xF0u8 as i8);
-
-        // Classify bytes
-        let is_continuation = _mm256_cmpeq_epi8(_mm256_and_si256(chunk, byte_0xC0), byte_0x80);
-
-        let is_2byte_start = _mm256_cmpeq_epi8(_mm256_and_si256(chunk, byte_0xE0), byte_0xC0);
-
-        let is_3byte_start = _mm256_cmpeq_epi8(_mm256_and_si256(chunk, byte_0xF0), byte_0xE0);
-
-        let is_4byte_start =
-            _mm256_cmpeq_epi8(_mm256_and_si256(chunk, _mm256_set1_epi8(0xF8u8 as i8)), byte_0xF0);
-
-        // Check for overlong encodings and surrogates
-        let byte_0x0F = _mm256_set1_epi8(0x0F);
-        let nibbles_lo = _mm256_and_si256(chunk, byte_0x0F);
-        let nibbles_hi = _mm256_and_si256(_mm256_srli_epi16(chunk, 4), byte_0x0F);
-
-        // Lookup table for invalid sequences
-        let lut_lo = _mm256_setr_epi8(
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-            0x0D, 0x0E, 0x0F, 0x10,
-        );
-
-        let lut_hi = _mm256_setr_epi8(
-            0x10,
-            0x20,
-            0x30,
-            0x40,
-            0x50,
-            0x60,
-            0x70,
-            0x80u8 as i8,
-            0x90u8 as i8,
-            0xA0u8 as i8,
-            0xB0u8 as i8,
-            0xC0u8 as i8,
-            0xD0u8 as i8,
-            0xE0u8 as i8,
-            0xF0u8 as i8,
-            0x00,
-            0x10,
-            0x20,
-            0x30,
-            0x40,
-            0x50,
-            0x60,
-            0x70,
-            0x80u8 as i8,
-            0x90u8 as i8,
-            0xA0u8 as i8,
-            0xB0u8 as i8,
-            0xC0u8 as i8,
-            0xD0u8 as i8,
-            0xE0u8 as i8,
-            0xF0u8 as i8,
-            0x00,
-        );
-
-        let lo_nibbles_lookup = _mm256_shuffle_epi8(lut_lo, nibbles_lo);
-        let hi_nibbles_lookup = _mm256_shuffle_epi8(lut_hi, nibbles_hi);
-
-        // Combine checks
-        let check = _mm256_and_si256(lo_nibbles_lookup, hi_nibbles_lookup);
-
-        // Check for errors in byte sequences
-        let has_error = _mm256_cmpgt_epi8(check, _mm256_setzero_si256());
-        if _mm256_movemask_epi8(has_error) != 0 {
-            // Invalid UTF-8 sequence detected
-            return false;
-        }
-
-        // Additional validation for 3-byte and 4-byte sequences
-        let prev_carry = _mm256_alignr_epi8(chunk, prev_input, 15);
-
-        // Check ED followed by A0..BF (surrogate pairs)
-        let byte_0xED = _mm256_cmpeq_epi8(prev_carry, _mm256_set1_epi8(0xEDu8 as i8));
-        let byte_0xA0 = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(0x9Fu8 as i8));
-        let surrogate_error = _mm256_and_si256(byte_0xED, byte_0xA0);
-
-        // Check F0 followed by 80..8F (overlong)
-        let byte_0xF0 = _mm256_cmpeq_epi8(prev_carry, _mm256_set1_epi8(0xF0u8 as i8));
-        let byte_0x90 = _mm256_cmpgt_epi8(_mm256_set1_epi8(0x90u8 as i8), chunk);
-        let overlong_error = _mm256_and_si256(byte_0xF0, byte_0x90);
-
-        // Check F4 followed by 90..BF (out of range)
-        let byte_0xF4 = _mm256_cmpeq_epi8(prev_carry, _mm256_set1_epi8(0xF4u8 as i8));
-        let byte_0x8F = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(0x8Fu8 as i8));
-        let range_error = _mm256_and_si256(byte_0xF4, byte_0x8F);
-
-        let all_errors =
-            _mm256_or_si256(_mm256_or_si256(surrogate_error, overlong_error), range_error);
-
-        if _mm256_movemask_epi8(all_errors) != 0 {
-            return false;
-        }
-
-        i += 32;
-    }
-
-    // Validate remainder with scalar
-    std::str::from_utf8(&data[i..]).is_ok()
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn validate_utf8_neon(data: &[u8]) -> bool {
-    use std::arch::aarch64::*;
-
-    let mut i = 0usize;
-
-    while i + 16 <= data.len() {
-        let chunk = vld1q_u8(data.as_ptr().add(i));
-
-        // ASCII fast path
-        let ascii_test = vorrq_u8(chunk, vdupq_n_u8(0x7F));
-        if vmaxvq_u8(ascii_test) == 0x7F {
-            i += 16;
-            continue;
-        }
-
-        let high_bits = vandq_u8(chunk, vdupq_n_u8(0x80));
-        let lane_mask = vmaxvq_u8(high_bits);
-        if lane_mask == 0 {
-            i += 16;
-            continue;
-        }
-
-        // Scalar fallback (rare branch)
-        if std::str::from_utf8(&data[i..i + 16]).is_err() {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    std::str::from_utf8(&data[i..]).is_ok()
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn validate_utf8_sve2(data: &[u8]) -> bool {
-    #[cfg(target_feature = "sve2")]
-    {
-        validate_utf8_sve2_impl(data)
-    }
-
-    #[cfg(not(target_feature = "sve2"))]
-    {
-        validate_utf8_neon(data)
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-#[target_feature(enable = "sve2")]
-unsafe fn validate_utf8_sve2_impl(data: &[u8]) -> bool {
-    use std::arch::aarch64::*;
-
-    let len = data.len();
-    let vl = svcntb() as usize;
-    let mut offset = 0usize;
-
-    while offset < len {
-        let remaining = len - offset;
-        let take = remaining.min(vl);
-        let pg = svwhilelt_b8(0, take as u64);
-        let chunk = svld1_u8(pg, data.as_ptr().add(offset));
-        let high_bits = svand_u8_x(pg, chunk, svdup_u8(0x80));
-
-        if svptest_any(pg, high_bits) {
-            if std::str::from_utf8(&data[offset..offset + take]).is_err() {
-                return false;
-            }
-        }
-
-        offset += take;
-    }
-
-    true
-}
-
-/// Fast integer parsing with BMI2 - 3x faster
-#[inline(always)]
-pub fn parse_u64(s: &str) -> Option<u64> {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { parse_u64_bmi2(s.as_bytes()) };
-        }
-        _ => {}
-    }
-
-    s.parse().ok()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn parse_u64_bmi2(s: &[u8]) -> Option<u64> {
-    use std::arch::x86_64::*;
-
-    if s.is_empty() || s.len() > 20 {
-        return None;
-    }
-
-    let mut result = 0u64;
-
-    // Process 8 digits at a time with BMI2
-    let mut i = 0;
-    while i + 8 <= s.len() {
-        // Load 8 bytes
-        let chunk = *(s.as_ptr().add(i) as *const u64);
-
-        // Check all are digits (0x30-0x39)
-        let sub = chunk.wrapping_sub(0x3030303030303030);
-        let check = sub & 0xF0F0F0F0F0F0F0F0;
-        if check != 0 {
-            break;
-        }
-
-        // Extract digit values with PEXT
-        let digits = _pext_u64(sub, 0x0F0F0F0F0F0F0F0F);
-
-        // Multiply and add
-        result = result * 100_000_000 + digits;
-        i += 8;
-    }
-
-    // Process remaining digits
-    while i < s.len() {
-        let digit = s[i].wrapping_sub(b'0');
-        if digit > 9 {
-            return None;
-        }
-        result = result * 10 + digit as u64;
-        i += 1;
-    }
-
-    Some(result)
-}
-
-/// Fast base64 encoding with AVX2 - 4x faster  
-#[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn base64_encode(data: &[u8]) -> String {
     let _profile = FeatureDetector::instance().profile();
 
@@ -688,6 +215,7 @@ pub fn base64_encode(data: &[u8]) -> String {
     base64_encode_scalar(data)
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
 fn base64_encode_scalar(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -709,7 +237,7 @@ fn base64_encode_scalar(data: &[u8]) -> String {
     result
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "avx2")]
 unsafe fn base64_encode_avx2(data: &[u8]) -> String {
     use std::arch::x86_64::*;
@@ -772,7 +300,7 @@ unsafe fn base64_encode_avx2(data: &[u8]) -> String {
 }
 
 /// NEON-optimized base64 encoding - 4x faster on ARM
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn base64_encode_neon(data: &[u8]) -> String {
     use std::arch::aarch64::*;
@@ -833,7 +361,7 @@ unsafe fn base64_encode_neon(data: &[u8]) -> String {
     String::from_utf8_unchecked(result)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn base64_encode_sve2(data: &[u8]) -> String {
     #[cfg(target_feature = "sve2")]
     {
@@ -846,7 +374,7 @@ unsafe fn base64_encode_sve2(data: &[u8]) -> String {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sve2")]
 unsafe fn base64_encode_sve2_impl(data: &[u8]) -> String {
     use std::arch::aarch64::*;
@@ -1041,6 +569,7 @@ unsafe fn ascii_to_indices_sve2(
 
 /// Fast base64 decoding (returns `None` on invalid input)
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests"))]
 pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
     if !data.len().is_multiple_of(4) {
         return None;
@@ -1087,6 +616,7 @@ pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
     base64_decode_scalar(data)
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
 fn base64_decode_scalar(data: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -1094,7 +624,7 @@ fn base64_decode_scalar(data: &str) -> Option<Vec<u8>> {
     STANDARD.decode(data.as_bytes()).ok()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sse4.1")]
 unsafe fn base64_decode_sse41(bytes: &[u8]) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
@@ -1186,7 +716,7 @@ unsafe fn base64_decode_sse41(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "avx2")]
 unsafe fn base64_decode_avx2(bytes: &[u8]) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
@@ -1278,7 +808,7 @@ unsafe fn base64_decode_avx2(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn base64_decode_neon(bytes: &[u8]) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -1353,7 +883,7 @@ unsafe fn base64_decode_neon(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 unsafe fn base64_decode_sve2(bytes: &[u8]) -> Option<Vec<u8>> {
     #[cfg(target_feature = "sve2")]
     {
@@ -1366,7 +896,7 @@ unsafe fn base64_decode_sve2(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "sve2")]
 unsafe fn base64_decode_sve2_impl(bytes: &[u8]) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::STANDARD;
@@ -1472,7 +1002,7 @@ unsafe fn base64_decode_sve2_impl(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(test, feature = "rust-tests")))]
 #[target_feature(enable = "neon")]
 unsafe fn translate_base64_indices(
     indices: std::arch::aarch64::uint8x16_t,
@@ -1500,4 +1030,266 @@ unsafe fn translate_base64_indices(
     let res = vbslq_u8(ge_52, digits, res);
     let res = vbslq_u8(ge_62, plus, res);
     vbslq_u8(eq_63, slash, res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- string_contains: basic correctness ----
+
+    #[test]
+    fn string_contains_finds_substring_in_middle() {
+        assert!(string_contains("hello world", "lo wo"));
+    }
+
+    #[test]
+    fn string_contains_finds_substring_at_start() {
+        assert!(string_contains("hello world", "hello"));
+    }
+
+    #[test]
+    fn string_contains_finds_substring_at_end() {
+        assert!(string_contains("hello world", "world"));
+    }
+
+    #[test]
+    fn string_contains_full_match() {
+        assert!(string_contains("exact", "exact"));
+    }
+
+    #[test]
+    fn string_contains_single_char_found() {
+        assert!(string_contains("abcdef", "d"));
+    }
+
+    #[test]
+    fn string_contains_single_char_not_found() {
+        assert!(!string_contains("abcdef", "z"));
+    }
+
+    #[test]
+    fn string_contains_empty_needle_returns_true() {
+        assert!(string_contains("anything", ""));
+    }
+
+    #[test]
+    fn string_contains_empty_haystack_empty_needle() {
+        assert!(string_contains("", ""));
+    }
+
+    #[test]
+    fn string_contains_empty_haystack_nonempty_needle() {
+        assert!(!string_contains("", "x"));
+    }
+
+    #[test]
+    fn string_contains_needle_longer_than_haystack() {
+        assert!(!string_contains("ab", "abcdef"));
+    }
+
+    #[test]
+    fn string_contains_no_match() {
+        assert!(!string_contains("the quick brown fox", "lazy dog"));
+    }
+
+    #[test]
+    fn string_contains_case_sensitive() {
+        assert!(!string_contains("Hello World", "hello world"));
+        assert!(string_contains("Hello World", "Hello"));
+        assert!(!string_contains("ABC", "abc"));
+    }
+
+    #[test]
+    fn string_contains_repeated_pattern() {
+        // Needle appears multiple times - should find any occurrence
+        assert!(string_contains("abcabcabc", "cab"));
+    }
+
+    #[test]
+    fn string_contains_overlapping_partial_matches() {
+        // "aab" has a false start at position 0 ("aa" matches first two chars but third fails)
+        assert!(string_contains("aaab", "aab"));
+    }
+
+    #[test]
+    fn string_contains_binary_like_content() {
+        // Test with bytes that look like binary data (high ASCII in valid UTF-8)
+        let haystack = "prefix\u{00FF}\u{00FE}\u{00FD}suffix";
+        let needle = "\u{00FE}\u{00FD}";
+        assert!(string_contains(haystack, needle));
+    }
+
+    #[test]
+    fn string_contains_long_haystack_short_needle() {
+        // Force SIMD path (>64 bytes for AVX512, >32 for AVX2, >16 for NEON)
+        let haystack = "a]".repeat(100) + "NEEDLE" + &"b[".repeat(100);
+        assert!(string_contains(&haystack, "NEEDLE"));
+        assert!(!string_contains(&haystack, "MISSING"));
+    }
+
+    #[test]
+    fn string_contains_long_haystack_needle_at_very_end() {
+        // Needle in the scalar fallback tail region after SIMD lanes are exhausted
+        let haystack = "x".repeat(200) + "FIN";
+        assert!(string_contains(&haystack, "FIN"));
+    }
+
+    #[test]
+    fn string_contains_long_haystack_needle_at_very_start() {
+        let haystack = "START".to_string() + &"y".repeat(200);
+        assert!(string_contains(&haystack, "START"));
+    }
+
+    #[test]
+    fn string_contains_parity_with_std() {
+        // Verify SIMD path produces same results as std::str::contains for many cases
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("a", ""),
+            ("", "a"),
+            ("a", "a"),
+            ("a", "b"),
+            ("ab", "a"),
+            ("ab", "b"),
+            ("ab", "ab"),
+            ("ab", "abc"),
+            ("abc", "bc"),
+            ("abc", "abc"),
+            ("the quick brown fox jumps over the lazy dog", "fox"),
+            ("the quick brown fox jumps over the lazy dog", "cat"),
+            ("aaaaaaaa", "aaa"),
+            ("TLS 1.3 handshake", "1.3"),
+            ("Content-Type: application/octet-stream", "octet-stream"),
+        ];
+        for &(haystack, needle) in cases {
+            assert_eq!(
+                string_contains(haystack, needle),
+                haystack.contains(needle),
+                "mismatch for haystack={:?} needle={:?}",
+                haystack,
+                needle,
+            );
+        }
+    }
+
+    #[test]
+    fn string_contains_long_needle_forces_fallback() {
+        // Needle > 64 bytes forces AVX512 to delegate to AVX2/scalar
+        let needle = "X".repeat(70);
+        let haystack = "Y".repeat(200) + &needle + &"Z".repeat(200);
+        assert!(string_contains(&haystack, &needle));
+        assert!(!string_contains(&haystack, &"W".repeat(70)));
+    }
+
+    // ---- base64 encode/decode roundtrip ----
+
+    #[test]
+    fn base64_roundtrip_empty() {
+        let encoded = base64_encode(b"");
+        assert_eq!(encoded, "");
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(vec![]));
+    }
+
+    #[test]
+    fn base64_roundtrip_single_byte() {
+        let encoded = base64_encode(b"\x42");
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(vec![0x42]));
+    }
+
+    #[test]
+    fn base64_roundtrip_two_bytes() {
+        let encoded = base64_encode(b"\xDE\xAD");
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(vec![0xDE, 0xAD]));
+    }
+
+    #[test]
+    fn base64_roundtrip_three_bytes_no_padding() {
+        let encoded = base64_encode(b"Man");
+        assert_eq!(encoded, "TWFu"); // RFC 4648 test vector
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(b"Man".to_vec()));
+    }
+
+    #[test]
+    fn base64_encode_known_vectors() {
+        // RFC 4648 section 10 test vectors
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_roundtrip_all_byte_values() {
+        // Ensure every byte value survives encode -> decode
+        let data: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(data));
+    }
+
+    #[test]
+    fn base64_roundtrip_large_buffer() {
+        // Force SIMD path (>24 bytes for AVX2, >12 for NEON)
+        let data: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, Some(data));
+    }
+
+    #[test]
+    fn base64_decode_invalid_length() {
+        // Length not a multiple of 4
+        assert_eq!(base64_decode("abc"), None);
+        assert_eq!(base64_decode("abcde"), None);
+    }
+
+    #[test]
+    fn base64_decode_invalid_chars() {
+        // Characters outside the base64 alphabet
+        assert_eq!(base64_decode("!@#$"), None);
+    }
+
+    #[test]
+    fn base64_decode_with_padding() {
+        assert_eq!(base64_decode("Zg=="), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8="), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
+    }
+
+    #[test]
+    fn base64_scalar_parity_with_crate() {
+        // Verify our scalar encoder matches the base64 crate decoder output
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let test_data: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            b"Hello, World!",
+            b"\x00\x01\x02\x03\x04\x05",
+            &[0xFF; 48],
+        ];
+
+        for data in test_data {
+            let our_encoded = base64_encode(data);
+            let crate_decoded = STANDARD.decode(our_encoded.as_bytes());
+            assert_eq!(
+                crate_decoded.ok().as_deref(),
+                Some(*data),
+                "scalar parity failed for {:?}",
+                data,
+            );
+        }
+    }
 }

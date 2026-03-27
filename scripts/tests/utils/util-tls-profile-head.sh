@@ -7,12 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
 require_base64_tool
 
-OUTPUT_DIR=""; RUSTFLAGS_EXTRA=""
+SCRIPT_NAME="$(basename "$0")"
+DESC="$(grep -m1 '^# Description:' "$0" | sed 's/^# Description:[[:space:]]*//')"
+print_help() { echo "Usage: $SCRIPT_NAME"; [ -n "$DESC" ] && echo "$DESC"; exit 0; }
+
+OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) print_help;;
     *) break;;
@@ -24,11 +26,6 @@ BASE_NAME="$(basename "$0" .sh)"
 mkdir -p "$OUTPUT_DIR"; LOG_FILE="$OUTPUT_DIR/${BASE_NAME}.log"; exec > >(tee -a "$LOG_FILE") 2>&1
 # JSON header
 JSON="$OUTPUT_DIR/results.json"; json_begin "$JSON" "utils_tls_profile_head"; JSON_FIRST_RUN=1
-# Unified help handler
-SCRIPT_NAME="$(basename "$0")"
-DESC="$(grep -m1 '^# Description:' "$0" | sed 's/^# Description:[[:space:]]*//')"
-print_help() { echo "Usage: $SCRIPT_NAME"; [ -n "$DESC" ] && echo "$DESC"; exit 0; }
-case "${1:-}" in -h|--help|help) print_help ;; esac
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd -P)"
 cd "$ROOT_DIR"
@@ -40,7 +37,7 @@ o=$(echo "$O" | tr 'A-Z' 'a-z')
 
 found=0
 set_base64_decode_flag DEC
-for d in browser_profiles; do
+for d in browser_profiles; do [ -d "$d" ] || continue
   f="$d/${b}_${o}.chlo"
   if [ -f "$f" ]; then
     echo "Using: $f"

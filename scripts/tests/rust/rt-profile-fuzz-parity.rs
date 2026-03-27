@@ -103,7 +103,7 @@ fn run_compress_cases(simd_profile: CpuProfile) {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn fuzz_parity_x86_sse2() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let simd_profile = CpuProfile::X86_P0a;
     assert!(optimize::set_profile_override_for_tests(simd_profile));
     optimize::clear_profile_override_for_tests();
@@ -117,7 +117,7 @@ fn fuzz_parity_x86_sse2() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn fuzz_parity_arm_neon() {
-    let _guard = OVERRIDE_LOCK.lock().unwrap();
+    let _guard = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let simd_profile = CpuProfile::ARM_A0;
     assert!(optimize::set_profile_override_for_tests(simd_profile));
     optimize::clear_profile_override_for_tests();

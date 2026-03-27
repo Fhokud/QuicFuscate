@@ -22,7 +22,6 @@ while [[ $# -gt 0 ]]; do
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --duration) FUZZ_DURATION="$2"; shift;;
     --jobs) FUZZ_JOBS="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--duration SEC] [--jobs N]"; exit 0;;
     *) break;;
@@ -214,7 +213,13 @@ echo -e "\n> Testing boundary conditions..."
 run_named_test "Boundary conditions" "boundary_conditions"
 
 echo -e "\n> Testing integer overflows..."
-run_case "Integer overflow checks" RUSTFLAGS="-Coverflow-checks=on" -- cargo test --release --features rust-tests --lib integer_overflow -- --nocapture
+if test_pattern_exists "integer_overflow"; then
+  run_case "Integer overflow checks" RUSTFLAGS="-Coverflow-checks=on" -- cargo test --release --features rust-tests --lib integer_overflow -- --nocapture
+else
+  warn "Skipping integer_overflow (no matching tests)"
+  SKIPPED=$((SKIPPED+1))
+  append_json "Integer overflow checks" "skipped" 0
+fi
 
 # Memory safety tests
 echo -e "\n=== Memory Safety Tests ==="

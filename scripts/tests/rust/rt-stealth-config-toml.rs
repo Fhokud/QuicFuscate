@@ -31,7 +31,6 @@ enable_http3_masquerading = false
 use_qpack_headers = false
 enable_domain_fronting = false
 fronting_domains = ["front1.example", "front2.example"]
-enable_xor_obfuscation = false
 enable_traffic_padding = true
 enable_timing_obfuscation = true
 enable_protocol_mimicry = false
@@ -59,7 +58,6 @@ deny = ["image/*"]
         cfg.fronting_domains,
         vec!["front1.example".to_string(), "front2.example".to_string()]
     );
-    assert!(!cfg.enable_xor_obfuscation);
     assert!(cfg.enable_traffic_padding);
     assert!(cfg.enable_timing_obfuscation);
     assert!(!cfg.enable_protocol_mimicry);
@@ -85,4 +83,72 @@ unknown_key = 123
 
     let cfg = StealthConfig::from_toml(toml).expect("parse with unknown keys");
     assert_eq!(cfg.initial_browser, BrowserProfile::Chrome);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: PacketNormalize padding strategy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn packet_normalize_variant_serializes_and_deserializes() {
+    let toml = r#"
+[stealth]
+padding_strategy = "PacketNormalize"
+normalize_target_size = 1200
+"#;
+    let cfg = StealthConfig::from_toml(toml).expect("parse PacketNormalize");
+    assert_eq!(cfg.padding_strategy, PaddingStrategy::PacketNormalize);
+    assert_eq!(cfg.normalize_target_size, 1200);
+}
+
+#[test]
+fn anti_dpi_preset_uses_packet_normalize_with_target() {
+    let cfg = StealthConfig::anti_dpi();
+    assert_eq!(cfg.padding_strategy, PaddingStrategy::BrowserMimic);
+    // Anti-DPI carries a normalize_target for operators who switch to PacketNormalize
+    assert_eq!(cfg.normalize_target_size, 1200);
+}
+
+#[test]
+fn off_preset_has_normalize_target_zero() {
+    let cfg = StealthConfig::off();
+    assert_eq!(cfg.normalize_target_size, 0);
+    assert!(!cfg.enable_cover_ping);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Cover PING scheduling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stealth_preset_enables_cover_ping() {
+    let cfg = StealthConfig::stealth();
+    assert!(cfg.enable_cover_ping);
+    assert_eq!(cfg.cover_ping_interval_ms, 30_000);
+}
+
+#[test]
+fn anti_dpi_preset_has_aggressive_cover_ping() {
+    let cfg = StealthConfig::anti_dpi();
+    assert!(cfg.enable_cover_ping);
+    assert_eq!(cfg.cover_ping_interval_ms, 15_000);
+}
+
+#[test]
+fn cover_ping_config_roundtrips_toml() {
+    let toml = r#"
+[stealth]
+enable_cover_ping = true
+cover_ping_interval_ms = 5000
+"#;
+    let cfg = StealthConfig::from_toml(toml).expect("parse cover ping config");
+    assert!(cfg.enable_cover_ping);
+    assert_eq!(cfg.cover_ping_interval_ms, 5000);
+}
+
+#[test]
+fn performance_and_off_presets_disable_cover_ping() {
+    for cfg in [StealthConfig::performance(), StealthConfig::off()] {
+        assert!(!cfg.enable_cover_ping, "mode {:?} should have cover ping off", cfg.mode);
+    }
 }

@@ -9,7 +9,7 @@ cd "$PROJECT_ROOT"
 
 OUTPUT_DIR=""
 ADMIN_USER="admin"
-ADMIN_PASS="123"
+ADMIN_PASS="E2E_TEST_ONLY_pw42"
 ADMIN_ADDR="127.0.0.1:9000"
 SERVER_ADDR="127.0.0.1:4433"
 ADMIN_ADDR_SET=0
@@ -152,7 +152,7 @@ fi
 cat > "$CONFIG_FILE" <<'TOML'
 [fec]
 mode = "auto"
-initial_mode = "normal"
+initial_mode = "auto"
 window_good = 20
 
 [stealth]
@@ -160,7 +160,6 @@ mode = "auto"
 enable_doh = true
 enable_http3_masquerading = true
 enable_domain_fronting = false
-enable_xor_obfuscation = false
 
 [optimization]
 memory_pool_size = 33554432
@@ -169,7 +168,7 @@ TOML
 cat > "$CONFIG_UPDATE" <<'TOML'
 [fec]
 mode = "auto"
-initial_mode = "normal"
+initial_mode = "auto"
 window_good = 20
 
 [stealth]
@@ -177,7 +176,6 @@ mode = "auto"
 enable_doh = true
 enable_http3_masquerading = true
 enable_domain_fronting = false
-enable_xor_obfuscation = false
 
 [optimization]
 memory_pool_size = 16777216

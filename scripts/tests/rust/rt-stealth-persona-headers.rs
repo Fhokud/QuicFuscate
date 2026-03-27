@@ -1,6 +1,5 @@
 #![cfg(feature = "rust-tests")]
 use quicfuscate::stealth::{BrowserProfile, FingerprintProfile, Http3Masquerade, OsProfile};
-use quicfuscate::transport::h3::NameValue;
 
 fn is_title_case(name: &[u8]) -> bool {
     let Ok(s) = std::str::from_utf8(name) else {

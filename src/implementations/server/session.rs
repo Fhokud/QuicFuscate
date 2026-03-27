@@ -6,15 +6,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::rng;
+
 /// Unique session identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
 
 impl SessionId {
     fn new() -> Self {
-        use std::sync::atomic::AtomicU64;
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
+        let mut buf = [0u8; 8];
+        rng::fill_secure_or_abort(&mut buf, "session::SessionId::new");
+        Self(u64::from_le_bytes(buf))
+    }
+
+    pub fn from_u64(value: u64) -> Self {
+        Self(value)
     }
 
     /// Returns the underlying numeric session identifier.
@@ -108,6 +114,10 @@ impl Session {
     pub fn stats(&self) -> &Arc<SessionStats> {
         &self.stats
     }
+
+    pub fn set_remote_addr(&mut self, remote_addr: SocketAddr) {
+        self.remote_addr = remote_addr;
+    }
 }
 
 /// Session manager.
@@ -170,6 +180,14 @@ impl SessionManager {
         self.sessions.get(&id)
     }
 
+    pub fn remote_addr_by_session_id(&self, id: SessionId) -> Option<SocketAddr> {
+        self.sessions.get(&id).map(Session::remote_addr)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&SessionId, &Session)> {
+        self.sessions.iter()
+    }
+
     /// Get session by client IP.
     pub fn get_by_client_ip(&self, ip: Ipv4Addr) -> Option<&Session> {
         self.by_client_ip.get(&ip).and_then(|id| self.sessions.get(id))
@@ -178,6 +196,26 @@ impl SessionManager {
     /// Get session by remote address.
     pub fn get_by_remote_addr(&self, addr: SocketAddr) -> Option<&Session> {
         self.by_remote_addr.get(&addr).and_then(|id| self.sessions.get(id))
+    }
+
+    pub fn session_id_by_remote_addr(&self, addr: SocketAddr) -> Option<SessionId> {
+        self.by_remote_addr.get(&addr).copied()
+    }
+
+    pub fn stats_by_remote_addr(&self, addr: SocketAddr) -> Option<Arc<SessionStats>> {
+        self.get_by_remote_addr(addr).map(|session| Arc::clone(session.stats()))
+    }
+
+    pub fn rebind_remote_addr(
+        &mut self,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    ) -> Option<SessionId> {
+        let session_id = self.by_remote_addr.remove(&old_addr)?;
+        let session = self.sessions.get_mut(&session_id)?;
+        session.set_remote_addr(new_addr);
+        self.by_remote_addr.insert(new_addr, session_id);
+        Some(session_id)
     }
 
     /// Get all session IDs.

@@ -73,6 +73,8 @@ pub struct ClientRuntime {
     shutdown: Arc<AtomicBool>,
     /// Current state
     state: ClientState,
+    /// Event-driven handshake completion notification (replaces polling loop).
+    handshake_event: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
 }
 
 /// Client subsystem handles (initialized during start).
@@ -84,7 +86,6 @@ pub struct ClientSubsystems {
 }
 
 /// FEC codec wrapper for the client.
-#[allow(dead_code)]
 pub struct FecCodec {
     inner: parking_lot::Mutex<crate::fec::AdaptiveFec>,
     packet_id: std::sync::atomic::AtomicU64,
@@ -92,48 +93,12 @@ pub struct FecCodec {
 
 impl FecCodec {
     pub fn new(config: crate::engine::FecSection) -> Self {
-        let initial_mode = match config.mode {
-            crate::engine::FecMode::Off => crate::fec::FecMode::Zero,
-            crate::engine::FecMode::Auto => crate::fec::FecMode::Normal,
-            crate::engine::FecMode::Manual => crate::fec::FecMode::Normal,
-        };
-        let force_on = matches!(config.mode, crate::engine::FecMode::Manual);
-        let mut window_sizes = std::collections::HashMap::new();
-        window_sizes.insert(crate::fec::FecMode::Zero, 0);
-        window_sizes.insert(crate::fec::FecMode::Light, config.window_excellent);
-        window_sizes.insert(crate::fec::FecMode::Normal, config.window_good);
-        window_sizes.insert(crate::fec::FecMode::Medium, config.window_fair);
-        window_sizes.insert(crate::fec::FecMode::Strong, config.window_poor);
-        window_sizes.insert(crate::fec::FecMode::Extreme, 100);
-        window_sizes.insert(crate::fec::FecMode::Streaming, config.stream_every);
-
-        let fec_config = crate::fec::FecConfig {
-            initial_mode,
-            window_sizes,
-            lambda: 0.15,
-            burst_window: 16,
-            hysteresis: if config.enable_hysteresis { 0.1 } else { 0.0 },
-            pid: crate::fec::PidConfig { kp: 1.2, ki: 0.5, kd: 0.1 },
-            force_on,
-            kalman_enabled: config.enable_kalman,
-            kalman_q: 0.001,
-            kalman_r: 0.01,
-        };
+        let fec_config = crate::fec::FecConfig::from_engine_section(&config);
 
         Self {
             inner: parking_lot::Mutex::new(crate::fec::AdaptiveFec::new(fec_config)),
             packet_id: std::sync::atomic::AtomicU64::new(0),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn encode(&self, data: &[u8]) -> Vec<u8> {
-        self.encode_packets(data).into_iter().next().unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub fn decode(&self, data: &[u8]) -> Vec<u8> {
-        self.decode_packets(data).into_iter().next().unwrap_or_default()
     }
 
     pub fn encode_packets(&self, data: &[u8]) -> Vec<Vec<u8>> {
@@ -218,6 +183,10 @@ impl ClientRuntime {
             io_handles: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             state: ClientState::Stopped,
+            handshake_event: Arc::new((
+                parking_lot::Mutex::new(false),
+                parking_lot::Condvar::new(),
+            )),
         })
     }
 
@@ -294,7 +263,9 @@ impl ClientRuntime {
             return Ok(());
         }
         if self.state == ClientState::Connected {
-            let _ = self.disconnect();
+            if let Err(e) = self.disconnect() {
+                log::warn!("Client disconnect during stop failed: {:?}", e);
+            }
         }
 
         self.state = ClientState::Stopping;
@@ -352,8 +323,12 @@ impl ClientRuntime {
             .set_nonblocking(true)
             .map_err(|e| EngineError::Io(format!("UDP nonblocking failed: {}", e)))?;
         let sock_ref = SockRef::from(&std_socket);
-        let _ = sock_ref.set_recv_buffer_size(io_config.socket_buffer_size);
-        let _ = sock_ref.set_send_buffer_size(io_config.socket_buffer_size);
+        if let Err(e) = sock_ref.set_recv_buffer_size(io_config.socket_buffer_size) {
+            log::debug!("UDP recv buffer size hint rejected: {}", e);
+        }
+        if let Err(e) = sock_ref.set_send_buffer_size(io_config.socket_buffer_size) {
+            log::debug!("UDP send buffer size hint rejected: {}", e);
+        }
         std_socket
             .connect(remote_addr)
             .map_err(|e| EngineError::Io(format!("UDP connect failed: {}", e)))?;
@@ -381,16 +356,26 @@ impl ClientRuntime {
             let conn = shared_conn.clone();
             let socket = socket.clone();
             async move {
-                let _ = io_driver.run_outbound(tun, conn, socket).await;
+                if let Err(e) = io_driver.run_outbound(tun, conn, socket).await {
+                    log::warn!("Client outbound I/O task exited with error: {:?}", e);
+                }
             }
         });
+        // Reset handshake event for new connection attempt.
+        {
+            let (lock, _) = &*self.handshake_event;
+            *lock.lock() = false;
+        }
         let inbound = runtime.spawn({
             let io_driver = io_driver.clone();
             let tun = tun.clone();
             let conn = shared_conn.clone();
             let socket = socket.clone();
+            let hs_event = self.handshake_event.clone();
             async move {
-                let _ = io_driver.run_inbound(tun, conn, socket).await;
+                if let Err(e) = io_driver.run_inbound(tun, conn, socket, hs_event).await {
+                    log::warn!("Client inbound I/O task exited with error: {:?}", e);
+                }
             }
         });
         self.io_handles = vec![outbound, inbound];
@@ -417,7 +402,9 @@ impl ClientRuntime {
             let handles = std::mem::take(&mut self.io_handles);
             rt.block_on(async move {
                 for handle in handles {
-                    let _ = handle.await;
+                    if let Err(e) = handle.await {
+                        log::warn!("Client I/O task join failed: {}", e);
+                    }
                 }
             });
         }
@@ -443,6 +430,24 @@ impl ClientRuntime {
             return false;
         }
         self.connection.as_ref().map(|conn| conn.is_established()).unwrap_or(false)
+    }
+
+    /// Block until the handshake completes or the deadline expires.
+    /// Returns `true` if handshake completed, `false` on timeout.
+    pub fn wait_handshake(&self, deadline: std::time::Instant) -> bool {
+        let (lock, cvar) = &*self.handshake_event;
+        let mut established = lock.lock();
+        while !*established {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let result = cvar.wait_for(&mut established, remaining);
+            if result.timed_out() {
+                return *established;
+            }
+        }
+        true
     }
 
     /// Get connection reference (if connected).
@@ -494,7 +499,9 @@ impl ClientRuntime {
 impl Drop for ClientRuntime {
     fn drop(&mut self) {
         if self.state != ClientState::Stopped {
-            let _ = self.stop();
+            if let Err(e) = self.stop() {
+                log::warn!("ClientRuntime drop-stop failed: {:?}", e);
+            }
         }
     }
 }

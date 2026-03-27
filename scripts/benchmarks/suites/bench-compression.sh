@@ -14,14 +14,13 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --iterations) ITER="$2"; shift;;
     --size) SIZE="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h)
       echo "Usage: $(basename "$0") [--output-dir DIR] [--iterations N] [--size BYTES]"
       usage_common_flags 2>/dev/null || true
       exit 0
       ;;
-    *) echo "Unknown argument: " >&2; exit 2;;
+    *) echo "Unknown argument: $1" >&2; exit 2;;
   esac
   shift
 done

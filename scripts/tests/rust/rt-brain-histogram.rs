@@ -38,7 +38,7 @@ fn scalar_js(bins: &[u64], total: u64, target: &[f64]) -> f64 {
 fn decay_histogram_matches_scalar() {
     let mut rng = StdRng::seed_from_u64(0xBAD5_EED5);
     for &decay in &[0.0, 0.25, 0.5, 0.98, 1.0] {
-        let bins: Vec<u64> = (0..32).map(|_| rng.gen_range(0..10_000)).collect();
+        let bins: Vec<u64> = (0..32).map(|_| rng.random_range(0..10_000)).collect();
         let mut accel_bins = bins.clone();
         quicfuscate::accelerate::brain::decay_histogram(&mut accel_bins, decay);
         let expected = scalar_decay(bins.clone(), decay);
@@ -50,12 +50,13 @@ fn decay_histogram_matches_scalar() {
 fn jensen_shannon_matches_scalar() {
     let mut rng = StdRng::seed_from_u64(0xFEED_C0DE);
     for bins_len in [8usize, 16, 31, 64] {
-        let mut bins: Vec<u64> = (0..bins_len).map(|_| rng.gen_range(0..5000)).collect();
+        let mut bins: Vec<u64> = (0..bins_len).map(|_| rng.random_range(0..5000)).collect();
         if bins.iter().all(|&v| v == 0) {
             bins[0] = 1;
         }
         let total = bins.iter().sum::<u64>().max(1);
-        let mut target: Vec<f64> = (0..bins_len).map(|_| rng.gen_range(0.0..1.0) + 1e-6).collect();
+        let mut target: Vec<f64> =
+            (0..bins_len).map(|_| rng.random_range(0.0..1.0) + 1e-6).collect();
         let target_sum: f64 = target.iter().sum();
         for v in target.iter_mut() {
             *v /= target_sum;
@@ -128,7 +129,7 @@ fn decay_histogram_extremes() {
 fn decay_histogram_x86_backends_match_scalar() {
     let mut rng = StdRng::seed_from_u64(0x5EED_1DEA);
     for &decay in &[0.0, 0.125, 0.5, 0.9375, 1.0] {
-        let bins: Vec<u64> = (0..32).map(|_| rng.gen_range(0..100_000)).collect();
+        let bins: Vec<u64> = (0..32).map(|_| rng.random_range(0..100_000)).collect();
         let expected = scalar_decay(bins.clone(), decay);
 
         if std::is_x86_feature_detected!("avx512f")
@@ -159,12 +160,13 @@ fn decay_histogram_x86_backends_match_scalar() {
 fn jensen_shannon_x86_backends_match_scalar() {
     let mut rng = StdRng::seed_from_u64(0xD0C5_1DED);
     for bins_len in [8usize, 16, 31, 64] {
-        let mut bins: Vec<u64> = (0..bins_len).map(|_| rng.gen_range(0..10_000)).collect();
+        let mut bins: Vec<u64> = (0..bins_len).map(|_| rng.random_range(0..10_000)).collect();
         if bins.iter().all(|&v| v == 0) {
             bins[0] = 1;
         }
         let total = bins.iter().sum::<u64>().max(1);
-        let mut target: Vec<f64> = (0..bins_len).map(|_| rng.gen_range(0.0..1.0) + 1e-6).collect();
+        let mut target: Vec<f64> =
+            (0..bins_len).map(|_| rng.random_range(0.0..1.0) + 1e-6).collect();
         let target_sum: f64 = target.iter().sum();
         for v in target.iter_mut() {
             *v /= target_sum;

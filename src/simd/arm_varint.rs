@@ -6,9 +6,14 @@ use std::arch::aarch64::*;
 
 /// NEON-optimized QUIC varint encoding
 /// Uses vtbl for length determination and bit manipulation
+///
+/// # Safety
+/// Caller must ensure NEON target feature is available at runtime.
+/// The function validates `buf.len() >= len` before any NEON store,
+/// so pointer arithmetic stays within the slice allocation.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub unsafe fn encode_varint_neon(mut val: u64, buf: &mut [u8]) -> usize {
+unsafe fn encode_varint_neon_impl(mut val: u64, buf: &mut [u8]) -> usize {
     // Determine length (same logic as scalar)
     let (len, prefix): (usize, u8) = if val < (1u64 << 6) {
         (1, 0b00)
@@ -32,14 +37,18 @@ pub unsafe fn encode_varint_neon(mut val: u64, buf: &mut [u8]) -> usize {
             buf[0] = (prefix << 6) | (val as u8 & 0x3F);
         }
         2 => {
-            // Use NEON to pack 2 bytes
+            // SAFETY: `buf.len() >= 2` checked above. The temporary array is stack-local
+            // with 8 bytes, so `vld1_u8` reads 8 valid bytes. `vst1_lane_u16` writes
+            // exactly 2 bytes to `buf`, which is within bounds.
             val &= (1u64 << 14) - 1;
             let bytes = val.to_be_bytes();
             let vec = vld1_u8([(prefix << 6) | bytes[6], bytes[7], 0, 0, 0, 0, 0, 0].as_ptr());
             vst1_lane_u16::<0>(buf.as_mut_ptr() as *mut u16, vreinterpret_u16_u8(vec));
         }
         4 => {
-            // NEON 4-byte pack
+            // SAFETY: `buf.len() >= 4` checked above. The 16-byte array literal is
+            // stack-local, so `vld1q_u8` reads 16 valid bytes. `vst1q_lane_u32`
+            // writes exactly 4 bytes to `buf`, which is within bounds.
             val &= (1u64 << 30) - 1;
             let bytes = val.to_be_bytes();
             let vec = vld1q_u8(
@@ -66,7 +75,9 @@ pub unsafe fn encode_varint_neon(mut val: u64, buf: &mut [u8]) -> usize {
             vst1q_lane_u32::<0>(buf.as_mut_ptr() as *mut u32, vreinterpretq_u32_u8(vec));
         }
         8 => {
-            // NEON 8-byte pack
+            // SAFETY: `buf.len() >= 8` checked above. The 16-byte array literal is
+            // stack-local, so `vld1q_u8` reads 16 valid bytes. `vst1q_lane_u64`
+            // writes exactly 8 bytes to `buf`, which is within bounds.
             val &= (1u64 << 62) - 1;
             let bytes = val.to_be_bytes();
             let vec = vld1q_u8(
@@ -92,15 +103,23 @@ pub unsafe fn encode_varint_neon(mut val: u64, buf: &mut [u8]) -> usize {
             );
             vst1q_lane_u64::<0>(buf.as_mut_ptr() as *mut u64, vreinterpretq_u64_u8(vec));
         }
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid varint encoded length");
+            return 0;
+        }
     }
     len
 }
 
 /// SVE2-optimized QUIC varint encoding (VL-scalable)
+///
+/// # Safety
+/// Caller must ensure SVE2 target feature is available at runtime.
+/// Buffer length is validated before each SVE store, so writes
+/// stay within the slice allocation.
 #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
 #[target_feature(enable = "sve2")]
-pub unsafe fn encode_varint_sve2(mut val: u64, buf: &mut [u8]) -> usize {
+unsafe fn encode_varint_sve2_impl(mut val: u64, buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
@@ -126,6 +145,9 @@ pub unsafe fn encode_varint_sve2(mut val: u64, buf: &mut [u8]) -> usize {
             buf[0] = (prefix << 6) | (val as u8 & 0x3F);
         }
         2 => {
+            // SAFETY: `buf.len() >= 2` checked above. The predicate `pg` activates
+            // exactly 1 u16 lane, so `svst1_u16` writes 2 bytes within bounds.
+            // Alignment is not required for SVE predicated stores.
             val &= (1u64 << 14) - 1;
             let encoded = (((prefix as u16) << 14) | (val as u16)).to_be();
             let lane = svdup_n_u16(encoded);
@@ -133,6 +155,8 @@ pub unsafe fn encode_varint_sve2(mut val: u64, buf: &mut [u8]) -> usize {
             svst1_u16(pg, buf.as_mut_ptr() as *mut u16, lane);
         }
         4 => {
+            // SAFETY: `buf.len() >= 4` checked above. The predicate activates 1 u32
+            // lane, so `svst1_u32` writes 4 bytes within bounds.
             val &= (1u64 << 30) - 1;
             let encoded = (((prefix as u32) << 30) | (val as u32)).to_be();
             let lane = svdup_n_u32(encoded);
@@ -140,23 +164,33 @@ pub unsafe fn encode_varint_sve2(mut val: u64, buf: &mut [u8]) -> usize {
             svst1_u32(pg, buf.as_mut_ptr() as *mut u32, lane);
         }
         8 => {
+            // SAFETY: `buf.len() >= 8` checked above. The predicate activates 1 u64
+            // lane, so `svst1_u64` writes 8 bytes within bounds.
             val &= (1u64 << 62) - 1;
             let encoded = (((prefix as u64) << 62) | val).to_be();
             let lane = svdup_n_u64(encoded);
             let pg = svwhilelt_b64(0_u64, 1_u64);
             svst1_u64(pg, buf.as_mut_ptr() as *mut u64, lane);
         }
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid varint encoded length");
+            return 0;
+        }
     }
 
     len
 }
 
-/// NEON-optimized QUIC varint decoding  
+/// NEON-optimized QUIC varint decoding
 /// Uses vtbl for efficient byte extraction
+///
+/// # Safety
+/// Caller must ensure NEON target feature is available at runtime.
+/// All NEON loads use bounded temporaries (`copy_from_slice` into stack arrays),
+/// so no out-of-bounds pointer access occurs.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub unsafe fn decode_varint_neon(buf: &[u8]) -> Option<(u64, usize)> {
+unsafe fn decode_varint_neon_impl(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
     }
@@ -169,7 +203,10 @@ pub unsafe fn decode_varint_neon(buf: &[u8]) -> Option<(u64, usize)> {
         0b01 => 2,
         0b10 => 4,
         0b11 => 8,
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid QUIC varint prefix");
+            return None;
+        }
     };
 
     if buf.len() < len {
@@ -207,16 +244,27 @@ pub unsafe fn decode_varint_neon(buf: &[u8]) -> Option<(u64, usize)> {
             let raw = vgetq_lane_u64::<0>(shifted);
             u64::from_be(raw) & 0x3FFFFFFFFFFFFFFF
         }
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid varint encoded length");
+            return None;
+        }
     };
 
     Some((val, len))
 }
 
 /// SVE2-optimized QUIC varint decoding (VL-scalable)
+///
+/// # Safety
+/// Caller must ensure SVE2 target feature is available at runtime.
+/// `buf.len() >= len` is checked before each SVE load. The predicate
+/// restricts the load to exactly 1 element, so reads stay in bounds.
+/// Casting `buf.as_ptr()` to wider integer pointer types relies on the
+/// SVE load being predicated (only 1 active lane), so alignment does
+/// not matter for correctness on AArch64.
 #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
 #[target_feature(enable = "sve2")]
-pub unsafe fn decode_varint_sve2(buf: &[u8]) -> Option<(u64, usize)> {
+unsafe fn decode_varint_sve2_impl(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
     }
@@ -229,7 +277,10 @@ pub unsafe fn decode_varint_sve2(buf: &[u8]) -> Option<(u64, usize)> {
         0b01 => 2,
         0b10 => 4,
         0b11 => 8,
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid QUIC varint prefix");
+            return None;
+        }
     };
 
     if buf.len() < len {
@@ -256,10 +307,44 @@ pub unsafe fn decode_varint_sve2(buf: &[u8]) -> Option<(u64, usize)> {
             let raw = svlasta_u64(pg, data);
             u64::from_be(raw) & ((1u64 << 62) - 1)
         }
-        _ => unreachable!(),
+        _ => {
+            debug_assert!(false, "invalid varint encoded length");
+            return None;
+        }
     };
 
     Some((value, len))
+}
+
+#[inline(always)]
+pub(crate) fn encode_varint_neon(val: u64, buf: &mut [u8]) -> usize {
+    // SAFETY: This module is compiled only on aarch64 where NEON is baseline.
+    // The impl function validates buffer length before writing.
+    unsafe { encode_varint_neon_impl(val, buf) }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[inline(always)]
+pub(crate) fn encode_varint_sve2(val: u64, buf: &mut [u8]) -> usize {
+    // SAFETY: Guarded by `target_feature = "sve2"` cfg. The impl validates
+    // buffer length before any SVE store instruction.
+    unsafe { encode_varint_sve2_impl(val, buf) }
+}
+
+#[inline(always)]
+pub(crate) fn decode_varint_neon(buf: &[u8]) -> Option<(u64, usize)> {
+    // SAFETY: This module is compiled only on aarch64 where NEON is baseline.
+    // The impl function validates buffer length before any NEON load and uses
+    // bounded stack copies to avoid out-of-bounds reads.
+    unsafe { decode_varint_neon_impl(buf) }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+#[inline(always)]
+pub(crate) fn decode_varint_sve2(buf: &[u8]) -> Option<(u64, usize)> {
+    // SAFETY: Guarded by `target_feature = "sve2"` cfg. The impl validates
+    // buffer length before any SVE predicated load.
+    unsafe { decode_varint_sve2_impl(buf) }
 }
 
 #[cfg(test)]
@@ -273,10 +358,10 @@ mod tests {
 
         for &val in &test_values {
             let mut buf = [0u8; 8];
-            let encoded_len = unsafe { encode_varint_neon(val, &mut buf) };
+            let encoded_len = encode_varint_neon(val, &mut buf);
             assert!(encoded_len > 0, "Encoding failed for {}", val);
 
-            let decoded = unsafe { decode_varint_neon(&buf) };
+            let decoded = decode_varint_neon(&buf);
             assert!(decoded.is_some(), "Decoding failed for {}", val);
 
             let (decoded_val, decoded_len) = decoded.unwrap();
@@ -292,10 +377,10 @@ mod tests {
 
         for &val in &test_values {
             let mut buf = [0u8; 8];
-            let encoded_len = unsafe { encode_varint_sve2(val, &mut buf) };
+            let encoded_len = encode_varint_sve2(val, &mut buf);
             assert!(encoded_len > 0, "Encoding failed for {}", val);
 
-            let decoded = unsafe { decode_varint_sve2(&buf) };
+            let decoded = decode_varint_sve2(&buf);
             assert!(decoded.is_some(), "Decoding failed for {}", val);
 
             let (decoded_val, decoded_len) = decoded.unwrap();

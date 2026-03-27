@@ -1,25 +1,50 @@
 //! HTTP admin server for web dashboard control.
 //!
 //! Serves static web assets and exposes a JSON API backed by an AdminHttpHandler.
+//! Uses hyper 1.x for HTTP/1.1 parsing and response writing.
+//!
+//! ## Architecture: admin_http.rs vs admin.rs
+//!
+//! This module (`admin_http.rs`) is the **HTTP web dashboard** - a remote-capable,
+//! authenticated admin interface. It serves the web-admin UI static assets and exposes
+//! a JSON API with session-based authentication (Argon2 password hashing, CSRF tokens,
+//! rate limiting, replay protection).
+//!
+//! The sibling module `admin.rs` is the **Unix domain socket control plane** - a low-level,
+//! local-only interface for `quicfuscate-ctl` CLI commands. It uses JSON-over-Unix-socket
+//! without authentication (socket file permissions provide access control).
+//!
+//! Both interfaces serve different use cases and are intentionally parallel:
+//! - `admin_http.rs`: remote dashboard access, QKey management, multi-user (authenticated)
+//! - `admin.rs`: local server management, scripting, automation (no auth overhead)
+//!
+//! Shared types (`AdminResponse`, `ClientInfo`) are imported from `admin.rs`.
+//! Handler logic is currently independent in each module. Future direction: extract
+//! shared handler logic into a common service layer to reduce duplication while
+//! preserving transport separation.
 
 use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use rand::rngs::OsRng;
-use rand::RngCore;
+// Salt via crate::rng::fill_secure (wraps getrandom, consistent with project RNG contract).
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, RwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 
 use super::admin::{AdminResponse, ClientInfo};
 
@@ -28,13 +53,23 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_USERNAME_CHARS: usize = 64;
 const MAX_PASSWORD_BYTES: usize = 256;
 const SESSION_COOKIE: &str = "qf_admin_session";
-const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+const SESSION_TTL_SECS: u64 = 60 * 60;
+const LOGIN_RATE_LIMIT_ATTEMPTS: u32 = 5;
+const LOGIN_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const CSRF_TOKEN_BYTES: usize = 16;
 const CSRF_TOKEN_HEADER: &str = "X-CSRF-Token";
 const CSRF_NONCE_HEADER: &str = "X-CSRF-Nonce";
-const MAX_REPLAY_FINGERPRINTS: usize = 128;
+const MAX_REPLAY_FINGERPRINTS: usize = 4096;
 const MAX_QKEY_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10; // 10 years
 const ADMIN_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
+
+fn shared_session_store(ttl: Duration) -> Arc<Mutex<SessionStore>> {
+    Arc::new(Mutex::new(SessionStore::new(ttl)))
+}
+
+fn shared_login_rate_limiter(max_attempts: u32, window_secs: u64) -> Arc<Mutex<LoginRateLimiter>> {
+    Arc::new(Mutex::new(LoginRateLimiter::new(max_attempts, window_secs)))
+}
 
 #[derive(Clone, Debug)]
 pub struct AdminAuth {
@@ -45,7 +80,10 @@ pub struct AdminAuth {
 
 impl AdminAuth {
     pub fn new(user: String, password: String, requires_password_change: bool) -> Self {
-        let password_phc = hash_password(&password);
+        let password_phc = hash_password(&password).unwrap_or_else(|e| {
+            log::error!("{} - admin account will be unusable until password is reset", e);
+            String::new()
+        });
         Self { user, password_phc, requires_password_change }
     }
 
@@ -68,10 +106,12 @@ impl AdminAuth {
         verify_password(&self.password_phc, password)
     }
 
-    fn set_credentials(&mut self, new_user: String, new_password: String) {
+    fn set_credentials(&mut self, new_user: String, new_password: String) -> Result<(), String> {
+        let phc = hash_password(&new_password)?;
         self.user = new_user;
-        self.password_phc = hash_password(&new_password);
+        self.password_phc = phc;
         self.requires_password_change = false;
+        Ok(())
     }
 
     fn set_username(&mut self, new_user: String) {
@@ -123,44 +163,20 @@ fn persist_auth_file(path: &Path, auth: &AdminAuth) {
             return;
         }
     }
-    if let Err(e) = atomic_write_file(path, &bytes) {
+    if let Err(e) = super::fsutil::atomic_write_file(
+        path,
+        &bytes,
+        Some(0o600),
+        "admin_http::auth_write_tmp_nonce",
+    ) {
         log::warn!("admin auth write failed ({}): {}", path.display(), e);
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
 }
 
-fn atomic_write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::fs::File;
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut nonce = [0u8; 8];
-    OsRng.fill_bytes(&mut nonce);
-    let mut tmp_name = String::from(".tmp-");
-    for b in nonce {
-        let _ = std::fmt::Write::write_fmt(&mut tmp_name, format_args!("{:02x}", b));
-    }
-
-    let tmp_path = path.with_file_name(format!(
-        "{}{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-        tmp_name
-    ));
-
-    let mut f = File::create(&tmp_path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+/// Re-export from the canonical shared utility in `crate::rng`.
+#[inline(always)]
+fn push_hex_byte(out: &mut String, byte: u8) {
+    crate::rng::push_hex_byte(out, byte);
 }
 
 fn current_epoch_secs() -> u64 {
@@ -237,14 +253,14 @@ impl SessionStore {
     fn create(&mut self) -> (String, String) {
         self.prune();
         let mut buf = [0u8; 32];
-        OsRng.fill_bytes(&mut buf);
+        crate::rng::fill_secure_or_abort(&mut buf, "admin_http::session_id");
         let id = URL_SAFE_NO_PAD.encode(buf);
 
         let mut token = [0u8; CSRF_TOKEN_BYTES];
-        OsRng.fill_bytes(&mut token);
+        crate::rng::fill_secure_or_abort(&mut token, "admin_http::session_csrf_token");
         let mut csrf_token = String::with_capacity(token.len() * 2);
         for b in token {
-            let _ = std::fmt::Write::write_fmt(&mut csrf_token, format_args!("{:02x}", b));
+            push_hex_byte(&mut csrf_token, b);
         }
 
         let expires_at = Instant::now() + self.ttl;
@@ -348,6 +364,14 @@ pub trait AdminHttpHandler: Send + Sync {
     fn handle_clear_logs(&self) -> AdminResponse;
 }
 
+/// Maximum number of concurrent admin HTTP connections.
+/// Limits memory pressure and mitigates connection-exhaustion DoS.
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+
+/// Per-connection timeout. Connections that exceed this duration are dropped,
+/// mitigating Slowloris-style attacks without thread-per-connection overhead.
+const CONNECTION_TIMEOUT_SECS: u64 = 30;
+
 /// HTTP admin server.
 pub struct AdminHttpServer {
     addr: SocketAddr,
@@ -358,6 +382,7 @@ pub struct AdminHttpServer {
     shutdown: Arc<AtomicBool>,
     sessions: Arc<Mutex<SessionStore>>,
     rate_limiter: Arc<Mutex<LoginRateLimiter>>,
+    conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AdminHttpServer {
@@ -385,10 +410,12 @@ impl AdminHttpServer {
             auth_path,
             handler,
             shutdown: Arc::new(AtomicBool::new(false)),
-            sessions: Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(
-                SESSION_TTL_SECS,
-            )))),
-            rate_limiter: Arc::new(Mutex::new(LoginRateLimiter::new(5, 60))),
+            sessions: shared_session_store(Duration::from_secs(SESSION_TTL_SECS)),
+            rate_limiter: shared_login_rate_limiter(
+                LOGIN_RATE_LIMIT_ATTEMPTS,
+                LOGIN_RATE_LIMIT_WINDOW_SECS,
+            ),
+            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         }
     }
 
@@ -396,21 +423,24 @@ impl AdminHttpServer {
         self.shutdown.clone()
     }
 
-    pub fn run(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.addr)?;
+    pub async fn run(&self) -> std::io::Result<()> {
+        let listener = TcpListener::bind(self.addr).await?;
         log::info!("admin web server listening on http://{}", self.addr);
 
-        for stream in listener.incoming() {
+        loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            let stream = match stream {
-                Ok(s) => s,
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(conn) => conn,
                 Err(e) => {
                     log::warn!("admin web accept error: {}", e);
                     continue;
                 }
             };
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             let handler = self.handler.clone();
             let web_root = self.web_root.clone();
             let auth = self.auth.clone();
@@ -418,20 +448,56 @@ impl AdminHttpServer {
             let shutdown = self.shutdown.clone();
             let sessions = self.sessions.clone();
             let rate_limiter = self.rate_limiter.clone();
-            std::thread::spawn(move || {
+            let semaphore = self.conn_semaphore.clone();
+            let peer = Some(peer_addr);
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Err(e) = handle_connection(
-                    stream,
-                    &web_root,
-                    auth,
-                    auth_path,
-                    sessions,
-                    rate_limiter,
-                    handler,
-                ) {
-                    log::warn!("admin web request error: {}", e);
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let web_root = web_root.clone();
+                    let auth = auth.clone();
+                    let auth_path = auth_path.clone();
+                    let sessions = sessions.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let handler = handler.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            handle_request(
+                                req,
+                                &web_root,
+                                auth,
+                                auth_path,
+                                sessions,
+                                rate_limiter,
+                                handler,
+                                peer,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let conn = http1::Builder::new()
+                    .max_buf_size(MAX_HEADER_BYTES)
+                    .keep_alive(false)
+                    .serve_connection(io, svc);
+                let timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
+                match tokio::time::timeout(timeout, conn).await {
+                    Ok(Err(e)) => {
+                        log::debug!("admin web connection error: {}", e);
+                    }
+                    Err(_elapsed) => {
+                        log::debug!(
+                            "admin web connection timed out after {}s",
+                            CONNECTION_TIMEOUT_SECS
+                        );
+                    }
+                    Ok(Ok(())) => {}
                 }
             });
         }
@@ -542,52 +608,169 @@ fn sanitize_asset_path(req_path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
+/// Convert a hyper Request into our internal HttpRequest representation.
+/// This preserves compatibility with all existing helper functions
+/// (get_cookie, header_value, authorize, validate_csrf, etc.).
+fn hyper_to_http_request(parts: &hyper::http::request::Parts, body: Vec<u8>) -> HttpRequest {
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    HttpRequest { method: parts.method.to_string(), path, headers, body }
+}
+
+fn build_response(status: u16, content_type: &str, body: Vec<u8>) -> Response<Full<Bytes>> {
+    build_response_with_headers(status, content_type, body, &[])
+}
+
+fn build_response_with_headers(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    extra_headers: &[(String, String)],
+) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .header("Content-Type", content_type)
+        .header("Connection", "close")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("X-Frame-Options", "DENY")
+        .header("Referrer-Policy", "no-referrer")
+        .header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        .header("Cross-Origin-Opener-Policy", "same-origin")
+        .header("Cross-Origin-Resource-Policy", "same-origin");
+    if content_type.starts_with("text/html") {
+        builder = builder.header("Content-Security-Policy", ADMIN_CSP);
+    }
+    for (key, value) in extra_headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Internal Server Error"))))
+}
+
+fn text_response(status: u16, body: &str) -> Response<Full<Bytes>> {
+    build_response(status, "text/plain; charset=utf-8", body.as_bytes().to_vec())
+}
+
+fn json_response<T: Serialize>(status: u16, body: &T) -> Response<Full<Bytes>> {
+    let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    build_response(status, "application/json", payload)
+}
+
+fn admin_json_response(body: &AdminResponse) -> Response<Full<Bytes>> {
+    json_response(admin_response_status(body), body)
+}
+
+fn json_response_with_headers<T: Serialize>(
+    status: u16,
+    body: &T,
+    headers: Vec<(String, String)>,
+) -> Response<Full<Bytes>> {
+    let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    build_response_with_headers(status, "application/json", payload, &headers)
+}
+
+fn file_response(path: &Path, extra_headers: &[(String, String)]) -> Response<Full<Bytes>> {
+    let mime = match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript",
+        "wasm" => "application/wasm",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    };
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return text_response(404, "Not Found"),
+    };
+    build_response_with_headers(200, mime, data, extra_headers)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request(
+    req: Request<Incoming>,
     web_root: &Path,
     auth: Option<Arc<RwLock<AdminAuth>>>,
     auth_path: Option<PathBuf>,
     sessions: Arc<Mutex<SessionStore>>,
     rate_limiter: Arc<Mutex<LoginRateLimiter>>,
     handler: Arc<dyn AdminHttpHandler>,
-) -> std::io::Result<()> {
-    let req = match read_request(&mut stream) {
-        Ok(req) => req,
-        Err(e) => {
-            let msg = e.to_string();
-            let (status, body) = if msg.contains("Payload too large") {
-                (413, "Payload Too Large")
-            } else if msg.contains("Headers too large") {
-                (431, "Request Header Fields Too Large")
-            } else {
-                (400, "Bad Request")
-            };
-            let _ = respond_text(&mut stream, status, body);
-            return Ok(());
+    peer: Option<SocketAddr>,
+) -> Response<Full<Bytes>> {
+    // Reject paths containing backslashes (path traversal guard).
+    let path = req.uri().path();
+    if path.contains('\\') {
+        return text_response(400, "Bad Request");
+    }
+
+    // Reject requests with oversized headers (hyper max_buf_size is a soft guard;
+    // enforce an explicit limit so the exact 431 status is guaranteed).
+    {
+        let header_size: usize = req
+            .headers()
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len() + 4) // ": " + "\r\n"
+            .sum();
+        if header_size > MAX_HEADER_BYTES {
+            return text_response(431, "Request Header Fields Too Large");
         }
+    }
+
+    // Check Content-Length before collecting body
+    let content_length: usize = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return text_response(413, "Payload Too Large");
+    }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return text_response(400, "Bad Request"),
     };
-    let peer = stream.peer_addr().ok();
+    if body_bytes.len() > MAX_BODY_BYTES {
+        return text_response(413, "Payload Too Large");
+    }
+
+    let req = hyper_to_http_request(&parts, body_bytes);
 
     if req.path.starts_with("/api/") {
         if req.path == "/api/login" {
-            return handle_login(&mut stream, req, auth.as_ref(), sessions, rate_limiter, peer);
+            return handle_login(req, auth.as_ref(), sessions, rate_limiter, peer);
         }
         if req.path == "/api/logout" {
-            return handle_logout(&mut stream, &req, auth.as_ref(), &sessions, peer);
+            return handle_logout(&req, auth.as_ref(), &sessions, peer);
         }
         if !authorize(&req, auth.as_ref(), &sessions) {
-            return respond_json(&mut stream, 401, &AdminResponse::error("Unauthorized"));
+            return json_response(401, &AdminResponse::error("Unauthorized"));
         }
 
         if req.path == "/api/csrf" {
             if req.method != "GET" {
-                return respond_text(&mut stream, 405, "Method Not Allowed");
+                return text_response(405, "Method Not Allowed");
             }
             let Some(csrf_token) = csrf_token_for_request(&req, &sessions) else {
-                return respond_json(&mut stream, 401, &AdminResponse::error("Unauthorized"));
+                return json_response(401, &AdminResponse::error("Unauthorized"));
             };
-            return respond_json_with_headers(
-                &mut stream,
+            return json_response_with_headers(
                 200,
                 &AdminResponse::ok(),
                 vec![(CSRF_TOKEN_HEADER.to_string(), csrf_token)],
@@ -596,23 +779,18 @@ fn handle_connection(
 
         if auth.is_some() && req.method == "POST" {
             if let Some(csrf_error) = validate_csrf_request(&req, &sessions) {
-                return respond_json(&mut stream, 403, &AdminResponse::error(csrf_error));
+                return json_response(403, &AdminResponse::error(csrf_error));
             }
         }
         if let Some(auth_ref) = auth.as_ref() {
             let requires_pw_change =
                 auth_ref.read().map(|guard| guard.requires_password_change()).unwrap_or(false);
             if requires_pw_change && req.path != "/api/admin/auth" && req.path != "/api/logout" {
-                return respond_json(
-                    &mut stream,
-                    423,
-                    &AdminResponse::error("Password change required"),
-                );
+                return json_response(423, &AdminResponse::error("Password change required"));
             }
         }
         if req.path == "/api/admin/auth" {
             return handle_admin_auth(
-                &mut stream,
                 req,
                 auth,
                 auth_path.as_deref(),
@@ -621,15 +799,15 @@ fn handle_connection(
                 peer,
             );
         }
-        return handle_api(&mut stream, req, handler, peer);
+        return handle_api(req, handler, peer);
     }
 
     if req.method != "GET" {
-        return respond_text(&mut stream, 405, "Method Not Allowed");
+        return text_response(405, "Method Not Allowed");
     }
 
     let Some(rel_path) = sanitize_asset_path(&req.path) else {
-        return respond_text(&mut stream, 403, "Forbidden");
+        return text_response(403, "Forbidden");
     };
     let full_path = web_root.join(rel_path);
     if full_path.is_file() {
@@ -645,15 +823,15 @@ fn handle_connection(
             "no-store"
         };
         let extra = vec![("Cache-Control".to_string(), cache.to_string())];
-        return respond_file_with_headers(&mut stream, &full_path, &extra);
+        return file_response(&full_path, &extra);
     }
     // SPA fallback: serve index.html for non-file routes (browser refresh on /logs etc.)
     let index = web_root.join("index.html");
     if index.is_file() {
         let extra = vec![("Cache-Control".to_string(), "no-store".to_string())];
-        return respond_file_with_headers(&mut stream, &index, &extra);
+        return file_response(&index, &extra);
     }
-    respond_text(&mut stream, 404, "Not Found")
+    text_response(404, "Not Found")
 }
 
 fn authorize(
@@ -696,6 +874,37 @@ fn trust_proxy_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn trusted_proxy_ips() -> Vec<std::net::IpAddr> {
+    std::env::var("QUICFUSCATE_TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.parse::<std::net::IpAddr>().ok()
+        })
+        .collect()
+}
+
+fn peer_is_trusted_proxy(peer: Option<SocketAddr>) -> bool {
+    let peer_ip = match peer {
+        Some(addr) => addr.ip(),
+        None => return false,
+    };
+    let trusted = trusted_proxy_ips();
+    if trusted.is_empty() {
+        // TRUST_PROXY is set but no trusted proxy IPs configured - unsafe, reject XFF
+        log::warn!(
+            "QUICFUSCATE_TRUST_PROXY is enabled but QUICFUSCATE_TRUSTED_PROXY_IPS is empty or unset; \
+             falling back to peer address for rate limiting"
+        );
+        return false;
+    }
+    trusted.contains(&peer_ip)
+}
+
 fn header_value<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
@@ -709,7 +918,7 @@ fn first_forwarded_ip(raw: &str) -> Option<String> {
 }
 
 fn client_ip_for_rate_limit(peer: Option<SocketAddr>, req: &HttpRequest) -> String {
-    if trust_proxy_enabled() {
+    if trust_proxy_enabled() && peer_is_trusted_proxy(peer) {
         if let Some(v) = header_value(req, "x-forwarded-for").and_then(first_forwarded_ip) {
             return v;
         }
@@ -733,12 +942,8 @@ fn normalize_ip_for_policy(raw: &str) -> Option<String> {
     trimmed.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
 }
 
-fn normalize_socket_addr(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<std::net::SocketAddr>().ok().map(|addr| addr.to_string())
+fn normalize_client_id(raw: &str) -> Option<String> {
+    super::admin::ClientIdentity::parse(raw).map(|id| id.to_string())
 }
 
 fn log_action(peer: Option<SocketAddr>, action: &str, detail: &str, success: bool) {
@@ -751,67 +956,72 @@ fn log_action(peer: Option<SocketAddr>, action: &str, detail: &str, success: boo
 }
 
 fn handle_login(
-    stream: &mut TcpStream,
     req: HttpRequest,
     auth: Option<&Arc<RwLock<AdminAuth>>>,
     sessions: Arc<Mutex<SessionStore>>,
     rate_limiter: Arc<Mutex<LoginRateLimiter>>,
     peer: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> Response<Full<Bytes>> {
     let Some(auth) = auth else {
-        return respond_json(stream, 500, &AdminResponse::error("Authentication not configured"));
+        return json_response(500, &AdminResponse::error("Authentication not configured"));
     };
     if req.method != "POST" {
-        return respond_text(stream, 405, "Method Not Allowed");
+        return text_response(405, "Method Not Allowed");
     }
     let peer_ip = client_ip_for_rate_limit(peer, &req);
     let key = limiter_key("login", &peer_ip);
-    // Rate limit check
-    {
+    let rate_limited = {
         let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         if limiter.is_locked(&key) {
-            log_action(peer, "login", &format!("ip={} RATE_LIMITED", peer_ip), false);
             let retry_after = limiter.retry_after_secs(&key).unwrap_or(60);
-            return respond_json_with_headers(
-                stream,
-                429,
-                &AdminResponse::error("Too many login attempts. Try again later."),
-                vec![("Retry-After".to_string(), retry_after.to_string())],
-            );
+            Some(retry_after)
+        } else {
+            None
         }
+    };
+    if let Some(retry_after) = rate_limited {
+        log_action(peer, "login", &format!("ip={} RATE_LIMITED", peer_ip), false);
+        return json_response_with_headers(
+            429,
+            &AdminResponse::error("Too many login attempts. Try again later."),
+            vec![("Retry-After".to_string(), retry_after.to_string())],
+        );
     }
     let payload: LoginPayload = match serde_json::from_slice(&req.body) {
         Ok(p) => p,
-        Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+        Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
     };
     let username = payload.username.trim();
     if username.chars().count() > MAX_USERNAME_CHARS {
-        return respond_json(stream, 400, &AdminResponse::error("Username too long"));
+        return json_response(400, &AdminResponse::error("Username too long"));
     }
     if payload.password.len() > MAX_PASSWORD_BYTES {
-        return respond_json(stream, 400, &AdminResponse::error("Password too long"));
+        return json_response(400, &AdminResponse::error("Password too long"));
     }
     let ok =
         auth.read().map(|guard| guard.verify(username, payload.password.as_str())).unwrap_or(false);
     if !ok {
-        let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-        limiter.record_failure(&key);
+        {
+            let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+            limiter.record_failure(&key);
+        }
         log_action(peer, "login", &format!("user={}", username), false);
-        return respond_json(stream, 401, &AdminResponse::error("Invalid credentials"));
+        return json_response(401, &AdminResponse::error("Invalid credentials"));
     }
     // Success: clear rate limit for this IP
     {
         let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         limiter.clear(&key);
     }
-    let mut store = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    let (session_id, csrf_token) = store.create();
+    let (session_id, csrf_token) = {
+        let mut store = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        store.create()
+    };
     let cookie = build_session_cookie(&session_id, &req);
     log_action(peer, "login", &format!("user={}", username), true);
     let requires_password_change =
         auth.read().map(|guard| guard.requires_password_change()).unwrap_or(false);
-    respond_json_with_headers(
-        stream,
+    json_response_with_headers(
         200,
         &AdminResponse::ok_with_data(serde_json::json!({
             "user": payload.username,
@@ -822,14 +1032,13 @@ fn handle_login(
 }
 
 fn handle_logout(
-    stream: &mut TcpStream,
     req: &HttpRequest,
     auth: Option<&Arc<RwLock<AdminAuth>>>,
     sessions: &Arc<Mutex<SessionStore>>,
     peer: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> Response<Full<Bytes>> {
     if auth.is_none() {
-        return respond_admin_json(stream, &AdminResponse::ok_with_message("Logged out"));
+        return admin_json_response(&AdminResponse::ok_with_message("Logged out"));
     }
     if let Some(session_id) = get_cookie(req, SESSION_COOKIE) {
         let mut store = sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -837,8 +1046,7 @@ fn handle_logout(
     }
     let cookie = build_expired_cookie(req);
     log_action(peer, "logout", "-", true);
-    respond_json_with_headers(
-        stream,
+    json_response_with_headers(
         200,
         &AdminResponse::ok_with_message("Logged out"),
         vec![("Set-Cookie".to_string(), cookie)],
@@ -855,16 +1063,15 @@ struct AdminAuthUpdatePayload {
 }
 
 fn handle_admin_auth(
-    stream: &mut TcpStream,
     req: HttpRequest,
     auth: Option<Arc<RwLock<AdminAuth>>>,
     auth_path: Option<&Path>,
     sessions: &Arc<Mutex<SessionStore>>,
     rate_limiter: Arc<Mutex<LoginRateLimiter>>,
     peer: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> Response<Full<Bytes>> {
     let Some(auth) = auth else {
-        return respond_json(stream, 500, &AdminResponse::error("Authentication not configured"));
+        return json_response(500, &AdminResponse::error("Authentication not configured"));
     };
 
     if req.method == "GET" {
@@ -879,55 +1086,51 @@ fn handle_admin_auth(
             .unwrap_or_else(
                 |_| serde_json::json!({ "user": "admin", "requires_password_change": false }),
             );
-        return respond_admin_json(stream, &AdminResponse::ok_with_data(payload));
+        return admin_json_response(&AdminResponse::ok_with_data(payload));
     }
 
     if req.method != "POST" {
-        return respond_text(stream, 405, "Method Not Allowed");
+        return text_response(405, "Method Not Allowed");
     }
 
     let payload: AdminAuthUpdatePayload = match serde_json::from_slice(&req.body) {
         Ok(p) => p,
-        Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+        Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
     };
     if payload.current_password.len() > MAX_PASSWORD_BYTES {
-        return respond_json(
-            stream,
-            400,
-            &AdminResponse::error("Password too long (max 256 chars)"),
-        );
+        return json_response(400, &AdminResponse::error("Password too long (max 256 chars)"));
     }
 
     if payload.new_username.is_none() && payload.new_password.is_none() {
-        return respond_json(stream, 400, &AdminResponse::error("No update requested"));
+        return json_response(400, &AdminResponse::error("No update requested"));
     }
 
     // Rate limit admin-auth attempts (password changes) to slow brute forcing.
     // This uses the same limiter state as login, but with a separate key namespace.
     let peer_ip = client_ip_for_rate_limit(peer, &req);
     let key = limiter_key("admin-auth", &peer_ip);
-    {
+    let rate_limited = {
         let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         if limiter.is_locked(&key) {
-            log_action(peer, "admin-auth", &format!("ip={} RATE_LIMITED", peer_ip), false);
             let retry_after = limiter.retry_after_secs(&key).unwrap_or(60);
-            return respond_json_with_headers(
-                stream,
-                429,
-                &AdminResponse::error("Too many attempts. Try again later."),
-                vec![("Retry-After".to_string(), retry_after.to_string())],
-            );
+            Some(retry_after)
+        } else {
+            None
         }
+    };
+    if let Some(retry_after) = rate_limited {
+        log_action(peer, "admin-auth", &format!("ip={} RATE_LIMITED", peer_ip), false);
+        return json_response_with_headers(
+            429,
+            &AdminResponse::error("Too many attempts. Try again later."),
+            vec![("Retry-After".to_string(), retry_after.to_string())],
+        );
     }
 
     let new_password = payload.new_password;
     if let Some(ref pw) = new_password {
         if pw.len() < 6 {
-            return respond_json(
-                stream,
-                400,
-                &AdminResponse::error("Password too short (min 6 chars)"),
-            );
+            return json_response(400, &AdminResponse::error("Password too short (min 6 chars)"));
         }
     }
 
@@ -941,10 +1144,12 @@ fn handle_admin_auth(
         })
         .unwrap_or_else(|_| ("-".to_string(), false));
     if !verified {
-        let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-        limiter.record_failure(&key);
+        {
+            let mut limiter = rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+            limiter.record_failure(&key);
+        }
         log_action(peer, "admin-auth", &format!("user={}", old_user), false);
-        return respond_json(stream, 401, &AdminResponse::error("Invalid credentials"));
+        return json_response(401, &AdminResponse::error("Invalid credentials"));
     }
 
     // Success: clear rate limiter for this key.
@@ -955,41 +1160,43 @@ fn handle_admin_auth(
 
     let new_user = payload.new_username.as_deref().unwrap_or(old_user.as_str()).trim().to_string();
     if new_user.is_empty() {
-        return respond_json(stream, 400, &AdminResponse::error("Username cannot be empty"));
+        return json_response(400, &AdminResponse::error("Username cannot be empty"));
     }
     if new_user.chars().count() > MAX_USERNAME_CHARS {
-        return respond_json(
-            stream,
-            400,
-            &AdminResponse::error("Username too long (max 64 chars)"),
-        );
+        return json_response(400, &AdminResponse::error("Username too long (max 64 chars)"));
     }
     if new_user.chars().any(|c| c.is_control()) {
-        return respond_json(
-            stream,
-            400,
-            &AdminResponse::error("Username contains invalid characters"),
-        );
+        return json_response(400, &AdminResponse::error("Username contains invalid characters"));
     }
 
-    {
+    if let Some(ref pw) = new_password {
+        if pw.len() > MAX_PASSWORD_BYTES {
+            return json_response(400, &AdminResponse::error("Password too long (max 256 chars)"));
+        }
+    }
+
+    let hash_failed = {
         let mut guard = auth.write().unwrap_or_else(|e| e.into_inner());
         if let Some(pw) = new_password {
-            if pw.len() > MAX_PASSWORD_BYTES {
-                return respond_json(
-                    stream,
-                    400,
-                    &AdminResponse::error("Password too long (max 256 chars)"),
-                );
+            match guard.set_credentials(new_user.clone(), pw) {
+                Ok(()) => false,
+                Err(e) => {
+                    log::error!("{}", e);
+                    true
+                }
             }
-            guard.set_credentials(new_user, pw);
         } else {
             // Username-only update: keep password hash and requires_password_change.
             guard.set_username(new_user);
+            false
         }
-        if let Some(path) = auth_path {
-            persist_auth_file(path, &guard);
-        }
+    };
+    if hash_failed {
+        return json_response(500, &AdminResponse::error("Password hashing failed"));
+    }
+    if let Some(path) = auth_path {
+        let guard = auth.read().unwrap_or_else(|e| e.into_inner());
+        persist_auth_file(path, &guard);
     }
 
     {
@@ -999,8 +1206,7 @@ fn handle_admin_auth(
 
     let cookie = build_expired_cookie(&req);
     log_action(peer, "admin-auth", &format!("user={}", old_user), true);
-    respond_json_with_headers(
-        stream,
+    json_response_with_headers(
         200,
         &AdminResponse::ok_with_message("Admin credentials updated"),
         vec![("Set-Cookie".to_string(), cookie)],
@@ -1011,7 +1217,8 @@ fn handle_admin_auth(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
     use std::sync::{Mutex, OnceLock};
     use std::thread;
 
@@ -1078,7 +1285,7 @@ mod tests {
         }
     }
 
-    fn read_all(mut s: TcpStream) -> String {
+    fn read_all(mut s: StdTcpStream) -> String {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).to_string()
@@ -1126,14 +1333,281 @@ mod tests {
     }
 
     fn send_req(addr: std::net::SocketAddr, raw: &str) -> String {
-        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut s = StdTcpStream::connect(addr).expect("connect");
+        // 10s to accommodate Argon2 password hashing in unoptimized debug builds.
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
         s.write_all(raw.as_bytes()).expect("write");
-        s.shutdown(std::net::Shutdown::Write).ok();
         read_all(s)
     }
 
+    struct AdminLoginSession {
+        cookie_header: String,
+        csrf_token: String,
+    }
+
+    impl AdminLoginSession {
+        fn csrf_header(&self) -> String {
+            format!("{}: {}", CSRF_TOKEN_HEADER, self.csrf_token)
+        }
+    }
+
+    fn authenticated_get(login: &AdminLoginSession, path: &str) -> String {
+        format!("GET {} HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n", path, login.cookie_header)
+    }
+
+    fn login_post(username: &str, password: &str) -> String {
+        login_post_with_headers(username, password, "")
+    }
+
+    fn raw_login_post(extra_headers: &str, body: &str) -> String {
+        format!("POST /api/login HTTP/1.1\r\nHost: localhost\r\n{}\r\n{}", extra_headers, body)
+    }
+
+    fn login_post_with_headers(username: &str, password: &str, extra_headers: &str) -> String {
+        let body = format!(r#"{{"username":"{}","password":"{}"}}"#, username, password);
+        let extra_headers =
+            if extra_headers.is_empty() { String::new() } else { format!("{extra_headers}\r\n") };
+        format!(
+            "POST /api/login HTTP/1.1\r\nHost: localhost\r\n{}Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            extra_headers,
+            body.len(),
+            body
+        )
+    }
+
+    fn logout_post(login: &AdminLoginSession) -> String {
+        format!(
+            "POST /api/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n{}\r\n{}\r\n\r\n",
+            login.cookie_header,
+            login.csrf_header(),
+        )
+    }
+
+    fn config_post(body: &str) -> String {
+        unauthenticated_json_post("/api/config", body)
+    }
+
+    fn unauthenticated_json_post(path: &str, body: &str) -> String {
+        format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            path,
+            body.len(),
+            body
+        )
+    }
+
+    fn authenticated_config_post_with_headers(
+        login: &AdminLoginSession,
+        extra_headers: &str,
+        body: &str,
+    ) -> String {
+        let extra_headers =
+            if extra_headers.is_empty() { String::new() } else { format!("{extra_headers}\r\n") };
+        format!(
+            "POST /api/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n{}\r\n{}",
+            body.len(),
+            login.cookie_header,
+            login.csrf_header(),
+            extra_headers,
+            body
+        )
+    }
+
+    fn admin_auth_post(login: &AdminLoginSession, body: &str) -> String {
+        admin_auth_post_with_headers(login, "", body)
+    }
+
+    fn admin_auth_post_without_csrf(login: &AdminLoginSession, body: &str) -> String {
+        format!(
+            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n\r\n{}\r\n",
+            body.len(),
+            login.cookie_header,
+            body
+        )
+    }
+
+    fn admin_auth_post_with_headers(
+        login: &AdminLoginSession,
+        extra_headers: &str,
+        body: &str,
+    ) -> String {
+        let extra_headers =
+            if extra_headers.is_empty() { String::new() } else { format!("{extra_headers}\r\n") };
+        format!(
+            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n{}\r\n{}",
+            body.len(),
+            login.cookie_header,
+            login.csrf_header(),
+            extra_headers,
+            body
+        )
+    }
+
+    fn admin_auth_post_with_csrf_and_headers(
+        login: &AdminLoginSession,
+        csrf_header: &str,
+        extra_headers: &str,
+        body: &str,
+    ) -> String {
+        let extra_headers =
+            if extra_headers.is_empty() { String::new() } else { format!("{extra_headers}\r\n") };
+        format!(
+            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n{}\r\n{}",
+            body.len(),
+            login.cookie_header,
+            csrf_header,
+            extra_headers,
+            body
+        )
+    }
+
+    fn login_admin(addr: std::net::SocketAddr, password: &str) -> AdminLoginSession {
+        let login_req = login_post("admin", password);
+        let login_resp = send_req(addr, &login_req);
+        assert_eq!(parse_status(&login_resp), 200);
+        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
+        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
+        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
+        AdminLoginSession { cookie_header, csrf_token }
+    }
+
+    fn test_auth(password: &str, requires_password_change: bool) -> Option<Arc<RwLock<AdminAuth>>> {
+        Some(Arc::new(RwLock::new(AdminAuth::new(
+            "admin".to_string(),
+            password.to_string(),
+            requires_password_change,
+        ))))
+    }
+
+    fn test_sessions() -> Arc<Mutex<SessionStore>> {
+        shared_session_store(Duration::from_secs(3600))
+    }
+
+    fn test_short_sessions() -> Arc<Mutex<SessionStore>> {
+        shared_session_store(Duration::from_secs(60))
+    }
+
+    fn test_rate_limiter(max_attempts: u32) -> Arc<Mutex<LoginRateLimiter>> {
+        shared_login_rate_limiter(max_attempts, 60)
+    }
+
+    fn test_handler() -> Arc<dyn AdminHttpHandler> {
+        Arc::new(TestHandler)
+    }
+
+    fn spawn_short_unauth_server(
+        listener: StdTcpListener,
+        n: usize,
+        web_root: std::path::PathBuf,
+    ) -> thread::JoinHandle<()> {
+        spawn_server(
+            listener,
+            n,
+            web_root,
+            None,
+            test_short_sessions(),
+            test_rate_limiter(5),
+            test_handler(),
+        )
+    }
+
+    fn start_short_unauth_server(
+        n: usize,
+        web_root: std::path::PathBuf,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let thr = spawn_short_unauth_server(listener, n, web_root);
+        (addr, thr)
+    }
+
+    fn spawn_auth_server(
+        listener: StdTcpListener,
+        n: usize,
+        web_root: std::path::PathBuf,
+        password: &str,
+        requires_password_change: bool,
+        max_attempts: u32,
+    ) -> thread::JoinHandle<()> {
+        spawn_server(
+            listener,
+            n,
+            web_root,
+            test_auth(password, requires_password_change),
+            test_sessions(),
+            test_rate_limiter(max_attempts),
+            test_handler(),
+        )
+    }
+
+    fn start_auth_server(
+        n: usize,
+        web_root: std::path::PathBuf,
+        password: &str,
+        requires_password_change: bool,
+        max_attempts: u32,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let thr = spawn_auth_server(
+            listener,
+            n,
+            web_root,
+            password,
+            requires_password_change,
+            max_attempts,
+        );
+        (addr, thr)
+    }
+
+    fn start_server_with_auth(
+        n: usize,
+        web_root: std::path::PathBuf,
+        auth: Option<Arc<RwLock<AdminAuth>>>,
+        max_attempts: u32,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let thr = spawn_server(
+            listener,
+            n,
+            web_root,
+            auth,
+            test_sessions(),
+            test_rate_limiter(max_attempts),
+            test_handler(),
+        );
+        (addr, thr)
+    }
+
+    fn start_unauth_server(
+        n: usize,
+        web_root: std::path::PathBuf,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let thr = spawn_unauth_server(listener, n, web_root);
+        (addr, thr)
+    }
+
+    fn spawn_unauth_server(
+        listener: StdTcpListener,
+        n: usize,
+        web_root: std::path::PathBuf,
+    ) -> thread::JoinHandle<()> {
+        spawn_server(
+            listener,
+            n,
+            web_root,
+            None,
+            test_sessions(),
+            test_rate_limiter(5),
+            test_handler(),
+        )
+    }
+
     fn spawn_server(
-        listener: TcpListener,
+        listener: StdTcpListener,
         n: usize,
         web_root: std::path::PathBuf,
         auth: Option<Arc<RwLock<AdminAuth>>>,
@@ -1142,45 +1616,92 @@ mod tests {
         handler: Arc<dyn AdminHttpHandler>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test tokio runtime");
             for _ in 0..n {
-                let (stream, _) = listener.accept().expect("accept");
-                let _ = handle_connection(
-                    stream,
-                    &web_root,
-                    auth.clone(),
-                    None,
-                    sessions.clone(),
-                    rate_limiter.clone(),
-                    handler.clone(),
-                );
+                let (stream, peer_addr) = listener.accept().expect("accept");
+                stream.set_nonblocking(true).expect("set_nonblocking");
+                let peer = Some(peer_addr);
+                let _ = rt.block_on(async {
+                    let tokio_stream = tokio::net::TcpStream::from_std(stream).expect("from_std");
+                    let io = TokioIo::new(tokio_stream);
+                    let web_root = web_root.clone();
+                    let auth = auth.clone();
+                    let sessions = sessions.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    let handler = handler.clone();
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let web_root = web_root.clone();
+                        let auth = auth.clone();
+                        let sessions = sessions.clone();
+                        let rate_limiter = rate_limiter.clone();
+                        let handler = handler.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                handle_request(
+                                    req,
+                                    &web_root,
+                                    auth,
+                                    None,
+                                    sessions,
+                                    rate_limiter,
+                                    handler,
+                                    peer,
+                                )
+                                .await,
+                            )
+                        }
+                    });
+                    http1::Builder::new()
+                        .max_buf_size(MAX_HEADER_BYTES)
+                        .keep_alive(false)
+                        .serve_connection(io, svc)
+                        .await
+                });
             }
         })
     }
 
-    fn with_trust_proxy_env<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    fn with_trust_proxy_env<T>(
+        enabled: bool,
+        trusted_proxy_ips: Option<&str>,
+        f: impl FnOnce() -> T,
+    ) -> T {
         // Environment variables are process-global. Guard tests that mutate
-        // QUICFUSCATE_TRUST_PROXY so parallel test execution cannot race.
+        // QUICFUSCATE_TRUST_PROXY and QUICFUSCATE_TRUSTED_PROXY_IPS so
+        // parallel test execution cannot race.
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _guard =
             ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
 
-        let prev = std::env::var("QUICFUSCATE_TRUST_PROXY").ok();
+        let prev_trust_proxy = std::env::var("QUICFUSCATE_TRUST_PROXY").ok();
+        let prev_trusted_proxy_ips = std::env::var("QUICFUSCATE_TRUSTED_PROXY_IPS").ok();
         if enabled {
             std::env::set_var("QUICFUSCATE_TRUST_PROXY", "1");
         } else {
             std::env::remove_var("QUICFUSCATE_TRUST_PROXY");
         }
+        match trusted_proxy_ips {
+            Some(value) => std::env::set_var("QUICFUSCATE_TRUSTED_PROXY_IPS", value),
+            None => std::env::remove_var("QUICFUSCATE_TRUSTED_PROXY_IPS"),
+        }
         let out = f();
-        match prev {
+        match prev_trust_proxy {
             Some(v) => std::env::set_var("QUICFUSCATE_TRUST_PROXY", v),
             None => std::env::remove_var("QUICFUSCATE_TRUST_PROXY"),
+        }
+        match prev_trusted_proxy_ips {
+            Some(v) => std::env::set_var("QUICFUSCATE_TRUSTED_PROXY_IPS", v),
+            None => std::env::remove_var("QUICFUSCATE_TRUSTED_PROXY_IPS"),
         }
         out
     }
 
     #[test]
     fn client_ip_for_rate_limit_uses_peer_when_proxy_not_trusted() {
-        with_trust_proxy_env(false, || {
+        with_trust_proxy_env(false, None, || {
             let req = HttpRequest {
                 method: "GET".to_string(),
                 path: "/api/status".to_string(),
@@ -1194,7 +1715,7 @@ mod tests {
 
     #[test]
     fn client_ip_for_rate_limit_uses_x_forwarded_for_when_trusted() {
-        with_trust_proxy_env(true, || {
+        with_trust_proxy_env(true, Some("127.0.0.1"), || {
             let req = HttpRequest {
                 method: "GET".to_string(),
                 path: "/api/status".to_string(),
@@ -1208,7 +1729,7 @@ mod tests {
 
     #[test]
     fn client_ip_for_rate_limit_ignores_invalid_forwarded_ip_and_falls_back_to_peer() {
-        with_trust_proxy_env(true, || {
+        with_trust_proxy_env(true, Some("127.0.0.1"), || {
             let req = HttpRequest {
                 method: "GET".to_string(),
                 path: "/api/status".to_string(),
@@ -1222,7 +1743,7 @@ mod tests {
 
     #[test]
     fn session_cookie_is_secure_only_for_https_forwarded_proto() {
-        with_trust_proxy_env(true, || {
+        with_trust_proxy_env(true, None, || {
             let base = HttpRequest {
                 method: "GET".to_string(),
                 path: "/".to_string(),
@@ -1252,7 +1773,7 @@ mod tests {
 
     #[test]
     fn expired_cookie_is_secure_only_for_https_forwarded_proto() {
-        with_trust_proxy_env(true, || {
+        with_trust_proxy_env(true, None, || {
             let base = HttpRequest {
                 method: "GET".to_string(),
                 path: "/".to_string(),
@@ -1310,29 +1831,10 @@ mod tests {
 
     #[test]
     fn login_rate_limit_returns_429_on_6th_failed_attempt() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let (addr, _thr) = start_auth_server(6, web_root, "123", false, 5);
 
-        let _thr = spawn_server(listener, 6, web_root, auth, sessions, rate, handler);
-
-        let body = r#"{"username":"admin","password":"wrong"}"#;
-        let req = || {
-            format!(
-                "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                body.len(),
-                body
-            )
-        };
+        let req = || login_post("admin", "wrong");
         for _ in 0..5 {
             let resp = send_req(addr, &req());
             assert_eq!(parse_status(&resp), 401);
@@ -1345,28 +1847,11 @@ mod tests {
 
     #[test]
     fn admin_auth_rate_limit_returns_429_on_6th_failed_attempt() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
         // 1 login + 6 admin-auth attempts
-        let _thr = spawn_server(listener, 7, web_root, auth.clone(), sessions, rate, handler);
+        let (addr, _thr) = start_auth_server(7, web_root, "123", false, 5);
 
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
+        let login_req = login_post("admin", "123");
         let login_resp = send_req(addr, &login_req);
         assert_eq!(parse_status(&login_resp), 200);
         let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
@@ -1397,8 +1882,8 @@ mod tests {
 
     #[test]
     fn html_responses_include_csp_but_json_does_not() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
 
         let web_root = {
             let mut dir = std::env::temp_dir();
@@ -1414,13 +1899,8 @@ mod tests {
                 .expect("write index");
             dir
         };
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
         // 1 request for "/" and 1 request for "/api/status"
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
+        let _thr = spawn_unauth_server(listener, 2, web_root);
 
         let html = send_req(addr, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert_eq!(parse_status(&html), 200);
@@ -1433,16 +1913,8 @@ mod tests {
 
     #[test]
     fn metrics_json_endpoint_returns_json_payload() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let json = send_req(addr, "GET /api/metrics/json HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert_eq!(parse_status(&json), 200);
@@ -1451,24 +1923,11 @@ mod tests {
 
     #[test]
     fn qkey_ttl_too_large_returns_400() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        // 1 request for "/api/qkey"
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = format!(r#"{{"ttl_seconds":{}}}"#, MAX_QKEY_TTL_SECS + 1);
-        let req = format!(
-            "POST /api/qkey HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/qkey", &body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("TTL too large"));
@@ -1476,23 +1935,11 @@ mod tests {
 
     #[test]
     fn qkey_create_rejects_invalid_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = "{not_json";
-        let req = format!(
-            "POST /api/qkey HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/qkey", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid JSON"));
@@ -1500,23 +1947,11 @@ mod tests {
 
     #[test]
     fn block_rejects_invalid_ip() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"ip":"not-an-ip"}"#;
-        let req = format!(
-            "POST /api/block HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/block", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid IP"));
@@ -1524,23 +1959,11 @@ mod tests {
 
     #[test]
     fn block_rejects_invalid_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = "{not_json";
-        let req = format!(
-            "POST /api/block HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/block", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid JSON"));
@@ -1548,23 +1971,11 @@ mod tests {
 
     #[test]
     fn unblock_rejects_invalid_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = "{not_json";
-        let req = format!(
-            "POST /api/unblock HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/unblock", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid JSON"));
@@ -1572,23 +1983,11 @@ mod tests {
 
     #[test]
     fn kick_rejects_invalid_client_id() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"id":"not-a-socket-addr"}"#;
-        let req = format!(
-            "POST /api/kick HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/kick", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid client id"));
@@ -1596,23 +1995,11 @@ mod tests {
 
     #[test]
     fn qkey_revoke_rejects_invalid_id() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"id":"not-a-qkey-id"}"#;
-        let req = format!(
-            "POST /api/qkeys/revoke HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/qkeys/revoke", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid QKey id"));
@@ -1620,23 +2007,11 @@ mod tests {
 
     #[test]
     fn qkey_revoke_rejects_missing_id() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"id":"   "}"#;
-        let req = format!(
-            "POST /api/qkeys/revoke HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/qkeys/revoke", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Missing QKey id"));
@@ -1644,23 +2019,11 @@ mod tests {
 
     #[test]
     fn config_write_rejects_invalid_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = "{not_json";
-        let req = format!(
-            "POST /api/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = config_post(body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid JSON"));
@@ -1668,23 +2031,11 @@ mod tests {
 
     #[test]
     fn config_write_rejects_empty_config() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"config":"   "}"#;
-        let req = format!(
-            "POST /api/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = config_post(body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Empty config"));
@@ -1692,23 +2043,11 @@ mod tests {
 
     #[test]
     fn logging_config_rejects_invalid_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = "{not_json";
-        let req = format!(
-            "POST /api/config/logging HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/config/logging", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
         assert!(resp.contains("Invalid JSON"));
@@ -1716,56 +2055,25 @@ mod tests {
 
     #[test]
     fn qkey_revoke_accepts_uppercase_hex_id() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_unauth_server(1, web_root);
 
         let body = r#"{"id":"A1B2C3D4E5F6"}"#;
-        let req = format!(
-            "POST /api/qkeys/revoke HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = unauthenticated_json_post("/api/qkeys/revoke", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 200);
     }
 
     #[test]
     fn secure_cookie_is_set_only_for_forwarded_https() {
-        with_trust_proxy_env(true, || {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-            let addr = listener.local_addr().unwrap();
-
+        with_trust_proxy_env(true, None, || {
             let web_root = std::env::temp_dir();
-            let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-                "admin".to_string(),
-                "123".to_string(),
-                false,
-            ))));
-            let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-            let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-            let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
             // 2 login requests
-            let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
+            let (addr, _thr) = start_server_with_auth(2, web_root, test_auth("123", false), 5);
 
-            let body = r#"{"username":"admin","password":"123"}"#;
             let mk = |proto: Option<&str>| {
-                let extra =
-                    proto.map(|p| format!("X-Forwarded-Proto: {}\r\n", p)).unwrap_or_default();
-                format!(
-                    "POST /api/login HTTP/1.1\r\nHost: localhost\r\n{}Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                    extra,
-                    body.len(),
-                    body
-                )
+                let extra = proto.map(|p| format!("X-Forwarded-Proto: {p}")).unwrap_or_default();
+                login_post_with_headers("admin", "123", &extra)
             };
 
             let http = send_req(addr, &mk(None));
@@ -1782,147 +2090,57 @@ mod tests {
 
     #[test]
     fn password_change_lock_returns_423_for_api_except_admin_auth() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            true,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
+        let auth = test_auth("123", true);
         // 1 login + 2 API calls
-        let _thr = spawn_server(listener, 3, web_root, auth.clone(), sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(3, web_root, auth.clone(), 5);
 
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let _csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
+        let login = login_admin(addr, "123");
 
-        let cfg_req = format!(
-            "GET /api/config HTTP/1.1\r\nHost: localhost\r\n{}\
-\r\n\r\n",
-            cookie_header
-        );
+        let cfg_req = authenticated_get(&login, "/api/config");
         let cfg_resp = send_req(addr, &cfg_req);
         assert_eq!(parse_status(&cfg_resp), 423);
 
-        let auth_req = format!(
-            "GET /api/admin/auth HTTP/1.1\r\nHost: localhost\r\n{}\
-\r\n\r\n",
-            cookie_header
-        );
+        let auth_req = authenticated_get(&login, "/api/admin/auth");
         let auth_resp = send_req(addr, &auth_req);
         assert_eq!(parse_status(&auth_resp), 200);
     }
 
     #[test]
     fn password_change_lock_allows_logout_and_clears_session() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            true,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
+        let auth = test_auth("123", true);
         // login + logout + config (old cookie should be invalid)
-        let _thr = spawn_server(listener, 3, web_root, auth.clone(), sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(3, web_root, auth.clone(), 5);
 
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
+        let login = login_admin(addr, "123");
 
-        let logout_req = format!(
-            "POST /api/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n{}\r\n{}: {}\r\n\r\n",
-            cookie_header,
-            CSRF_TOKEN_HEADER,
-            csrf_token,
-        );
+        let logout_req = logout_post(&login);
         let logout_resp = send_req(addr, &logout_req);
         assert_eq!(parse_status(&logout_resp), 200);
 
         // Old cookie must no longer authorize.
-        let cfg_req = format!(
-            "GET /api/config HTTP/1.1\r\nHost: localhost\r\n{}\
-\r\n\r\n",
-            cookie_header
-        );
+        let cfg_req = authenticated_get(&login, "/api/config");
         let cfg_resp = send_req(addr, &cfg_req);
         assert_eq!(parse_status(&cfg_resp), 401);
     }
 
     #[test]
     fn admin_auth_allows_username_only_update_without_new_password_and_preserves_lock_flag() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth =
-            Arc::new(RwLock::new(AdminAuth::new("admin".to_string(), "123".to_string(), true)));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
+        let auth = test_auth("123", true).expect("auth fixture");
         // login + username update + auth status (GET)
-        let _thr = spawn_server(listener, 3, web_root, Some(auth.clone()), sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(3, web_root, Some(auth.clone()), 5);
 
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let body = r#"{"current_password":"123","new_username":"root"}"#;
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let update_req = admin_auth_post(&login, body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 200);
 
         // Sessions are cleared and lock flag must remain true because no password was changed.
-        let auth_req = format!(
-            "GET /api/admin/auth HTTP/1.1\r\nHost: localhost\r\n{}\
-\r\n\r\n",
-            cookie_header
-        );
+        let auth_req = authenticated_get(&login, "/api/admin/auth");
         let auth_resp = send_req(addr, &auth_req);
         assert_eq!(parse_status(&auth_resp), 401);
 
@@ -1933,46 +2151,16 @@ mod tests {
 
     #[test]
     fn admin_auth_rejects_username_too_long() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth, 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let too_long_user = "u".repeat(65);
         let body =
             format!("{{\"current_password\":\"123\",\"new_username\":\"{}\"}}", too_long_user);
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let update_req = admin_auth_post(&login, &body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 400);
         assert!(
@@ -1986,39 +2174,14 @@ mod tests {
 
     #[test]
     fn admin_auth_post_rejects_missing_csrf_token() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth.clone(), 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth.clone(), sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
+        let login = login_admin(addr, "123");
 
         let body = r#"{"current_password":"123","new_password":"abcdef"}"#;
-        let req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n\r\n{}\r\n",
-            body.len(),
-            cookie_header,
-            body
-        );
+        let req = admin_auth_post_without_csrf(&login, body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 403);
         assert!(resp.contains("Missing CSRF token"));
@@ -2026,41 +2189,15 @@ mod tests {
 
     #[test]
     fn admin_auth_post_rejects_invalid_csrf_token() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth.clone(), 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth.clone(), sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
+        let login = login_admin(addr, "123");
 
         let body = r#"{"current_password":"123","new_password":"abcdef"}"#;
         let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, "g".repeat(CSRF_TOKEN_BYTES * 2));
-        let req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n\r\n{}\r\n",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let req = admin_auth_post_with_csrf_and_headers(&login, &csrf_header, "", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 403);
         assert!(resp.contains("Invalid CSRF token"));
@@ -2068,42 +2205,14 @@ mod tests {
 
     #[test]
     fn admin_auth_post_rejects_cross_origin_request() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth.clone(), 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth.clone(), sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let body = r#"{"current_password":"123","new_password":"abcdef"}"#;
-        let req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n\r\n{}\r\n",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let req = admin_auth_post_with_headers(&login, "Origin: https://evil.example", body);
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 403);
         assert!(resp.contains("Invalid Origin"));
@@ -2111,42 +2220,14 @@ mod tests {
 
     #[test]
     fn post_replay_is_rejected_for_same_origin_browser_request() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(3, web_root, auth.clone(), 5);
 
-        let _thr = spawn_server(listener, 3, web_root, auth.clone(), sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let body = r#"{"config":"test = true"}"#;
-        let req = format!(
-            "POST /api/config HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\r\n{}\r\n\r\n{}\r\n",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let req = authenticated_config_post_with_headers(&login, "Origin: http://localhost", body);
         let first = send_req(addr, &req);
         assert_eq!(parse_status(&first), 200);
 
@@ -2157,44 +2238,14 @@ mod tests {
 
     #[test]
     fn admin_auth_rejects_username_with_control_characters() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth, 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let body = r#"{"current_password":"123","new_username":"root\nx"}"#;
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let update_req = admin_auth_post(&login, body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 400);
         assert!(update_resp.contains("Username contains invalid characters"));
@@ -2202,90 +2253,30 @@ mod tests {
 
     #[test]
     fn admin_auth_rejects_password_too_short() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth, 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
+        let login = login_admin(addr, "123");
 
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
-
-        let body = r#"{"current_password":"123","new_password":"abcde"}"#;
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let body = r#"{"current_password":"123","new_password":"abc"}"#;
+        let update_req = admin_auth_post(&login, body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 400);
-        assert!(update_resp.contains("Password too short"));
+        assert!(update_resp.contains("Password too short (min 6 chars)"));
     }
 
     #[test]
     fn admin_auth_rejects_password_too_long() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let auth = test_auth("123", false);
+        let (addr, _thr) = start_server_with_auth(2, web_root, auth, 5);
 
-        let _thr = spawn_server(listener, 2, web_root, auth, sessions, rate, handler);
-
-        let login_body = r#"{"username":"admin","password":"123"}"#;
-        let login_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        let login_resp = send_req(addr, &login_req);
-        assert_eq!(parse_status(&login_resp), 200);
-        let set_cookie = parse_set_cookie(&login_resp).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&login_resp).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let long_pw = "x".repeat(257);
         let body = format!("{{\"current_password\":\"123\",\"new_password\":\"{}\"}}", long_pw);
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            body.len(),
-            cookie_header,
-            csrf_header,
-            body
-        );
+        let update_req = admin_auth_post(&login, &body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 400);
         assert!(update_resp.contains("Password too long"));
@@ -2293,89 +2284,37 @@ mod tests {
 
     #[test]
     fn password_change_lock_is_removed_after_admin_auth_update_and_relogin() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            true,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
+        let auth = test_auth("123", true);
         // login + admin/auth update + config(old cookie) + login(new pw) + config(new cookie)
-        let _thr = spawn_server(listener, 5, web_root, auth.clone(), sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(5, web_root, auth.clone(), 5);
 
-        let login1_body = r#"{"username":"admin","password":"123"}"#;
-        let login1_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login1_body.len(),
-            login1_body
-        );
-        let login1_resp = send_req(addr, &login1_req);
-        assert_eq!(parse_status(&login1_resp), 200);
-        let set_cookie1 = parse_set_cookie(&login1_resp).expect("set-cookie");
-        let cookie_header1 = cookie_header_from_set_cookie(&set_cookie1).expect("cookie header");
-        let csrf_token1 = parse_csrf_token(&login1_resp).expect("csrf token");
-        let csrf_header1 = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token1);
+        let login1 = login_admin(addr, "123");
 
         let update_body = r#"{"current_password":"123","new_password":"abcdef"}"#;
-        let update_req = format!(
-            "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-            update_body.len(),
-            cookie_header1,
-            csrf_header1,
-            update_body
-        );
+        let update_req = admin_auth_post(&login1, update_body);
         let update_resp = send_req(addr, &update_req);
         assert_eq!(parse_status(&update_resp), 200);
 
         // All sessions are cleared as part of the credential update.
-        let cfg_old_req =
-            format!("GET /api/config HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n", cookie_header1);
+        let cfg_old_req = authenticated_get(&login1, "/api/config");
         let cfg_old_resp = send_req(addr, &cfg_old_req);
         assert_eq!(parse_status(&cfg_old_resp), 401);
 
-        let login2_body = r#"{"username":"admin","password":"abcdef"}"#;
-        let login2_req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            login2_body.len(),
-            login2_body
-        );
-        let login2_resp = send_req(addr, &login2_req);
-        assert_eq!(parse_status(&login2_resp), 200);
-        let set_cookie2 = parse_set_cookie(&login2_resp).expect("set-cookie");
-        let cookie_header2 = cookie_header_from_set_cookie(&set_cookie2).expect("cookie header");
+        let login2 = login_admin(addr, "abcdef");
 
         // Lock must be gone now: config should be readable.
-        let cfg_new_req =
-            format!("GET /api/config HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n", cookie_header2);
+        let cfg_new_req = authenticated_get(&login2, "/api/config");
         let cfg_new_resp = send_req(addr, &cfg_new_req);
         assert_eq!(parse_status(&cfg_new_resp), 200);
     }
 
     #[test]
     fn password_change_lock_does_not_leak_to_unauthorized_callers() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            true,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
+        let auth = test_auth("123", true);
         // Single unauthorized API call.
-        let _thr = spawn_server(listener, 1, web_root, auth.clone(), sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(1, web_root, auth.clone(), 5);
 
         let cfg_req = "GET /api/config HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let cfg_resp = send_req(addr, cfg_req);
@@ -2384,33 +2323,14 @@ mod tests {
 
     #[test]
     fn login_rate_limit_is_cleared_on_successful_login() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
+        let auth = test_auth("123", false);
         // Use a small threshold to make the test short and deterministic.
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(2, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
         // 1st fail, 1 success, then 3 fails (last one should be 429).
-        let _thr = spawn_server(listener, 5, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_server_with_auth(5, web_root, auth, 2);
 
-        let mk = |body: &str| {
-            format!(
-                "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                body.len(),
-                body
-            )
-        };
-
-        let fail = mk(r#"{"username":"admin","password":"wrong"}"#);
-        let ok = mk(r#"{"username":"admin","password":"123"}"#);
+        let fail = login_post("admin", "wrong");
+        let ok = login_post("admin", "123");
 
         let r1 = send_req(addr, &fail);
         assert_eq!(parse_status(&r1), 401);
@@ -2430,27 +2350,10 @@ mod tests {
 
     #[test]
     fn login_response_includes_requires_password_change_flag() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            true,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
+        let (addr, thr) = start_auth_server(1, web_root, "123", true, 5);
 
-        let thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
-
-        let body = r#"{"username":"admin","password":"123"}"#;
-        let req = format!(
-            "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let req = login_post("admin", "123");
         let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 200);
         assert!(parse_csrf_token(&resp).is_some());
@@ -2461,37 +2364,13 @@ mod tests {
 
     #[test]
     fn login_and_admin_auth_rate_limits_are_separate_namespaces() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().unwrap();
-
         let web_root = std::env::temp_dir();
-        let auth = Some(Arc::new(RwLock::new(AdminAuth::new(
-            "admin".to_string(),
-            "123".to_string(),
-            false,
-        ))));
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(3600))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(2, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-
         // login(ok) + login(fail) + login(fail) + login(429) + admin-auth(fail) + admin-auth(fail) + admin-auth(429)
-        let thr = spawn_server(listener, 7, web_root, auth, sessions, rate, handler);
+        let (addr, thr) = start_auth_server(7, web_root, "123", false, 2);
 
-        let mk_login = |pw: &str| {
-            let body = format!(r#"{{"username":"admin","password":"{}"}}"#, pw);
-            format!(
-                "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                body.len(),
-                body
-            )
-        };
+        let mk_login = |pw: &str| login_post("admin", pw);
 
-        let ok = send_req(addr, &mk_login("123"));
-        assert_eq!(parse_status(&ok), 200);
-        let set_cookie = parse_set_cookie(&ok).expect("set-cookie");
-        let cookie_header = cookie_header_from_set_cookie(&set_cookie).expect("cookie header");
-        let csrf_token = parse_csrf_token(&ok).expect("csrf token");
-        let csrf_header = format!("{}: {}", CSRF_TOKEN_HEADER, csrf_token);
+        let login = login_admin(addr, "123");
 
         let fail = send_req(addr, &mk_login("wrong"));
         assert_eq!(parse_status(&fail), 401);
@@ -2504,15 +2383,7 @@ mod tests {
 
         let mk_admin_auth = |current_pw: &str| {
             let body = format!(r#"{{"current_password":"{}","new_username":"root"}}"#, current_pw);
-            format!(
-                "POST /api/admin/auth HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{}\
-\r\n{}\
-\r\n\r\n{}",
-                body.len(),
-                cookie_header,
-                csrf_header,
-                body
-            )
+            admin_auth_post(&login, &body)
         };
 
         // Admin auth uses a separate key namespace and should not be 429 yet.
@@ -2528,9 +2399,6 @@ mod tests {
 
     #[test]
     fn static_assets_rejects_path_traversal_with_403() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = {
             let root = std::env::temp_dir()
                 .join(format!("qf-admin-webroot-traversal-{}", current_epoch_secs()));
@@ -2540,11 +2408,7 @@ mod tests {
             root
         };
 
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         // Attempt to escape web_root via parent directory traversal.
         let req = "GET /../Cargo.toml HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -2554,9 +2418,6 @@ mod tests {
 
     #[test]
     fn static_assets_serves_index_for_spa_routes() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = {
             let root =
                 std::env::temp_dir().join(format!("qf-admin-webroot-spa-{}", current_epoch_secs()));
@@ -2566,11 +2427,7 @@ mod tests {
             root
         };
 
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         // Non-file route should fall back to index.html (SPA refresh support).
         let req = "GET /logs HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -2581,15 +2438,8 @@ mod tests {
 
     #[test]
     fn oversized_payload_returns_413() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = format!(
             "POST /api/qkey HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -2601,15 +2451,8 @@ mod tests {
 
     #[test]
     fn oversized_headers_return_431() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let large_header_value = "a".repeat(MAX_HEADER_BYTES + 128);
         let req =
@@ -2620,73 +2463,41 @@ mod tests {
 
     #[test]
     fn invalid_content_length_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
-        let req = "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n{}";
-        let resp = send_req(addr, req);
+        let req = raw_login_post("Content-Length: nope", "{}");
+        let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
     }
 
     #[test]
     fn duplicate_content_length_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
-        let req = "POST /api/login HTTP/1.1\r\n\
-Host: localhost\r\n\
-Content-Length: 1\r\n\
-Content-Length: 1\r\n\r\n{}";
-        let resp = send_req(addr, req);
+        let req = raw_login_post("Content-Length: 1\r\nContent-Length: 1", "{}");
+        let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
     }
 
     #[test]
     fn request_body_shorter_than_content_length_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
-        let req = "POST /api/login HTTP/1.1\r\n\
-Host: localhost\r\n\
-Content-Length: 20\r\n\
-Content-Type: application/json\r\n\r\n\
-{\"username\":\"ad";
-        let resp = send_req(addr, req);
+        let req = raw_login_post(
+            "Content-Length: 20\r\nContent-Type: application/json",
+            "{\"username\":\"ad",
+        );
+        let resp = send_req(addr, &req);
         assert_eq!(parse_status(&resp), 400);
     }
 
     #[test]
     fn invalid_http_version_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "GET / HTTP/2.0\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2695,15 +2506,8 @@ Content-Type: application/json\r\n\r\n\
 
     #[test]
     fn invalid_http_version_schema_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "GET / FTP/1.0\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2712,15 +2516,8 @@ Content-Type: application/json\r\n\r\n\
 
     #[test]
     fn invalid_request_line_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "BADLINE\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2729,15 +2526,8 @@ Content-Type: application/json\r\n\r\n\
 
     #[test]
     fn invalid_method_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "GE T / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2746,15 +2536,8 @@ Content-Type: application/json\r\n\r\n\
 
     #[test]
     fn invalid_path_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "GET api/status HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2763,15 +2546,8 @@ Content-Type: application/json\r\n\r\n\
 
     #[test]
     fn invalid_backslash_in_path_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
         let web_root = std::env::temp_dir();
-        let auth = None;
-        let sessions = Arc::new(Mutex::new(SessionStore::new(Duration::from_secs(60))));
-        let rate = Arc::new(Mutex::new(LoginRateLimiter::new(5, 60)));
-        let handler: Arc<dyn AdminHttpHandler> = Arc::new(TestHandler);
-        let _thr = spawn_server(listener, 1, web_root, auth, sessions, rate, handler);
+        let (addr, _thr) = start_short_unauth_server(1, web_root);
 
         let req = "GET /api\\status HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let resp = send_req(addr, req);
@@ -2815,88 +2591,86 @@ Content-Type: application/json\r\n\r\n\
 }
 
 fn handle_api(
-    stream: &mut TcpStream,
     req: HttpRequest,
     handler: Arc<dyn AdminHttpHandler>,
     peer: Option<SocketAddr>,
-) -> std::io::Result<()> {
+) -> Response<Full<Bytes>> {
     if req.method == "POST" {
         if let Some(id) =
             req.path.strip_prefix("/api/clients/").and_then(|rest| rest.strip_suffix("/kick"))
         {
             let raw = id.trim();
             if raw.is_empty() {
-                return respond_json(stream, 400, &AdminResponse::error("Missing client id"));
+                return json_response(400, &AdminResponse::error("Missing client id"));
             }
-            let Some(id) = normalize_socket_addr(raw) else {
-                return respond_json(stream, 400, &AdminResponse::error("Invalid client id"));
+            let Some(id) = normalize_client_id(raw) else {
+                return json_response(400, &AdminResponse::error("Invalid client id"));
             };
             let resp = handler.handle_kick(&id);
             log_action(peer, "kick", &format!("id={}", id), resp.success);
-            return respond_admin_json(stream, &resp);
+            return admin_json_response(&resp);
         }
     }
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/status") => respond_admin_json(stream, &handler.handle_status()),
+        ("GET", "/api/status") => admin_json_response(&handler.handle_status()),
         ("GET", "/api/clients") => {
             let clients = handler.handle_list_clients();
-            respond_json(
-                stream,
+            json_response(
                 200,
                 &AdminResponse::ok_with_data(
                     serde_json::to_value(clients).unwrap_or_else(|_| serde_json::json!([])),
                 ),
             )
         }
-        ("GET", "/api/blocked") => respond_admin_json(stream, &handler.handle_list_blocked_ips()),
-        ("GET", "/api/config") => respond_admin_json(stream, &handler.handle_read_config()),
-        ("GET", "/api/metrics") => respond_text(stream, 200, &handler.handle_metrics_text()),
-        ("GET", "/api/metrics/json") => respond_admin_json(stream, &handler.handle_metrics_json()),
-        ("GET", "/api/qkeys") => respond_admin_json(stream, &handler.handle_list_qkeys()),
+        ("GET", "/api/blocked") => admin_json_response(&handler.handle_list_blocked_ips()),
+        ("GET", "/api/config") => admin_json_response(&handler.handle_read_config()),
+        ("GET", "/api/metrics") => text_response(200, &handler.handle_metrics_text()),
+        ("GET", "/api/metrics/json") => admin_json_response(&handler.handle_metrics_json()),
+        ("GET", "/api/qkeys") => admin_json_response(&handler.handle_list_qkeys()),
         ("POST", "/api/kick") => {
             let payload: IdPayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             let raw = payload.id.trim();
             if raw.is_empty() {
-                return respond_json(stream, 400, &AdminResponse::error("Missing client id"));
+                return json_response(400, &AdminResponse::error("Missing client id"));
             }
-            let Some(id) = normalize_socket_addr(raw) else {
-                return respond_json(stream, 400, &AdminResponse::error("Invalid client id"));
+            let Some(id) = normalize_client_id(raw) else {
+                return json_response(400, &AdminResponse::error("Invalid client id"));
             };
             let resp = handler.handle_kick(&id);
             log_action(peer, "kick", &format!("id={}", id), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/block") => {
             let payload: IpPayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             let Some(ip) = normalize_ip_for_policy(&payload.ip) else {
-                return respond_json(stream, 400, &AdminResponse::error("Invalid IP"));
+                return json_response(400, &AdminResponse::error("Invalid IP"));
             };
             let resp = handler.handle_block(&ip);
             log_action(peer, "block", &format!("ip={}", ip), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/unblock") => {
             let payload: IpPayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             let Some(ip) = normalize_ip_for_policy(&payload.ip) else {
-                return respond_json(stream, 400, &AdminResponse::error("Invalid IP"));
+                return json_response(400, &AdminResponse::error("Invalid IP"));
             };
             let resp = handler.handle_unblock(&ip);
             log_action(peer, "unblock", &format!("ip={}", ip), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/reload") => {
             let resp = handler.handle_reload();
             log_action(peer, "reload", "-", resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/qkey") => {
             let payload: QKeyCreatePayload = if req.body.is_empty() {
@@ -2912,16 +2686,12 @@ fn handle_api(
             } else {
                 match serde_json::from_slice(&req.body) {
                     Ok(p) => p,
-                    Err(_) => {
-                        return respond_json(stream, 400, &AdminResponse::error("Invalid JSON"))
-                    }
+                    Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
                 }
             };
             if let Some(ttl) = payload.ttl_seconds {
-                // Avoid absurd TTLs and keep behavior deterministic across frontends.
                 if ttl > MAX_QKEY_TTL_SECS {
-                    return respond_json(
-                        stream,
+                    return json_response(
                         400,
                         &AdminResponse::error(format!(
                             "TTL too large (max {} seconds)",
@@ -2932,8 +2702,7 @@ fn handle_api(
             }
             if let Some(port) = payload.port {
                 if port == 0 {
-                    return respond_json(
-                        stream,
+                    return json_response(
                         400,
                         &AdminResponse::error("Port must be between 1 and 65535"),
                     );
@@ -2950,57 +2719,55 @@ fn handle_api(
             };
             let resp = handler.handle_qkey(req);
             log_action(peer, "qkey", "-", resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/qkeys/revoke") => {
             let payload: QKeyRevokePayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             if payload.id.trim().is_empty() {
-                return respond_json(stream, 400, &AdminResponse::error("Missing QKey id"));
+                return json_response(400, &AdminResponse::error("Missing QKey id"));
             }
             let Some(id) = normalize_qkey_id(&payload.id) else {
-                return respond_json(stream, 400, &AdminResponse::error("Invalid QKey id"));
+                return json_response(400, &AdminResponse::error("Invalid QKey id"));
             };
             let resp = handler.handle_revoke_qkey(&id);
             log_action(peer, "qkey-revoke", &format!("id={}", id), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/shutdown") => {
             if !admin_shutdown_enabled() {
-                return respond_text(stream, 404, "Not Found");
+                return text_response(404, "Not Found");
             }
             let resp = handler.handle_shutdown();
             log_action(peer, "shutdown", "-", resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("POST", "/api/config") => {
             let payload: ConfigPayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             if payload.config.trim().is_empty() {
-                return respond_json(stream, 400, &AdminResponse::error("Empty config"));
+                return json_response(400, &AdminResponse::error("Empty config"));
             }
             let resp = handler.handle_write_config(&payload.config);
             log_action(peer, "config", &format!("bytes={}", payload.config.len()), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
-        ("GET", "/api/config/logging") => {
-            respond_admin_json(stream, &handler.handle_get_logging_config())
-        }
+        ("GET", "/api/config/logging") => admin_json_response(&handler.handle_get_logging_config()),
         ("POST", "/api/config/logging") => {
             let payload: LoggingModePayload = match serde_json::from_slice(&req.body) {
                 Ok(p) => p,
-                Err(_) => return respond_json(stream, 400, &AdminResponse::error("Invalid JSON")),
+                Err(_) => return json_response(400, &AdminResponse::error("Invalid JSON")),
             };
             let resp = handler.handle_set_logging_config(&payload.mode);
             log_action(peer, "logging", &format!("mode={}", payload.mode), resp.success);
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
         ("GET", "/api/logs") | ("GET", "/api/logs?") => {
-            respond_admin_json(stream, &handler.handle_get_logs(0))
+            admin_json_response(&handler.handle_get_logs(0))
         }
         ("GET", path) if path.starts_with("/api/logs?") => {
             let cursor = path
@@ -3013,301 +2780,17 @@ fn handle_api(
                         .and_then(|v| v.parse::<u64>().ok())
                 })
                 .unwrap_or(0);
-            respond_admin_json(stream, &handler.handle_get_logs(cursor))
+            admin_json_response(&handler.handle_get_logs(cursor))
         }
         ("POST", "/api/logs/clear") => {
             let resp = handler.handle_clear_logs();
-            // Keep clear behavior strict: successful clear must leave live buffer empty.
-            // Only log failures for diagnostics.
             if !resp.success {
                 log_action(peer, "logs-clear", "-", false);
             }
-            respond_admin_json(stream, &resp)
+            admin_json_response(&resp)
         }
-        _ => respond_text(stream, 404, "Not Found"),
+        _ => text_response(404, "Not Found"),
     }
-}
-
-fn respond_json<T: Serialize>(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &T,
-) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    respond_bytes(stream, status, "application/json", &payload)
-}
-
-fn respond_admin_json(stream: &mut TcpStream, body: &AdminResponse) -> std::io::Result<()> {
-    respond_json(stream, admin_response_status(body), body)
-}
-
-fn respond_json_with_headers<T: Serialize>(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &T,
-    headers: Vec<(String, String)>,
-) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    respond_bytes_with_headers(stream, status, "application/json", &payload, &headers)
-}
-
-fn respond_text(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    respond_bytes(stream, status, "text/plain; charset=utf-8", body.as_bytes())
-}
-
-fn respond_file_with_headers(
-    stream: &mut TcpStream,
-    path: &Path,
-    headers: &[(String, String)],
-) -> std::io::Result<()> {
-    let mime = match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript",
-        "wasm" => "application/wasm",
-        "json" => "application/json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        _ => "application/octet-stream",
-    };
-    let data = std::fs::read(path)?;
-    respond_bytes_with_headers(stream, 200, mime, &data, headers)
-}
-
-fn respond_bytes(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    respond_bytes_with_headers(stream, status, content_type, body, &[])
-}
-
-fn respond_bytes_with_headers(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-    headers: &[(String, String)],
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        413 => "Payload Too Large",
-        423 => "Locked",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    };
-    let status_line = format!("{} {}", status, reason);
-    let mut header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        status_line,
-        content_type,
-        body.len()
-    );
-    header.push_str("X-Content-Type-Options: nosniff\r\n");
-    header.push_str("X-Frame-Options: DENY\r\n");
-    header.push_str("Referrer-Policy: no-referrer\r\n");
-    header.push_str(
-        "Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()\r\n",
-    );
-    header.push_str("Cross-Origin-Opener-Policy: same-origin\r\n");
-    header.push_str("Cross-Origin-Resource-Policy: same-origin\r\n");
-    if content_type.starts_with("text/html") {
-        header.push_str("Content-Security-Policy: ");
-        header.push_str(ADMIN_CSP);
-        header.push_str("\r\n");
-    }
-    for (key, value) in headers {
-        header.push_str(key);
-        header.push_str(": ");
-        header.push_str(value);
-        header.push_str("\r\n");
-    }
-    header.push_str("\r\n");
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
-    Ok(())
-}
-
-fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut temp = [0u8; 1024];
-    let mut header_end = None;
-    while header_end.is_none() && buf.len() < MAX_HEADER_BYTES {
-        let n = stream.read(&mut temp)?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&temp[..n]);
-        header_end = find_header_end(&buf);
-    }
-    let header_end = match header_end {
-        Some(pos) => pos,
-        None => {
-            let msg = if buf.len() >= MAX_HEADER_BYTES {
-                "Headers too large"
-            } else {
-                "Invalid HTTP request"
-            };
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
-        }
-    };
-    let (head, rest) = buf.split_at(header_end);
-    let head_str = std::str::from_utf8(head)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid headers"))?;
-    let mut lines = head_str.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing request line")
-    })?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing request method")
-    })?;
-    if !is_valid_http_token(method) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid method"));
-    }
-    let path = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing request path")
-    })?;
-    let version = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing HTTP version")
-    })?;
-    if parts.next().is_some() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid HTTP request"));
-    }
-    if !version.starts_with("HTTP/") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Invalid HTTP version schema",
-        ));
-    }
-    if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Unsupported HTTP version",
-        ));
-    }
-    let method = method.to_string();
-    let path = path.to_string();
-    if !is_valid_request_path(&path) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid request path"));
-    }
-    let mut headers = Vec::new();
-    let mut content_len = 0usize;
-    let mut saw_content_len = false;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid header"));
-        }
-        let (k, v) = line.split_once(':').ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid header")
-        })?;
-        let key = k.trim().to_string();
-        let val = v.trim().to_string();
-        if !is_valid_header_name(&key) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid header"));
-        }
-        if key.eq_ignore_ascii_case("content-length") {
-            if saw_content_len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Invalid Content-Length",
-                ));
-            }
-            saw_content_len = true;
-            let parsed = val.parse::<usize>().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid Content-Length")
-            })?;
-            content_len = parsed;
-        }
-        headers.push((key, val));
-    }
-    let mut body = rest.to_vec();
-    if content_len > MAX_BODY_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Payload too large"));
-    }
-    if body.len() < content_len {
-        let to_read = content_len - body.len();
-        let mut extra = vec![0u8; to_read];
-        stream.read_exact(&mut extra).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                return std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Incomplete request body",
-                );
-            }
-            e
-        })?;
-        body.extend_from_slice(&extra);
-    } else if body.len() > content_len {
-        body.truncate(content_len);
-    }
-    Ok(HttpRequest { method, path, headers, body })
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|pos| pos + 4)
-}
-
-fn is_valid_header_name(name: &str) -> bool {
-    is_valid_http_token(name)
-}
-
-fn is_valid_http_token(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    for ch in value.bytes() {
-        let is_alpha_num = ch.is_ascii_alphanumeric();
-        let is_tchar_special = matches!(
-            ch,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        );
-        if !(is_alpha_num || is_tchar_special) {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_valid_request_path(path: &str) -> bool {
-    if !path.starts_with('/') {
-        return false;
-    }
-    if path.contains('\u{0000}') {
-        return false;
-    }
-    if path.contains("\\") {
-        return false;
-    }
-    if path.chars().any(|c| c.is_control()) {
-        return false;
-    }
-    true
 }
 
 fn get_cookie(req: &HttpRequest, name: &str) -> Option<String> {
@@ -3407,15 +2890,20 @@ fn constant_time_token_eq(left: &str, right: &str) -> bool {
 }
 
 fn request_replay_fingerprint(req: &HttpRequest, csrf_token: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    req.method.hash(&mut hasher);
-    req.path.hash(&mut hasher);
-    req.body.hash(&mut hasher);
-    csrf_token.hash(&mut hasher);
+    let mut h = Sha256::new();
+    h.update(req.method.as_bytes());
+    h.update(b"|");
+    h.update(req.path.as_bytes());
+    h.update(b"|");
+    h.update(&req.body);
+    h.update(b"|");
+    h.update(csrf_token.as_bytes());
     if let Some(nonce) = header_value(req, CSRF_NONCE_HEADER) {
-        nonce.hash(&mut hasher);
+        h.update(b"|");
+        h.update(nonce.as_bytes());
     }
-    hasher.finish()
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0u8; 8]))
 }
 
 fn validate_csrf_request(
@@ -3484,16 +2972,16 @@ fn is_same_origin_request(req: &HttpRequest) -> bool {
     origin_host.eq_ignore_ascii_case(host)
 }
 
-fn hash_password(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
+fn hash_password(password: &str) -> Result<String, String> {
+    let mut salt_bytes = [0u8; 16];
+    crate::rng::fill_secure(&mut salt_bytes).map_err(|e| format!("salt RNG failed: {}", e))?;
+    let salt =
+        SaltString::encode_b64(&salt_bytes).map_err(|e| format!("salt encoding failed: {}", e))?;
     let argon2 = Argon2::default();
-    match argon2.hash_password(password.as_bytes(), &salt) {
-        Ok(hash) => hash.to_string(),
-        Err(e) => {
-            log::warn!("admin password hash failed: {}", e);
-            String::new()
-        }
-    }
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| format!("admin password hash failed: {}", e))
 }
 
 fn verify_password(password_phc: &str, password: &str) -> bool {

@@ -1,79 +1,96 @@
-use lazy_static::lazy_static;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-// Global Zerocopy telemetry (Linux-only producers increment; always defined for simplicity)
-// Total number of MSG_ZEROCOPY completion notifications observed.
-pub static ZC_COMPLETIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
-// Total bytes reported as completed by zerocopy notifications (best-effort).
-pub static ZC_COMPLETED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
-// Batch send attempts using zerocopy-capable fast paths (sendmmsg/sendmsg_x).
-pub static ZEROCOPY_SEND_CALLS: AtomicU64 = AtomicU64::new(0);
-// Fallbacks when batched zerocopy send is unavailable or rejected.
-pub static ZEROCOPY_SEND_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-// TLS provider gauge: 0 = rustls-only, 1 = rustls+tls-cover (unified)
+/// TLS provider gauge: 0 = rustls-only, 1 = rustls+tls-cover (unified).
 pub static TLS_PROVIDER_KIND: SafeGauge = SafeGauge::new();
 
-// HTTP/3 metrics
+/// Total HTTP/3 frames processed.
 pub static H3_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Total HTTP/3 header blocks processed.
 pub static H3_HEADERS: AtomicU64 = AtomicU64::new(0);
+/// Total HTTP/3 DATA frame bytes transferred.
 pub static H3_DATA_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Total HTTP/3 errors encountered.
 pub static H3_ERRORS: AtomicU64 = AtomicU64::new(0);
 
-// MASQUE state gauge: 0 = inactive, 1 = active (CONNECT-UDP established)
+/// MASQUE state gauge: 0 = inactive, 1 = active (CONNECT-UDP established).
 pub static MASQUE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
-// AEGIS plan gauge:
-// 0 = MORUS (fallback), 1 = AEGIS-128L, 4 = AEGIS-128X4 (unrolled), 8 = AEGIS-128X8 (unrolled)
+/// AEGIS plan gauge: 0=MORUS, 1=AEGIS-128L, 4=AEGIS-128X4, 8=AEGIS-128X8.
 pub static AEGIS_PLAN: AtomicU64 = AtomicU64::new(0);
 
-// MASQUE hint from Brain: 0 = no preference, 1 = prefer MASQUE path
+/// Brain MASQUE hint: 0 = no preference, 1 = prefer MASQUE path.
 pub static MASQUE_HINT: AtomicU64 = AtomicU64::new(0);
 
-// IP/TUN telemetry
+/// Total IPv4 packets processed through TUN device.
 pub static IP_V4_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Total IPv6 packets processed through TUN device.
 pub static IP_V6_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative IP ToS/DSCP field values (for averaging).
 pub static IP_TOS_SUM: AtomicU64 = AtomicU64::new(0);
+/// Number of IP ToS samples collected.
 pub static IP_TOS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+/// Total TUN fast-path write attempts.
 pub static TUN_FASTPATH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-pub static TUN_FASTPATH_URING_SUCCESS: AtomicU64 = AtomicU64::new(0);
-pub static TUN_FASTPATH_URING_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// TUN writes completed via direct path.
 pub static TUN_FASTPATH_DIRECT_WRITES: AtomicU64 = AtomicU64::new(0);
+/// TUN operations rejected due to unmet requirements.
 pub static TUN_REQUIREMENT_REJECTS: AtomicU64 = AtomicU64::new(0);
+/// TUN operations rejected due to configuration mismatch.
 pub static TUN_CONFIG_REJECTS: AtomicU64 = AtomicU64::new(0);
+/// TUN operations rejected due to insufficient permissions.
 pub static TUN_PERMISSION_REJECTS: AtomicU64 = AtomicU64::new(0);
 
-// Stealth path signals for Intelligent escalation heuristics
+/// RTT spike signals observed for Intelligent stealth escalation.
 pub static STEALTH_SIGNAL_RTT_SPIKES: AtomicU64 = AtomicU64::new(0);
+/// ECN Congestion Experienced marks detected for stealth escalation.
 pub static STEALTH_SIGNAL_ECN_CE: AtomicU64 = AtomicU64::new(0);
+/// Connection reset signals for stealth escalation.
 pub static STEALTH_SIGNAL_RST: AtomicU64 = AtomicU64::new(0);
+/// ToS anomaly signals for stealth escalation.
 pub static STEALTH_SIGNAL_TOS_ANOM: AtomicU64 = AtomicU64::new(0);
+/// Other unclassified stealth escalation signals.
 pub static STEALTH_SIGNAL_OTHER: AtomicU64 = AtomicU64::new(0);
+/// Total server-push cover traffic bursts emitted.
 pub static SERVER_PUSH_BURSTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total bytes of server-push cover traffic sent.
 pub static SERVER_PUSH_TOTAL_COVER_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Server-push cover bursts emitted in the last minute.
 pub static SERVER_PUSH_BURSTS_LAST_MINUTE: AtomicU64 = AtomicU64::new(0);
+/// Current server-push intensity in parts-per-million.
 pub static SERVER_PUSH_CURRENT_INTENSITY_PPM: AtomicU64 = AtomicU64::new(0);
+/// Server-push bursts triggered by loss detection.
 pub static SERVER_PUSH_TRIGGER_LOSS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Server-push bursts triggered by time-based schedule.
 pub static SERVER_PUSH_TRIGGER_TIME_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Server-push bursts triggered by gating logic.
 pub static SERVER_PUSH_TRIGGER_GATING_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// Per-category telemetry export gates (controlled by [telemetry] config flags).
+// Default: all enabled. Set to false to suppress that category from /telemetry output.
+use std::sync::atomic::AtomicBool;
+/// Whether packet-level stats are included in telemetry export.
+pub static COLLECT_PACKET_STATS: AtomicBool = AtomicBool::new(true);
+/// Whether stream-level stats are included in telemetry export.
+pub static COLLECT_STREAM_STATS: AtomicBool = AtomicBool::new(true);
+/// Whether congestion/plan stats are included in telemetry export.
+pub static COLLECT_CONGESTION_STATS: AtomicBool = AtomicBool::new(true);
+/// Whether FEC stats are included in telemetry export.
+pub static COLLECT_FEC_STATS: AtomicBool = AtomicBool::new(true);
+/// Whether stealth stats are included in telemetry export.
+pub static COLLECT_STEALTH_STATS: AtomicBool = AtomicBool::new(true);
 
 /// Export a subset of metrics in a plain text telemetry format.
 /// This intentionally covers the most relevant hot-path counters to keep overhead minimal.
+/// Respects per-category flags (COLLECT_PACKET_STATS, etc.) to filter output.
 pub fn export_telemetry_text() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let get = |v: &AtomicU64| v.load(Ordering::Relaxed);
+    let packets = COLLECT_PACKET_STATS.load(Ordering::Relaxed);
+    let congestion = COLLECT_CONGESTION_STATS.load(Ordering::Relaxed);
+    let fec = COLLECT_FEC_STATS.load(Ordering::Relaxed);
+    let stealth = COLLECT_STEALTH_STATS.load(Ordering::Relaxed);
 
-    // Zero-copy totals
-    let _ = writeln!(out, "quicfuscate_zc_completions_total {}", get(&ZC_COMPLETIONS_TOTAL));
-    let _ =
-        writeln!(out, "quicfuscate_zc_completed_bytes_total {}", get(&ZC_COMPLETED_BYTES_TOTAL));
-    let _ = writeln!(out, "quicfuscate_zerocopy_send_calls_total {}", get(&ZEROCOPY_SEND_CALLS));
-    let _ = writeln!(
-        out,
-        "quicfuscate_zerocopy_send_fallbacks_total {}",
-        get(&ZEROCOPY_SEND_FALLBACKS)
-    );
     let _ = writeln!(out, "quicfuscate_xdp_active {}", get(&XDP_ACTIVE));
 
     // Memory Pool metrics
@@ -141,7 +158,6 @@ pub fn export_telemetry_text() -> String {
     let _ = writeln!(out, "quicfuscate_aes_ctr_sve_ops {}", AES_CTR_SVE_OPS.get());
     let _ = writeln!(out, "quicfuscate_aes_ctr_ssse3_ops {}", AES_CTR_SSSE3_OPS.get());
     let _ = writeln!(out, "quicfuscate_aes_ctr_scalar_ops {}", AES_CTR_SCALAR_OPS.get());
-    let _ = writeln!(out, "quicfuscate_rng_aes_ctr_ops {}", RNG_AES_CTR_OPS.get());
     let _ = writeln!(out, "quicfuscate_poly1305_avx512_ops {}", POLY1305_AVX512_OPS.get());
     let _ = writeln!(out, "quicfuscate_poly1305_avx2_ops {}", POLY1305_AVX2_OPS.get());
     let _ = writeln!(out, "quicfuscate_poly1305_sse2_ops {}", POLY1305_SSE2_OPS.get());
@@ -166,30 +182,32 @@ pub fn export_telemetry_text() -> String {
     let _ = writeln!(out, "quicfuscate_wiedemann_usage {}", WIEDEMANN_USAGE.get());
     let _ = writeln!(out, "quicfuscate_wiedemann_amx_ops {}", WIEDEMANN_AMX_OPS.get());
     let _ = writeln!(out, "quicfuscate_wiedemann_scalar_ops {}", WIEDEMANN_SCALAR_OPS.get());
-    let _ = writeln!(out, "quicfuscate_fec_mode {}", get(&FEC_MODE));
-    let _ = writeln!(out, "quicfuscate_fec_loss_rate {}", get(&LOSS_RATE));
-    let _ = writeln!(out, "quicfuscate_fec_mode_switches_total {}", get(&FEC_MODE_SWITCHES));
-    let _ = writeln!(out, "quicfuscate_fec_window {}", get(&FEC_WINDOW));
-    let _ = writeln!(
-        out,
-        "quicfuscate_fec_switch_reason_adaptive_total {}",
-        get(&FEC_SWITCH_REASON_ADAPTIVE)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_fec_switch_reason_force_on_total {}",
-        get(&FEC_SWITCH_REASON_FORCE_ON)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_fec_switch_reason_extreme_total {}",
-        get(&FEC_SWITCH_REASON_EXTREME)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_fec_switch_reason_disturbance_total {}",
-        get(&FEC_SWITCH_REASON_DISTURBANCE)
-    );
+    if fec {
+        let _ = writeln!(out, "quicfuscate_fec_mode {}", get(&FEC_MODE));
+        let _ = writeln!(out, "quicfuscate_fec_loss_rate {}", get(&LOSS_RATE));
+        let _ = writeln!(out, "quicfuscate_fec_mode_switches_total {}", get(&FEC_MODE_SWITCHES));
+        let _ = writeln!(out, "quicfuscate_fec_window {}", get(&FEC_WINDOW));
+        let _ = writeln!(
+            out,
+            "quicfuscate_fec_switch_reason_adaptive_total {}",
+            get(&FEC_SWITCH_REASON_ADAPTIVE)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_fec_switch_reason_force_on_total {}",
+            get(&FEC_SWITCH_REASON_FORCE_ON)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_fec_switch_reason_extreme_total {}",
+            get(&FEC_SWITCH_REASON_EXTREME)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_fec_switch_reason_disturbance_total {}",
+            get(&FEC_SWITCH_REASON_DISTURBANCE)
+        );
+    } // end fec
 
     // MASQUE
     let _ = writeln!(out, "quicfuscate_masque_active {}", get(&MASQUE_ACTIVE));
@@ -198,40 +216,74 @@ pub fn export_telemetry_text() -> String {
     // AEGIS plan
     let _ = writeln!(out, "quicfuscate_aegis_plan {}", get(&AEGIS_PLAN));
 
-    // Plan selection metrics
-    let _ = writeln!(out, "quicfuscate_plan_decisions_total {}", PLAN_DECISIONS_TOTAL.get());
-    let _ = writeln!(out, "quicfuscate_plan_decisions_default {}", PLAN_DECISIONS_DEFAULT.get());
-    let _ = writeln!(out, "quicfuscate_plan_decisions_len {}", PLAN_DECISIONS_LEN.get());
-    let _ = writeln!(out, "quicfuscate_plan_select_l_total {}", PLAN_DECISIONS_L.get());
-    let _ = writeln!(out, "quicfuscate_plan_select_neon_l_total {}", PLAN_DECISIONS_NEON_L.get());
-    let _ = writeln!(out, "quicfuscate_plan_select_morus_total {}", PLAN_DECISIONS_MORUS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_scalar_ops {}", MORUS1280_SCALAR_OPS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_sse2_ops {}", MORUS1280_SSE2_OPS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_ssse3_ops {}", MORUS1280_SSSE3_OPS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_sse41_ops {}", MORUS1280_SSE41_OPS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_sse42_ops {}", MORUS1280_SSE42_OPS.get());
-    let _ = writeln!(out, "quicfuscate_morus1280_neon_ops {}", MORUS1280_NEON_OPS.get());
+    if congestion {
+        // Plan selection metrics
+        let _ = writeln!(out, "quicfuscate_plan_decisions_total {}", PLAN_DECISIONS_TOTAL.get());
+        let _ =
+            writeln!(out, "quicfuscate_plan_decisions_default {}", PLAN_DECISIONS_DEFAULT.get());
+        let _ = writeln!(out, "quicfuscate_plan_decisions_len {}", PLAN_DECISIONS_LEN.get());
+        let _ = writeln!(out, "quicfuscate_plan_select_l_total {}", PLAN_DECISIONS_L.get());
+        let _ = writeln!(out, "quicfuscate_plan_select_x4_total {}", PLAN_DECISIONS_X4.get());
+        let _ = writeln!(out, "quicfuscate_plan_select_x8_total {}", PLAN_DECISIONS_X8.get());
+        let _ =
+            writeln!(out, "quicfuscate_plan_select_neon_l_total {}", PLAN_DECISIONS_NEON_L.get());
+        let _ = writeln!(out, "quicfuscate_plan_select_morus_total {}", PLAN_DECISIONS_MORUS.get());
+        let _ = writeln!(
+            out,
+            "quicfuscate_data_aead_backend_aegis_l_total {}",
+            DATA_AEAD_BACKEND_AEGIS_L_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_data_aead_backend_aegis_x4_total {}",
+            DATA_AEAD_BACKEND_AEGIS_X4_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_data_aead_backend_aegis_x8_total {}",
+            DATA_AEAD_BACKEND_AEGIS_X8_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_data_aead_backend_morus_total {}",
+            DATA_AEAD_BACKEND_MORUS_TOTAL.get()
+        );
+        let _ = writeln!(out, "quicfuscate_morus1280_scalar_ops {}", MORUS1280_SCALAR_OPS.get());
+        let _ = writeln!(out, "quicfuscate_morus1280_sse2_ops {}", MORUS1280_SSE2_OPS.get());
+        let _ = writeln!(out, "quicfuscate_morus1280_ssse3_ops {}", MORUS1280_SSSE3_OPS.get());
+        let _ = writeln!(out, "quicfuscate_morus1280_sse41_ops {}", MORUS1280_SSE41_OPS.get());
+        let _ = writeln!(out, "quicfuscate_morus1280_sse42_ops {}", MORUS1280_SSE42_OPS.get());
+        let _ = writeln!(out, "quicfuscate_morus1280_neon_ops {}", MORUS1280_NEON_OPS.get());
+    } // end congestion (plan/aead)
 
-    // Compression decision metrics
-    let _ =
-        writeln!(out, "quicfuscate_compress_decisions_total {}", COMPRESS_DECISIONS_TOTAL.get());
-    let _ =
-        writeln!(out, "quicfuscate_compress_decisions_allow {}", COMPRESS_DECISIONS_ALLOW.get());
-    let _ = writeln!(
-        out,
-        "quicfuscate_compress_decisions_skip_len {}",
-        COMPRESS_DECISIONS_SKIP_LEN.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_compress_decisions_skip_loss {}",
-        COMPRESS_DECISIONS_SKIP_LOSS.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_compress_decisions_skip_profile {}",
-        COMPRESS_DECISIONS_SKIP_PROFILE.get()
-    );
+    if congestion {
+        // Compression decision metrics
+        let _ = writeln!(
+            out,
+            "quicfuscate_compress_decisions_total {}",
+            COMPRESS_DECISIONS_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_compress_decisions_allow {}",
+            COMPRESS_DECISIONS_ALLOW.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_compress_decisions_skip_len {}",
+            COMPRESS_DECISIONS_SKIP_LEN.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_compress_decisions_skip_loss {}",
+            COMPRESS_DECISIONS_SKIP_LOSS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_compress_decisions_skip_profile {}",
+            COMPRESS_DECISIONS_SKIP_PROFILE.get()
+        );
+    } // end congestion (compression)
 
     // GHASH backend metrics
     let _ = writeln!(out, "quicfuscate_ghash_pclmul_ops {}", GHASH_PCLMUL_OPS.get());
@@ -245,173 +297,240 @@ pub fn export_telemetry_text() -> String {
     let _ = writeln!(out, "quicfuscate_ghash_scalar_calls_total {}", GHASH_SCALAR_CALLS.get());
     let _ = writeln!(out, "quicfuscate_ghash_scalar_bytes_total {}", GHASH_SCALAR_BYTES.get());
 
-    // H3
-    let _ = writeln!(out, "quicfuscate_h3_frames_total {}", get(&H3_FRAMES));
-    let _ = writeln!(out, "quicfuscate_h3_headers_total {}", get(&H3_HEADERS));
-    let _ = writeln!(out, "quicfuscate_h3_data_bytes_total {}", get(&H3_DATA_BYTES));
-    let _ = writeln!(out, "quicfuscate_h3_errors_total {}", get(&H3_ERRORS));
+    if packets {
+        // H3
+        let _ = writeln!(out, "quicfuscate_h3_frames_total {}", get(&H3_FRAMES));
+        let _ = writeln!(out, "quicfuscate_h3_headers_total {}", get(&H3_HEADERS));
+        let _ = writeln!(out, "quicfuscate_h3_data_bytes_total {}", get(&H3_DATA_BYTES));
+        let _ = writeln!(out, "quicfuscate_h3_errors_total {}", get(&H3_ERRORS));
 
-    // IP/TUN
-    let _ = writeln!(out, "quicfuscate_ip_v4_packets_total {}", get(&IP_V4_PACKETS));
-    let _ = writeln!(out, "quicfuscate_ip_v6_packets_total {}", get(&IP_V6_PACKETS));
-    let _ = writeln!(out, "quicfuscate_ip_tos_sum {}", get(&IP_TOS_SUM));
-    let _ = writeln!(out, "quicfuscate_ip_tos_samples {}", get(&IP_TOS_SAMPLES));
-    let _ =
-        writeln!(out, "quicfuscate_tun_fastpath_attempts_total {}", get(&TUN_FASTPATH_ATTEMPTS));
-    let _ = writeln!(
-        out,
-        "quicfuscate_tun_fastpath_uring_success_total {}",
-        get(&TUN_FASTPATH_URING_SUCCESS)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_tun_fastpath_uring_fallbacks_total {}",
-        get(&TUN_FASTPATH_URING_FALLBACKS)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_tun_fastpath_direct_writes_total {}",
-        get(&TUN_FASTPATH_DIRECT_WRITES)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_tun_requirement_rejects_total {}",
-        get(&TUN_REQUIREMENT_REJECTS)
-    );
-    let _ = writeln!(out, "quicfuscate_tun_config_rejects_total {}", get(&TUN_CONFIG_REJECTS));
-    let _ =
-        writeln!(out, "quicfuscate_tun_permission_rejects_total {}", get(&TUN_PERMISSION_REJECTS));
-    let _ = writeln!(out, "quicfuscate_io_driver_copy_ops_total {}", get(&IO_DRIVER_COPY_OPS));
-    let _ = writeln!(out, "quicfuscate_io_driver_copy_bytes_total {}", get(&IO_DRIVER_COPY_BYTES));
-    let _ = writeln!(
-        out,
-        "quicfuscate_io_driver_batch_drain_packets_total {}",
-        get(&IO_DRIVER_BATCH_DRAIN_PACKETS)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_io_driver_sendmmsg_calls_total {}",
-        get(&IO_DRIVER_SENDMMSG_CALLS)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_io_driver_sendmmsg_packets_total {}",
-        get(&IO_DRIVER_SENDMMSG_PACKETS)
-    );
+        // IP/TUN
+        let _ = writeln!(out, "quicfuscate_ip_v4_packets_total {}", get(&IP_V4_PACKETS));
+        let _ = writeln!(out, "quicfuscate_ip_v6_packets_total {}", get(&IP_V6_PACKETS));
+        let _ = writeln!(out, "quicfuscate_ip_tos_sum {}", get(&IP_TOS_SUM));
+        let _ = writeln!(out, "quicfuscate_ip_tos_samples {}", get(&IP_TOS_SAMPLES));
+        let _ = writeln!(
+            out,
+            "quicfuscate_tun_fastpath_attempts_total {}",
+            get(&TUN_FASTPATH_ATTEMPTS)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_tun_fastpath_direct_writes_total {}",
+            get(&TUN_FASTPATH_DIRECT_WRITES)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_tun_requirement_rejects_total {}",
+            get(&TUN_REQUIREMENT_REJECTS)
+        );
+        let _ = writeln!(out, "quicfuscate_tun_config_rejects_total {}", get(&TUN_CONFIG_REJECTS));
+        let _ = writeln!(
+            out,
+            "quicfuscate_tun_permission_rejects_total {}",
+            get(&TUN_PERMISSION_REJECTS)
+        );
+        let _ = writeln!(out, "quicfuscate_io_driver_copy_ops_total {}", get(&IO_DRIVER_COPY_OPS));
+        let _ =
+            writeln!(out, "quicfuscate_io_driver_copy_bytes_total {}", get(&IO_DRIVER_COPY_BYTES));
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_driver_batch_drain_packets_total {}",
+            get(&IO_DRIVER_BATCH_DRAIN_PACKETS)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_driver_sendmmsg_calls_total {}",
+            get(&IO_DRIVER_SENDMMSG_CALLS)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_driver_sendmmsg_packets_total {}",
+            get(&IO_DRIVER_SENDMMSG_PACKETS)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_submit_calls_total {}",
+            IO_URING_SUBMIT_CALLS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_submit_packets_total {}",
+            IO_URING_SUBMIT_PACKETS.get()
+        );
+        let _ = writeln!(out, "quicfuscate_io_uring_fallbacks_total {}", IO_URING_FALLBACKS.get());
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_sqpoll_active {}",
+            get(&IO_URING_SQPOLL_ACTIVE)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_zc_sends_total {}",
+            IO_URING_ZC_SENDS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_zc_notifs_total {}",
+            IO_URING_ZC_NOTIFS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_server_submit_calls_total {}",
+            IO_URING_SERVER_SUBMIT_CALLS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_server_packets_total {}",
+            IO_URING_SERVER_PACKETS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_recv_batches_total {}",
+            IO_URING_RECV_BATCHES.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_recv_packets_total {}",
+            IO_URING_RECV_PACKETS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_io_uring_recv_active {}",
+            get(&IO_URING_RECV_ACTIVE)
+        );
+    } // end packets
 
-    // Stealth signals
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_signal_rtt_spikes_total {}",
-        get(&STEALTH_SIGNAL_RTT_SPIKES)
-    );
-    let _ =
-        writeln!(out, "quicfuscate_stealth_signal_ecn_ce_total {}", get(&STEALTH_SIGNAL_ECN_CE));
-    let _ = writeln!(out, "quicfuscate_stealth_signal_rst_total {}", get(&STEALTH_SIGNAL_RST));
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_signal_tos_anom_total {}",
-        get(&STEALTH_SIGNAL_TOS_ANOM)
-    );
-    let _ = writeln!(out, "quicfuscate_stealth_signal_other_total {}", get(&STEALTH_SIGNAL_OTHER));
-    let _ =
-        writeln!(out, "quicfuscate_server_push_bursts_total {}", get(&SERVER_PUSH_BURSTS_TOTAL));
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_total_cover_bytes {}",
-        get(&SERVER_PUSH_TOTAL_COVER_BYTES)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_bursts_last_minute {}",
-        get(&SERVER_PUSH_BURSTS_LAST_MINUTE)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_current_intensity_ppm {}",
-        get(&SERVER_PUSH_CURRENT_INTENSITY_PPM)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_trigger_loss_total {}",
-        get(&SERVER_PUSH_TRIGGER_LOSS_TOTAL)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_trigger_time_total {}",
-        get(&SERVER_PUSH_TRIGGER_TIME_TOTAL)
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_server_push_trigger_gating_total {}",
-        get(&SERVER_PUSH_TRIGGER_GATING_TOTAL)
-    );
-    let _ =
-        writeln!(out, "quicfuscate_stealth_probe_detected_total {}", STEALTH_PROBE_DETECTED.get());
-    let _ = writeln!(out, "quicfuscate_stealth_probe_switch_total {}", STEALTH_PROBE_SWITCH.get());
-    let _ = writeln!(out, "quicfuscate_stealth_probe_fake_total {}", STEALTH_PROBE_FAKE.get());
-    let _ = writeln!(out, "quicfuscate_stealth_probe_block_total {}", STEALTH_PROBE_BLOCK.get());
-    let _ =
-        writeln!(out, "quicfuscate_stealth_mode_escalated_total {}", STEALTH_MODE_ESCALATED.get());
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_transitions_total {}",
-        STEALTH_INTELLIGENT_TRANSITIONS_TOTAL.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_reason_loss_total {}",
-        STEALTH_INTELLIGENT_REASON_LOSS.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_reason_jitter_total {}",
-        STEALTH_INTELLIGENT_REASON_JITTER.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_reason_timeout_total {}",
-        STEALTH_INTELLIGENT_REASON_TIMEOUT.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_reason_retransmit_total {}",
-        STEALTH_INTELLIGENT_REASON_RETRANSMIT.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_reason_probe_total {}",
-        STEALTH_INTELLIGENT_REASON_PROBE.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_intelligent_deescalations_total {}",
-        STEALTH_INTELLIGENT_DEESCALATIONS_TOTAL.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_ascii_simd_avx2_bytes_total {}",
-        STEALTH_ASCII_SIMD_AVX2_BYTES.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_ascii_simd_sse2_bytes_total {}",
-        STEALTH_ASCII_SIMD_SSE2_BYTES.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_ascii_simd_neon_bytes_total {}",
-        STEALTH_ASCII_SIMD_NEON_BYTES.get()
-    );
-    let _ = writeln!(
-        out,
-        "quicfuscate_stealth_ascii_scalar_bytes_total {}",
-        STEALTH_ASCII_SCALAR_BYTES.get()
-    );
+    if stealth {
+        // Stealth signals
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_signal_rtt_spikes_total {}",
+            get(&STEALTH_SIGNAL_RTT_SPIKES)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_signal_ecn_ce_total {}",
+            get(&STEALTH_SIGNAL_ECN_CE)
+        );
+        let _ = writeln!(out, "quicfuscate_stealth_signal_rst_total {}", get(&STEALTH_SIGNAL_RST));
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_signal_tos_anom_total {}",
+            get(&STEALTH_SIGNAL_TOS_ANOM)
+        );
+        let _ =
+            writeln!(out, "quicfuscate_stealth_signal_other_total {}", get(&STEALTH_SIGNAL_OTHER));
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_bursts_total {}",
+            get(&SERVER_PUSH_BURSTS_TOTAL)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_total_cover_bytes {}",
+            get(&SERVER_PUSH_TOTAL_COVER_BYTES)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_bursts_last_minute {}",
+            get(&SERVER_PUSH_BURSTS_LAST_MINUTE)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_current_intensity_ppm {}",
+            get(&SERVER_PUSH_CURRENT_INTENSITY_PPM)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_trigger_loss_total {}",
+            get(&SERVER_PUSH_TRIGGER_LOSS_TOTAL)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_trigger_time_total {}",
+            get(&SERVER_PUSH_TRIGGER_TIME_TOTAL)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_server_push_trigger_gating_total {}",
+            get(&SERVER_PUSH_TRIGGER_GATING_TOTAL)
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_probe_detected_total {}",
+            STEALTH_PROBE_DETECTED.get()
+        );
+        let _ =
+            writeln!(out, "quicfuscate_stealth_probe_switch_total {}", STEALTH_PROBE_SWITCH.get());
+        let _ = writeln!(out, "quicfuscate_stealth_probe_fake_total {}", STEALTH_PROBE_FAKE.get());
+        let _ =
+            writeln!(out, "quicfuscate_stealth_probe_block_total {}", STEALTH_PROBE_BLOCK.get());
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_mode_escalated_total {}",
+            STEALTH_MODE_ESCALATED.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_transitions_total {}",
+            STEALTH_INTELLIGENT_TRANSITIONS_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_reason_loss_total {}",
+            STEALTH_INTELLIGENT_REASON_LOSS.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_reason_jitter_total {}",
+            STEALTH_INTELLIGENT_REASON_JITTER.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_reason_timeout_total {}",
+            STEALTH_INTELLIGENT_REASON_TIMEOUT.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_reason_retransmit_total {}",
+            STEALTH_INTELLIGENT_REASON_RETRANSMIT.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_reason_probe_total {}",
+            STEALTH_INTELLIGENT_REASON_PROBE.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_intelligent_deescalations_total {}",
+            STEALTH_INTELLIGENT_DEESCALATIONS_TOTAL.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_ascii_simd_avx2_bytes_total {}",
+            STEALTH_ASCII_SIMD_AVX2_BYTES.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_ascii_simd_sse2_bytes_total {}",
+            STEALTH_ASCII_SIMD_SSE2_BYTES.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_ascii_simd_neon_bytes_total {}",
+            STEALTH_ASCII_SIMD_NEON_BYTES.get()
+        );
+        let _ = writeln!(
+            out,
+            "quicfuscate_stealth_ascii_scalar_bytes_total {}",
+            STEALTH_ASCII_SCALAR_BYTES.get()
+        );
+    } // end stealth
+
     let _ = writeln!(out, "quicfuscate_admin_csrf_reject_total {}", ADMIN_CSRF_REJECT_TOTAL.get());
     let _ =
         writeln!(out, "quicfuscate_admin_origin_reject_total {}", ADMIN_ORIGIN_REJECT_TOTAL.get());
-    let _ = writeln!(out, "quicfuscate_qkey_auth_fail_total {}", QKEY_AUTH_FAIL_TOTAL.get());
     let _ = writeln!(out, "quicfuscate_qkey_path_rebind_total {}", QKEY_PATH_REBIND_TOTAL.get());
     let _ = writeln!(
         out,
@@ -422,14 +541,18 @@ pub fn export_telemetry_text() -> String {
     out
 }
 
+/// Thread-safe gauge backed by an `AtomicI64` for signed metric values.
 pub struct SafeGauge(AtomicI64);
 impl SafeGauge {
+    /// Create a new gauge initialized to zero.
     pub const fn new() -> Self {
         Self(AtomicI64::new(0))
     }
+    /// Store a new gauge value (relaxed ordering).
     pub fn set(&self, val: i64) {
         self.0.store(val, Ordering::Relaxed);
     }
+    /// Read the current gauge value (relaxed ordering).
     pub fn get(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -440,17 +563,22 @@ impl Default for SafeGauge {
     }
 }
 
+/// Thread-safe monotonic counter backed by an `AtomicU64`.
 pub struct Counter(AtomicU64);
 impl Counter {
+    /// Create a new counter initialized to zero.
     pub const fn new() -> Self {
         Counter(AtomicU64::new(0))
     }
+    /// Increment by one (relaxed ordering).
     pub fn inc(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
+    /// Increment by an arbitrary amount (relaxed ordering).
     pub fn inc_by(&self, val: u64) {
         self.0.fetch_add(val, Ordering::Relaxed);
     }
+    /// Read the current counter value (relaxed ordering).
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -461,480 +589,611 @@ impl Default for Counter {
     }
 }
 
-lazy_static! {
-    // Unsafe operation metrics
-    pub static ref UNSAFE_POOL_CREATED: Counter = Counter::new();
-    pub static ref UNSAFE_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
-    pub static ref UNSAFE_ALLOC_CALLS: Counter = Counter::new();
-    pub static ref UNSAFE_FREE_CALLS: Counter = Counter::new();
-    pub static ref UNSAFE_TLS_HITS: Counter = Counter::new();
-    pub static ref UNSAFE_GLOBAL_HITS: Counter = Counter::new();
-    pub static ref UNSAFE_FALLBACK_ALLOCS: Counter = Counter::new();
-    pub static ref UNSAFE_DEALLOCS: Counter = Counter::new();
+/// Unsafe memory pools created.
+pub static UNSAFE_POOL_CREATED: Counter = Counter::new();
+/// Current capacity of the unsafe memory pool.
+pub static UNSAFE_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
+/// Total allocation calls through unsafe pool.
+pub static UNSAFE_ALLOC_CALLS: Counter = Counter::new();
+/// Total free calls through unsafe pool.
+pub static UNSAFE_FREE_CALLS: Counter = Counter::new();
+/// Allocations served from thread-local slab hits.
+pub static UNSAFE_TLS_HITS: Counter = Counter::new();
+/// Allocations served from global pool hits.
+pub static UNSAFE_GLOBAL_HITS: Counter = Counter::new();
+/// Allocations that fell back to the system allocator.
+pub static UNSAFE_FALLBACK_ALLOCS: Counter = Counter::new();
+/// Total deallocations through unsafe pool.
+pub static UNSAFE_DEALLOCS: Counter = Counter::new();
 
-    // SIMD operation metrics
-    pub static ref SIMD_GF_OPS: Counter = Counter::new();
-    pub static ref SIMD_XOR_OPS: Counter = Counter::new();
-    pub static ref SIMD_PREFETCH_OPS: Counter = Counter::new();
+/// SIMD Galois field operations performed.
+pub static SIMD_GF_OPS: Counter = Counter::new();
+/// SIMD XOR operations performed.
+pub static SIMD_XOR_OPS: Counter = Counter::new();
+/// SIMD prefetch operations issued.
+pub static SIMD_PREFETCH_OPS: Counter = Counter::new();
 
-    // Unsafe compression metrics
-    pub static ref UNSAFE_COMPRESS_CALLS: Counter = Counter::new();
-    pub static ref UNSAFE_COMPRESS_FAILURES: Counter = Counter::new();
-    pub static ref UNSAFE_COMPRESS_BYTES_IN: Counter = Counter::new();
-    pub static ref UNSAFE_COMPRESS_BYTES_OUT: Counter = Counter::new();
+/// Total unsafe compression calls.
+pub static UNSAFE_COMPRESS_CALLS: Counter = Counter::new();
+/// Failed unsafe compression attempts.
+pub static UNSAFE_COMPRESS_FAILURES: Counter = Counter::new();
+/// Bytes fed into unsafe compression.
+pub static UNSAFE_COMPRESS_BYTES_IN: Counter = Counter::new();
+/// Bytes produced by unsafe compression.
+pub static UNSAFE_COMPRESS_BYTES_OUT: Counter = Counter::new();
 
-    // Entropy calculation metrics
-    pub static ref ENTROPY_CALCULATIONS: Counter = Counter::new();
-    pub static ref ENTROPY_SIMD_USED: Counter = Counter::new();
+/// Total entropy calculations performed.
+pub static ENTROPY_CALCULATIONS: Counter = Counter::new();
+/// Entropy calculations accelerated via SIMD.
+pub static ENTROPY_SIMD_USED: Counter = Counter::new();
 
-    // Zero-copy transport metrics
-    pub static ref ZERO_COPY_SENDS: Counter = Counter::new();
-    pub static ref ZERO_COPY_RECVS: Counter = Counter::new();
-    pub static ref IOSLICE_OPERATIONS: Counter = Counter::new();
+/// Zero-copy send operations completed.
+pub static ZERO_COPY_SENDS: Counter = Counter::new();
+/// Zero-copy receive operations completed.
+pub static ZERO_COPY_RECVS: Counter = Counter::new();
+/// IoSlice scatter/gather operations performed.
+pub static IOSLICE_OPERATIONS: Counter = Counter::new();
 
-    // FEC SIMD metrics
-    pub static ref FEC_SIMD_ENCODE: Counter = Counter::new();
-    pub static ref FEC_SIMD_DECODE: Counter = Counter::new();
-    pub static ref FEC_AVX2_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_AVX512_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_AVX2_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_SSE_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_NEON_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_SVE2_OPS: Counter = Counter::new();
-    pub static ref BRAIN_HISTOGRAM_SCALAR_OPS: Counter = Counter::new();
+/// FEC encoding operations accelerated via SIMD.
+pub static FEC_SIMD_ENCODE: Counter = Counter::new();
+/// FEC decoding operations accelerated via SIMD.
+pub static FEC_SIMD_DECODE: Counter = Counter::new();
+/// FEC operations using AVX2 backend.
+pub static FEC_AVX2_OPS: Counter = Counter::new();
+/// Brain histogram computations via AVX-512.
+pub static BRAIN_HISTOGRAM_AVX512_OPS: Counter = Counter::new();
+/// Brain histogram computations via AVX2.
+pub static BRAIN_HISTOGRAM_AVX2_OPS: Counter = Counter::new();
+/// Brain histogram computations via SSE.
+pub static BRAIN_HISTOGRAM_SSE_OPS: Counter = Counter::new();
+/// Brain histogram computations via NEON.
+pub static BRAIN_HISTOGRAM_NEON_OPS: Counter = Counter::new();
+/// Brain histogram computations via SVE2.
+pub static BRAIN_HISTOGRAM_SVE2_OPS: Counter = Counter::new();
+/// Brain histogram computations via scalar fallback.
+pub static BRAIN_HISTOGRAM_SCALAR_OPS: Counter = Counter::new();
 
-    // Plan selection metrics
-    pub static ref PLAN_DECISIONS_TOTAL: Counter = Counter::new();
-    pub static ref PLAN_DECISIONS_DEFAULT: Counter = Counter::new();
-    pub static ref PLAN_DECISIONS_LEN: Counter = Counter::new();
-    pub static ref PLAN_DECISIONS_L: Counter = Counter::new();
-    pub static ref PLAN_DECISIONS_NEON_L: Counter = Counter::new();
-    pub static ref PLAN_DECISIONS_MORUS: Counter = Counter::new();
-    pub static ref MORUS1280_SCALAR_OPS: Counter = Counter::new();
-    pub static ref MORUS1280_SSE2_OPS: Counter = Counter::new();
-    pub static ref MORUS1280_SSSE3_OPS: Counter = Counter::new();
-    pub static ref MORUS1280_SSE41_OPS: Counter = Counter::new();
-    pub static ref MORUS1280_SSE42_OPS: Counter = Counter::new();
-    pub static ref MORUS1280_NEON_OPS: Counter = Counter::new();
+/// Total AEAD plan selection decisions made.
+pub static PLAN_DECISIONS_TOTAL: Counter = Counter::new();
+/// Plan selections that chose the default backend.
+pub static PLAN_DECISIONS_DEFAULT: Counter = Counter::new();
+/// Plan selections based on payload length heuristic.
+pub static PLAN_DECISIONS_LEN: Counter = Counter::new();
+/// Plan selections that chose AEGIS-128L.
+pub static PLAN_DECISIONS_L: Counter = Counter::new();
+/// Plan selections that chose AEGIS-128X4 (4-way unrolled).
+pub static PLAN_DECISIONS_X4: Counter = Counter::new();
+/// Plan selections that chose AEGIS-128X8 (8-way unrolled).
+pub static PLAN_DECISIONS_X8: Counter = Counter::new();
+/// Plan selections that chose AEGIS-128L on NEON.
+pub static PLAN_DECISIONS_NEON_L: Counter = Counter::new();
+/// Plan selections that chose MORUS fallback.
+pub static PLAN_DECISIONS_MORUS: Counter = Counter::new();
+/// Data-plane AEAD operations using AEGIS-128L backend.
+pub static DATA_AEAD_BACKEND_AEGIS_L_TOTAL: Counter = Counter::new();
+/// Data-plane AEAD operations using AEGIS-128X4 backend.
+pub static DATA_AEAD_BACKEND_AEGIS_X4_TOTAL: Counter = Counter::new();
+/// Data-plane AEAD operations using AEGIS-128X8 backend.
+pub static DATA_AEAD_BACKEND_AEGIS_X8_TOTAL: Counter = Counter::new();
+/// Data-plane AEAD operations using MORUS fallback backend.
+pub static DATA_AEAD_BACKEND_MORUS_TOTAL: Counter = Counter::new();
+/// MORUS-1280 operations via scalar backend.
+pub static MORUS1280_SCALAR_OPS: Counter = Counter::new();
+/// MORUS-1280 operations via SSE2 backend.
+pub static MORUS1280_SSE2_OPS: Counter = Counter::new();
+/// MORUS-1280 operations via SSSE3 backend.
+pub static MORUS1280_SSSE3_OPS: Counter = Counter::new();
+/// MORUS-1280 operations via SSE4.1 backend.
+pub static MORUS1280_SSE41_OPS: Counter = Counter::new();
+/// MORUS-1280 operations via SSE4.2 backend.
+pub static MORUS1280_SSE42_OPS: Counter = Counter::new();
+/// MORUS-1280 operations via NEON backend.
+pub static MORUS1280_NEON_OPS: Counter = Counter::new();
 
-    // Compression decision metrics
-    pub static ref COMPRESS_DECISIONS_TOTAL: Counter = Counter::new();
-    pub static ref COMPRESS_DECISIONS_ALLOW: Counter = Counter::new();
-    pub static ref COMPRESS_DECISIONS_SKIP_LEN: Counter = Counter::new();
-    pub static ref COMPRESS_DECISIONS_SKIP_LOSS: Counter = Counter::new();
-    pub static ref COMPRESS_DECISIONS_SKIP_PROFILE: Counter = Counter::new();
+/// Accepted 0-RTT early data attempts.
+pub static ZERO_RTT_ACCEPT_TOTAL: Counter = Counter::new();
+/// Rejected 0-RTT replays caught by the strike register.
+pub static ZERO_RTT_REPLAY_REJECT_TOTAL: Counter = Counter::new();
 
-    // GHASH scalar fallback metrics
-    pub static ref GHASH_SCALAR_CALLS: Counter = Counter::new();
-    pub static ref GHASH_SCALAR_BYTES: Counter = Counter::new();
-    pub static ref FEC_AVX512_OPS: Counter = Counter::new();
-    pub static ref FEC_GF16_VBMI2_OPS: Counter = Counter::new();
-    pub static ref FEC_NEON_OPS: Counter = Counter::new();
-    pub static ref FEC_SVE2_OPS: Counter = Counter::new();
-    pub static ref FEC_BERLEKAMP_SVE2_OPS: Counter = Counter::new();
+/// Total compression eligibility decisions.
+pub static COMPRESS_DECISIONS_TOTAL: Counter = Counter::new();
+/// Compression decisions that allowed compression.
+pub static COMPRESS_DECISIONS_ALLOW: Counter = Counter::new();
+/// Compression skipped due to payload length threshold.
+pub static COMPRESS_DECISIONS_SKIP_LEN: Counter = Counter::new();
+/// Compression skipped due to high loss rate.
+pub static COMPRESS_DECISIONS_SKIP_LOSS: Counter = Counter::new();
+/// Compression skipped due to incompatible stealth profile.
+pub static COMPRESS_DECISIONS_SKIP_PROFILE: Counter = Counter::new();
 
-    // SIMD operation counters
-    pub static ref AVX512_OPS: Counter = Counter::new();
-    pub static ref AVX2_OPS: Counter = Counter::new();
-    // SSE2_OPS removed - baseline is SSE4.2
-    pub static ref NEON_OPS: Counter = Counter::new();
-    pub static ref SVE2_OPS: Counter = Counter::new();
-    pub static ref SCALAR_OPS: Counter = Counter::new();
+/// Total calls to GHASH scalar fallback path.
+pub static GHASH_SCALAR_CALLS: Counter = Counter::new();
+/// Total bytes processed by GHASH scalar fallback.
+pub static GHASH_SCALAR_BYTES: Counter = Counter::new();
+/// FEC operations using AVX-512 backend.
+pub static FEC_AVX512_OPS: Counter = Counter::new();
+/// FEC GF(2^16) operations using VBMI2 instructions.
+pub static FEC_GF16_VBMI2_OPS: Counter = Counter::new();
+/// FEC operations using NEON backend.
+pub static FEC_NEON_OPS: Counter = Counter::new();
+/// FEC operations using SVE2 backend.
+pub static FEC_SVE2_OPS: Counter = Counter::new();
+/// FEC Berlekamp-Massey solver operations using SVE2.
+pub static FEC_BERLEKAMP_SVE2_OPS: Counter = Counter::new();
 
-    // AES block backend usage
-    pub static ref AES_BLOCK_AESNI_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_VAES_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_AESE_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_SSSE3_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_SVE_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_NEON_TABLE_OPS: Counter = Counter::new();
-    pub static ref AES_BLOCK_SCALAR_OPS: Counter = Counter::new();
-    pub static ref SHA256_AVX2_OPS: Counter = Counter::new();
-    pub static ref SHA256_VNNI_OPS: Counter = Counter::new();
-    pub static ref SHA256_SHA_OPS: Counter = Counter::new();
-    pub static ref SHA256_NEON_OPS: Counter = Counter::new();
-    pub static ref SHA256_SVE2_OPS: Counter = Counter::new();
-    pub static ref SHA256_SCALAR_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_AVX2_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_VNNI_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_SHA_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_NEON_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_SVE2_OPS: Counter = Counter::new();
-    pub static ref HMAC_SHA256_SCALAR_OPS: Counter = Counter::new();
+/// General AVX-512 SIMD operations performed.
+pub static AVX512_OPS: Counter = Counter::new();
+/// General AVX2 SIMD operations performed.
+pub static AVX2_OPS: Counter = Counter::new();
+// SSE2_OPS removed - baseline is SSE4.2
+/// General NEON SIMD operations performed.
+pub static NEON_OPS: Counter = Counter::new();
+/// General SVE2 SIMD operations performed.
+pub static SVE2_OPS: Counter = Counter::new();
+/// General scalar (non-SIMD) fallback operations performed.
+pub static SCALAR_OPS: Counter = Counter::new();
 
-    // GHASH backend usage
-    pub static ref GHASH_PCLMUL_OPS: Counter = Counter::new();
-    pub static ref GHASH_VPCLMUL_OPS: Counter = Counter::new();
-    pub static ref GHASH_PMULL_OPS: Counter = Counter::new();
-    pub static ref GHASH_NEON_OPS: Counter = Counter::new();
-    pub static ref GHASH_SSE_OPS: Counter = Counter::new();
-    pub static ref GHASH_SCALAR_OPS: Counter = Counter::new();
+/// AES block operations via AES-NI (x86).
+pub static AES_BLOCK_AESNI_OPS: Counter = Counter::new();
+/// AES block operations via VAES (x86 wide).
+pub static AES_BLOCK_VAES_OPS: Counter = Counter::new();
+/// AES block operations via AESE (ARM).
+pub static AES_BLOCK_AESE_OPS: Counter = Counter::new();
+/// AES block operations via SSSE3 software table.
+pub static AES_BLOCK_SSSE3_OPS: Counter = Counter::new();
+/// AES block operations via SVE (ARM).
+pub static AES_BLOCK_SVE_OPS: Counter = Counter::new();
+/// AES block operations via NEON table lookup.
+pub static AES_BLOCK_NEON_TABLE_OPS: Counter = Counter::new();
+/// AES block operations via scalar fallback.
+pub static AES_BLOCK_SCALAR_OPS: Counter = Counter::new();
+/// SHA-256 operations via AVX2 backend.
+pub static SHA256_AVX2_OPS: Counter = Counter::new();
+/// SHA-256 operations via VNNI backend.
+pub static SHA256_VNNI_OPS: Counter = Counter::new();
+/// SHA-256 operations via hardware SHA extension.
+pub static SHA256_SHA_OPS: Counter = Counter::new();
+/// SHA-256 operations via NEON backend.
+pub static SHA256_NEON_OPS: Counter = Counter::new();
+/// SHA-256 operations via SVE2 backend.
+pub static SHA256_SVE2_OPS: Counter = Counter::new();
+/// SHA-256 operations via scalar fallback.
+pub static SHA256_SCALAR_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via AVX2 backend.
+pub static HMAC_SHA256_AVX2_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via VNNI backend.
+pub static HMAC_SHA256_VNNI_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via hardware SHA extension.
+pub static HMAC_SHA256_SHA_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via NEON backend.
+pub static HMAC_SHA256_NEON_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via SVE2 backend.
+pub static HMAC_SHA256_SVE2_OPS: Counter = Counter::new();
+/// HMAC-SHA256 operations via scalar fallback.
+pub static HMAC_SHA256_SCALAR_OPS: Counter = Counter::new();
 
-    // ChaCha20 4-way usage
-    pub static ref CHACHA20_X4_AVX2_OPS: Counter = Counter::new();
-    pub static ref CHACHA20_X4_AVX_OPS: Counter = Counter::new();
-    pub static ref CHACHA20_X4_SSE41_OPS: Counter = Counter::new();
-    pub static ref CHACHA20_X4_NEON_OPS: Counter = Counter::new();
-    pub static ref CHACHA20_X4_SCALAR_OPS: Counter = Counter::new();
+/// GHASH operations via PCLMULQDQ (x86).
+pub static GHASH_PCLMUL_OPS: Counter = Counter::new();
+/// GHASH operations via VPCLMULQDQ (x86 wide).
+pub static GHASH_VPCLMUL_OPS: Counter = Counter::new();
+/// GHASH operations via PMULL (ARM).
+pub static GHASH_PMULL_OPS: Counter = Counter::new();
+/// GHASH operations via NEON backend.
+pub static GHASH_NEON_OPS: Counter = Counter::new();
+/// GHASH operations via SSE backend.
+pub static GHASH_SSE_OPS: Counter = Counter::new();
+/// GHASH operations via scalar fallback.
+pub static GHASH_SCALAR_OPS: Counter = Counter::new();
 
-    // CRC32 hardware acceleration usage
-    pub static ref CRC32_SSE42_OPS: Counter = Counter::new();
-    pub static ref CRC32_ARM_OPS: Counter = Counter::new();
-    pub static ref CRC32_SCALAR_OPS: Counter = Counter::new();
+/// ChaCha20 4-way parallel operations via AVX2.
+pub static CHACHA20_X4_AVX2_OPS: Counter = Counter::new();
+/// ChaCha20 4-way parallel operations via AVX.
+pub static CHACHA20_X4_AVX_OPS: Counter = Counter::new();
+/// ChaCha20 4-way parallel operations via SSE4.1.
+pub static CHACHA20_X4_SSE41_OPS: Counter = Counter::new();
+/// ChaCha20 4-way parallel operations via NEON.
+pub static CHACHA20_X4_NEON_OPS: Counter = Counter::new();
+/// ChaCha20 4-way parallel operations via scalar fallback.
+pub static CHACHA20_X4_SCALAR_OPS: Counter = Counter::new();
 
-    // FEC SIMD operation counters for new paths
-    pub static ref FEC_AVX2_GF_OPS: Counter = Counter::new();
-    pub static ref FEC_SSSE3_OPS: Counter = Counter::new();
-    pub static ref FEC_GFNI_OPS: Counter = Counter::new();
+/// CRC32 operations via SSE4.2 hardware.
+pub static CRC32_SSE42_OPS: Counter = Counter::new();
+/// CRC32 operations via ARM CRC32 hardware.
+pub static CRC32_ARM_OPS: Counter = Counter::new();
+/// CRC32 operations via scalar fallback.
+pub static CRC32_SCALAR_OPS: Counter = Counter::new();
 
-    // GF(2^16) SIMD operation counters for Extreme/Ultra FEC modes
-    pub static ref GF16_VPCLMUL_OPS: Counter = Counter::new();
-    pub static ref GF16_PCLMUL_OPS: Counter = Counter::new();
-    pub static ref GF16_PMULL_OPS: Counter = Counter::new();
-    // Pattern matching and histogram SIMD operation counters
-    pub static ref PATTERN_AVX512_VBMI2_OPS: Counter = Counter::new();
-    pub static ref PATTERN_AVX512_OPS: Counter = Counter::new();
-    pub static ref PATTERN_AVX2_OPS: Counter = Counter::new();
-    pub static ref PATTERN_NEON_OPS: Counter = Counter::new();
-    pub static ref PATTERN_SVE2_OPS: Counter = Counter::new();
-    pub static ref PATTERN_SCALAR_OPS: Counter = Counter::new();
+/// FEC Galois field operations via AVX2 path.
+pub static FEC_AVX2_GF_OPS: Counter = Counter::new();
+/// FEC operations via SSSE3 path.
+pub static FEC_SSSE3_OPS: Counter = Counter::new();
+/// FEC operations via GFNI (Galois Field New Instructions).
+pub static FEC_GFNI_OPS: Counter = Counter::new();
 
-    // Performance improvement metrics
-    pub static ref UNSAFE_SPEEDUP_FACTOR: AtomicU64 = AtomicU64::new(100);
-    pub static ref UNSAFE_LATENCY_REDUCTION_US: AtomicU64 = AtomicU64::new(0);
-    pub static ref UNSAFE_THROUGHPUT_GBPS: AtomicU64 = AtomicU64::new(0);
-    pub static ref CRYPTO_PROFILE: AtomicU64 = AtomicU64::new(0);
+/// GF(2^16) multiplication via VPCLMULQDQ for Extreme/Ultra FEC.
+pub static GF16_VPCLMUL_OPS: Counter = Counter::new();
+/// GF(2^16) multiplication via PCLMULQDQ for Extreme/Ultra FEC.
+pub static GF16_PCLMUL_OPS: Counter = Counter::new();
+/// GF(2^16) multiplication via PMULL for Extreme/Ultra FEC.
+pub static GF16_PMULL_OPS: Counter = Counter::new();
+/// Pattern matching operations via AVX-512 VBMI2.
+pub static PATTERN_AVX512_VBMI2_OPS: Counter = Counter::new();
+/// Pattern matching operations via AVX-512.
+pub static PATTERN_AVX512_OPS: Counter = Counter::new();
+/// Pattern matching operations via AVX2.
+pub static PATTERN_AVX2_OPS: Counter = Counter::new();
+/// Pattern matching operations via NEON.
+pub static PATTERN_NEON_OPS: Counter = Counter::new();
+/// Pattern matching operations via SVE2.
+pub static PATTERN_SVE2_OPS: Counter = Counter::new();
+/// Pattern matching operations via scalar fallback.
+pub static PATTERN_SCALAR_OPS: Counter = Counter::new();
 
-    // AEGIS batched operations counter
-    pub static ref AEGIS_BATCH_OPS: AtomicU64 = AtomicU64::new(0);
+/// Estimated speedup factor from unsafe optimizations (reserved).
+pub static UNSAFE_SPEEDUP_FACTOR: AtomicU64 = AtomicU64::new(100);
+/// Estimated latency reduction in microseconds from unsafe path (reserved).
+pub static UNSAFE_LATENCY_REDUCTION_US: AtomicU64 = AtomicU64::new(0);
+/// Estimated throughput in Gbps from unsafe path (reserved).
+pub static UNSAFE_THROUGHPUT_GBPS: AtomicU64 = AtomicU64::new(0);
+/// Active crypto profile identifier (maps to CpuProfile enum).
+pub static CRYPTO_PROFILE: AtomicU64 = AtomicU64::new(0);
 
-    // XDP metrics
-    pub static ref XDP_ACTIVE: AtomicU64 = AtomicU64::new(0);
-    pub static ref XDP_FALLBACKS: Counter = Counter::new();
-    pub static ref XDP_BYTES_SENT: Counter = Counter::new();
-    pub static ref XDP_BYTES_RECEIVED: Counter = Counter::new();
-    pub static ref XDP_SEND_LATENCY: Counter = Counter::new();
-    pub static ref XDP_RECV_LATENCY: Counter = Counter::new();
-    pub static ref XDP_THROUGHPUT: SafeGauge = SafeGauge::new();
+/// Total AEGIS batched encrypt/decrypt operations.
+pub static AEGIS_BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 
-    // Memory pool metrics
-    pub static ref MEM_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
-    pub static ref MEM_POOL_BLOCK_SIZE: AtomicU64 = AtomicU64::new(0);
-    pub static ref MEM_POOL_IN_USE: AtomicU64 = AtomicU64::new(0);
-    pub static ref MEM_POOL_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static ref MEM_POOL_FRAGMENTATION: AtomicU64 = AtomicU64::new(0);
-    pub static ref MEM_POOL_UTILIZATION: AtomicU64 = AtomicU64::new(0);
-    // 0=Local, 1=Preferred, 2=Interleave
-    pub static ref MEM_POOL_NUMA_POLICY: AtomicU64 = AtomicU64::new(0);
+/// Whether XDP fast path is currently active (0/1 gauge).
+pub static XDP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// XDP operations that fell back to kernel network stack.
+pub static XDP_FALLBACKS: Counter = Counter::new();
+/// Total bytes sent via XDP fast path.
+pub static XDP_BYTES_SENT: Counter = Counter::new();
+/// Total bytes received via XDP fast path.
+pub static XDP_BYTES_RECEIVED: Counter = Counter::new();
+/// Cumulative XDP send latency (microseconds).
+pub static XDP_SEND_LATENCY: Counter = Counter::new();
+/// Cumulative XDP receive latency (microseconds).
+pub static XDP_RECV_LATENCY: Counter = Counter::new();
+/// Current XDP throughput gauge.
+pub static XDP_THROUGHPUT: SafeGauge = SafeGauge::new();
 
-    // SIMD metrics
-    pub static ref SIMD_ACTIVE: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_AVX2: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_AVX512: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_AVX10_256: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_AVX10_512: AtomicU64 = AtomicU64::new(0);
-    // Some modules still report SSE2 usage; keep a counter for compatibility
-    pub static ref SIMD_USAGE_SSE2: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_NEON: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_SVE2: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_SCALAR: AtomicU64 = AtomicU64::new(0);
-    pub static ref SIMD_USAGE_RVV: AtomicU64 = AtomicU64::new(0);
-    pub static ref ARGSORT_AVX2_OPS: Counter = Counter::new();
-    pub static ref ARGSORT_NEON_OPS: Counter = Counter::new();
-    pub static ref ARGSORT_FALLBACK_OPS: Counter = Counter::new();
-    pub static ref MOVING_AVG_AVX512_OPS: Counter = Counter::new();
-    pub static ref MOVING_AVG_AVX2_OPS: Counter = Counter::new();
-    pub static ref MOVING_AVG_NEON_OPS: Counter = Counter::new();
-    pub static ref MOVING_AVG_SSE_OPS: Counter = Counter::new();
-    pub static ref MOVING_AVG_SCALAR_OPS: Counter = Counter::new();
-    pub static ref FAKETLS_CHACHA_OPS: Counter = Counter::new();
-    pub static ref FAKETLS_AES_GCM_OPS: Counter = Counter::new();
-    pub static ref FAKETLS_CIPHER_FAILURES: Counter = Counter::new();
-    pub static ref AES_CTR_AESNI_OPS: Counter = Counter::new();
-    pub static ref AES_CTR_AESE_OPS: Counter = Counter::new();
-    pub static ref AES_CTR_SVE_OPS: Counter = Counter::new();
-    pub static ref AES_CTR_SSSE3_OPS: Counter = Counter::new();
-    pub static ref AES_CTR_SCALAR_OPS: Counter = Counter::new();
-    pub static ref RNG_AES_CTR_OPS: Counter = Counter::new();
-    pub static ref POLY1305_AVX512_OPS: Counter = Counter::new();
-    pub static ref POLY1305_AVX2_OPS: Counter = Counter::new();
-    pub static ref POLY1305_SSE2_OPS: Counter = Counter::new();
-    pub static ref POLY1305_SVE_OPS: Counter = Counter::new();
-    pub static ref POLY1305_NEON_OPS: Counter = Counter::new();
-    pub static ref POLY1305_SCALAR_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_AVX512_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_AVX2_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_SSE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_NEON_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_SVE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_RVV_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_F32_SCALAR_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_AVX512_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_AVX2_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_SSE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_NEON_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_SVE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_RVV_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U32_SCALAR_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_AVX512_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_AVX2_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_SSE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_NEON_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_SVE_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_RVV_OPS: Counter = Counter::new();
-    pub static ref ITER_SUM_U64_SCALAR_OPS: Counter = Counter::new();
+/// Total capacity of the memory pool in blocks.
+pub static MEM_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
+/// Memory pool block size in bytes.
+pub static MEM_POOL_BLOCK_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Number of memory pool blocks currently in use.
+pub static MEM_POOL_IN_USE: AtomicU64 = AtomicU64::new(0);
+/// Total memory pool usage in bytes.
+pub static MEM_POOL_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Memory pool fragmentation metric.
+pub static MEM_POOL_FRAGMENTATION: AtomicU64 = AtomicU64::new(0);
+/// Memory pool utilization as a percentage.
+pub static MEM_POOL_UTILIZATION: AtomicU64 = AtomicU64::new(0);
+/// NUMA allocation policy: 0=Local, 1=Preferred, 2=Interleave.
+pub static MEM_POOL_NUMA_POLICY: AtomicU64 = AtomicU64::new(0);
 
-    // CPU features
-    pub static ref CPU_FEATURE_MASK: AtomicI64 = AtomicI64::new(0);
-    pub static ref IO_DRIVER_COPY_OPS: AtomicU64 = AtomicU64::new(0);
-    pub static ref IO_DRIVER_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static ref IO_DRIVER_BATCH_DRAIN_PACKETS: AtomicU64 = AtomicU64::new(0);
-    pub static ref IO_DRIVER_SENDMMSG_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static ref IO_DRIVER_SENDMMSG_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Whether any SIMD acceleration is active (0/1 gauge).
+pub static SIMD_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// Cumulative AVX2 usage counter across all subsystems.
+pub static SIMD_USAGE_AVX2: AtomicU64 = AtomicU64::new(0);
+/// Cumulative AVX-512 usage counter across all subsystems.
+pub static SIMD_USAGE_AVX512: AtomicU64 = AtomicU64::new(0);
+/// Cumulative AVX10/256 usage counter.
+pub static SIMD_USAGE_AVX10_256: AtomicU64 = AtomicU64::new(0);
+/// Cumulative AVX10/512 usage counter.
+pub static SIMD_USAGE_AVX10_512: AtomicU64 = AtomicU64::new(0);
+/// Legacy SSE2 usage counter (compatibility).
+pub static SIMD_USAGE_SSE2: AtomicU64 = AtomicU64::new(0);
+/// Cumulative NEON usage counter.
+pub static SIMD_USAGE_NEON: AtomicU64 = AtomicU64::new(0);
+/// Cumulative SVE2 usage counter.
+pub static SIMD_USAGE_SVE2: AtomicU64 = AtomicU64::new(0);
+/// Cumulative scalar fallback usage counter.
+pub static SIMD_USAGE_SCALAR: AtomicU64 = AtomicU64::new(0);
+/// Cumulative RISC-V Vector usage counter.
+pub static SIMD_USAGE_RVV: AtomicU64 = AtomicU64::new(0);
+/// Argsort operations via AVX2.
+pub static ARGSORT_AVX2_OPS: Counter = Counter::new();
+/// Argsort operations via NEON.
+pub static ARGSORT_NEON_OPS: Counter = Counter::new();
+/// Argsort operations via scalar fallback.
+pub static ARGSORT_FALLBACK_OPS: Counter = Counter::new();
+/// Moving average computations via AVX-512.
+pub static MOVING_AVG_AVX512_OPS: Counter = Counter::new();
+/// Moving average computations via AVX2.
+pub static MOVING_AVG_AVX2_OPS: Counter = Counter::new();
+/// Moving average computations via NEON.
+pub static MOVING_AVG_NEON_OPS: Counter = Counter::new();
+/// Moving average computations via SSE.
+pub static MOVING_AVG_SSE_OPS: Counter = Counter::new();
+/// Moving average computations via scalar fallback.
+pub static MOVING_AVG_SCALAR_OPS: Counter = Counter::new();
+/// TLS-cover layer ChaCha20 cipher operations.
+pub static FAKETLS_CHACHA_OPS: Counter = Counter::new();
+/// TLS-cover layer AES-GCM cipher operations.
+pub static FAKETLS_AES_GCM_OPS: Counter = Counter::new();
+/// TLS-cover layer cipher operation failures.
+pub static FAKETLS_CIPHER_FAILURES: Counter = Counter::new();
+/// AES-CTR operations via AES-NI (x86).
+pub static AES_CTR_AESNI_OPS: Counter = Counter::new();
+/// AES-CTR operations via AESE (ARM).
+pub static AES_CTR_AESE_OPS: Counter = Counter::new();
+/// AES-CTR operations via SVE (ARM).
+pub static AES_CTR_SVE_OPS: Counter = Counter::new();
+/// AES-CTR operations via SSSE3 software table.
+pub static AES_CTR_SSSE3_OPS: Counter = Counter::new();
+/// AES-CTR operations via scalar fallback.
+pub static AES_CTR_SCALAR_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via AVX-512.
+pub static POLY1305_AVX512_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via AVX2.
+pub static POLY1305_AVX2_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via SSE2.
+pub static POLY1305_SSE2_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via SVE.
+pub static POLY1305_SVE_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via NEON.
+pub static POLY1305_NEON_OPS: Counter = Counter::new();
+/// Poly1305 MAC operations via scalar fallback.
+pub static POLY1305_SCALAR_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via AVX-512.
+pub static ITER_SUM_F32_AVX512_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via AVX2.
+pub static ITER_SUM_F32_AVX2_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via SSE.
+pub static ITER_SUM_F32_SSE_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via NEON.
+pub static ITER_SUM_F32_NEON_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via SVE.
+pub static ITER_SUM_F32_SVE_OPS: Counter = Counter::new();
+/// f32 SIMD sum reductions via RISC-V Vector.
+pub static ITER_SUM_F32_RVV_OPS: Counter = Counter::new();
+/// f32 sum reductions via scalar fallback.
+pub static ITER_SUM_F32_SCALAR_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via AVX-512.
+pub static ITER_SUM_U32_AVX512_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via AVX2.
+pub static ITER_SUM_U32_AVX2_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via SSE.
+pub static ITER_SUM_U32_SSE_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via NEON.
+pub static ITER_SUM_U32_NEON_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via SVE.
+pub static ITER_SUM_U32_SVE_OPS: Counter = Counter::new();
+/// u32 SIMD sum reductions via RISC-V Vector.
+pub static ITER_SUM_U32_RVV_OPS: Counter = Counter::new();
+/// u32 sum reductions via scalar fallback.
+pub static ITER_SUM_U32_SCALAR_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via AVX-512.
+pub static ITER_SUM_U64_AVX512_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via AVX2.
+pub static ITER_SUM_U64_AVX2_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via SSE.
+pub static ITER_SUM_U64_SSE_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via NEON.
+pub static ITER_SUM_U64_NEON_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via SVE.
+pub static ITER_SUM_U64_SVE_OPS: Counter = Counter::new();
+/// u64 SIMD sum reductions via RISC-V Vector.
+pub static ITER_SUM_U64_RVV_OPS: Counter = Counter::new();
+/// u64 sum reductions via scalar fallback.
+pub static ITER_SUM_U64_SCALAR_OPS: Counter = Counter::new();
 
-    // General metrics
-    pub static ref MEMORY_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static ref BYTES_SENT: Counter = Counter::new();
-    pub static ref BYTES_RECEIVED: Counter = Counter::new();
+/// Bitmask of detected CPU features (see CPU_MASK_* constants).
+pub static CPU_FEATURE_MASK: AtomicI64 = AtomicI64::new(0);
+/// Total IO driver copy operations.
+pub static IO_DRIVER_COPY_OPS: AtomicU64 = AtomicU64::new(0);
+/// Total bytes copied by the IO driver.
+pub static IO_DRIVER_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Packets drained in IO driver batch operations.
+pub static IO_DRIVER_BATCH_DRAIN_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Total sendmmsg() system calls made by IO driver.
+pub static IO_DRIVER_SENDMMSG_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Total packets sent via sendmmsg() batching.
+pub static IO_DRIVER_SENDMMSG_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Total io_uring submit_and_wait() calls.
+pub static IO_URING_SUBMIT_CALLS: Counter = Counter::new();
+/// Total packets sent via io_uring batching.
+pub static IO_URING_SUBMIT_PACKETS: Counter = Counter::new();
+/// io_uring send failures that fell back to sendmmsg.
+pub static IO_URING_FALLBACKS: Counter = Counter::new();
+/// Whether io_uring SQPOLL mode is active (0 = standard mode, 1 = SQPOLL active).
+pub static IO_URING_SQPOLL_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// Total packets sent via io_uring zero-copy SendMsgZc path.
+pub static IO_URING_ZC_SENDS: Counter = Counter::new();
+/// Total zero-copy buffer-release notifications received from the kernel.
+pub static IO_URING_ZC_NOTIFS: Counter = Counter::new();
+/// Total io_uring submit calls from the server outbound path.
+pub static IO_URING_SERVER_SUBMIT_CALLS: Counter = Counter::new();
+/// Total packets sent via the server io_uring batch path.
+pub static IO_URING_SERVER_PACKETS: Counter = Counter::new();
+/// Total io_uring recv drain cycles (CQ drain batches).
+pub static IO_URING_RECV_BATCHES: Counter = Counter::new();
+/// Total packets received via the io_uring recv path.
+pub static IO_URING_RECV_PACKETS: Counter = Counter::new();
+/// Whether io_uring recv is active (0 = inactive, 1 = active).
+pub static IO_URING_RECV_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
-    // FEC metrics
-    pub static ref DECODING_TIME_MS: AtomicU64 = AtomicU64::new(0);
-    pub static ref WIEDEMANN_USAGE: Counter = Counter::new();
-    pub static ref WIEDEMANN_AMX_OPS: Counter = Counter::new();
-    pub static ref WIEDEMANN_SCALAR_OPS: Counter = Counter::new();
-    pub static ref FEC_MODE: AtomicU64 = AtomicU64::new(0);
-    pub static ref LOSS_RATE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_MODE_SWITCHES: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_WINDOW: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_SWITCH_REASON_ADAPTIVE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_SWITCH_REASON_FORCE_ON: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_SWITCH_REASON_EXTREME: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_SWITCH_REASON_DISTURBANCE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
-    pub static ref DNS_ERRORS: AtomicU64 = AtomicU64::new(0);
-    // Additional FEC gauges
-    pub static ref FEC_EMITTED_QUEUE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FOUNTAIN_PROGRESS: AtomicU64 = AtomicU64::new(0); // progress*1_000_000
-    pub static ref FOUNTAIN_SYMBOL_SIZE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_EMITTED_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    pub static ref FEC_EMITTED_ORDER_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// Process memory usage in bytes (updated periodically).
+pub static MEMORY_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Total bytes sent across all transports.
+pub static BYTES_SENT: Counter = Counter::new();
+/// Total bytes received across all transports.
+pub static BYTES_RECEIVED: Counter = Counter::new();
 
-    // Lazy decoding telemetry: repairs skipped when no loss detected
-    pub static ref FEC_LAZY_SKIPPED: AtomicU64 = AtomicU64::new(0);
-    // Interleaving telemetry: repairs generated across interleaved blocks
-    pub static ref FEC_INTERLEAVE_REPAIRS: AtomicU64 = AtomicU64::new(0);
-    // Ultra-Zero-Mode: upgrades from zero encoder/decoder to real FEC on loss detection
-    pub static ref ZERO_MODE_UPGRADES: AtomicU64 = AtomicU64::new(0);
+/// Last FEC decoding time in milliseconds.
+pub static DECODING_TIME_MS: AtomicU64 = AtomicU64::new(0);
+/// Wiedemann solver invocations for FEC recovery.
+pub static WIEDEMANN_USAGE: Counter = Counter::new();
+/// Wiedemann solver operations via AMX (Apple).
+pub static WIEDEMANN_AMX_OPS: Counter = Counter::new();
+/// Wiedemann solver operations via scalar fallback.
+pub static WIEDEMANN_SCALAR_OPS: Counter = Counter::new();
+/// Current FEC mode (0=Off, 1=Auto, 2=Extreme, etc.).
+pub static FEC_MODE: AtomicU64 = AtomicU64::new(0);
+/// Current observed packet loss rate (parts per million).
+pub static LOSS_RATE: AtomicU64 = AtomicU64::new(0);
+/// Total FEC mode transitions.
+pub static FEC_MODE_SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// Current FEC encoding window size.
+pub static FEC_WINDOW: AtomicU64 = AtomicU64::new(0);
+/// FEC mode switches triggered by adaptive controller.
+pub static FEC_SWITCH_REASON_ADAPTIVE: AtomicU64 = AtomicU64::new(0);
+/// FEC mode switches triggered by force-on policy.
+pub static FEC_SWITCH_REASON_FORCE_ON: AtomicU64 = AtomicU64::new(0);
+/// FEC mode switches triggered by extreme loss detection.
+pub static FEC_SWITCH_REASON_EXTREME: AtomicU64 = AtomicU64::new(0);
+/// FEC mode switches triggered by network disturbance.
+pub static FEC_SWITCH_REASON_DISTURBANCE: AtomicU64 = AtomicU64::new(0);
+/// FEC buffer overflow events.
+pub static FEC_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+/// Total DNS resolution errors.
+pub static DNS_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Current FEC emitted-packet queue depth.
+pub static FEC_EMITTED_QUEUE: AtomicU64 = AtomicU64::new(0);
+/// Fountain code recovery progress (scaled by 1,000,000).
+pub static FOUNTAIN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+/// Current fountain code symbol size in bytes.
+pub static FOUNTAIN_SYMBOL_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Unique FEC repair symbols emitted.
+pub static FEC_EMITTED_UNIQUE: AtomicU64 = AtomicU64::new(0);
+/// FEC emission reordering depth.
+pub static FEC_EMITTED_ORDER_DEPTH: AtomicU64 = AtomicU64::new(0);
 
-    // Stealth metrics
-    pub static ref STEALTH_DOH: AtomicU64 = AtomicU64::new(0);
-    pub static ref STEALTH_FRONTING: AtomicU64 = AtomicU64::new(0);
-    pub static ref STEALTH_XOR: AtomicU64 = AtomicU64::new(0);
-    pub static ref STEALTH_PADDING_GFNI_OPS: Counter = Counter::new();
-    // HTTP/3 Server Push telemetry
-    pub static ref STEALTH_PUSH_PROMISES: Counter = Counter::new();
-    pub static ref STEALTH_PUSH_BYTES: AtomicU64 = AtomicU64::new(0);
-    // Congestion aggregation telemetry
-    pub static ref CONGESTION_VNNI_BATCHES: Counter = Counter::new();
-    pub static ref CONGESTION_AVX2_BATCHES: Counter = Counter::new();
-    pub static ref CONGESTION_NEON_BATCHES: Counter = Counter::new();
+/// FEC lazy decoding repairs skipped (no loss detected).
+pub static FEC_LAZY_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// FEC repair symbols generated across interleaved blocks.
+pub static FEC_INTERLEAVE_REPAIRS: AtomicU64 = AtomicU64::new(0);
+/// Ultra-Zero-Mode upgrades from zero encoder to real FEC on loss.
+pub static ZERO_MODE_UPGRADES: AtomicU64 = AtomicU64::new(0);
 
-    // MASQUE metrics
-    pub static ref MASQUE_BYTES_SENT: Counter = Counter::new();
-    pub static ref MASQUE_BYTES_RECEIVED: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_00: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_21: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_22: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_00_BYTES: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_21_BYTES: Counter = Counter::new();
-    pub static ref MASQUE_CAPSULE_22_BYTES: Counter = Counter::new();
+/// DNS-over-HTTPS queries routed through stealth path.
+pub static STEALTH_DOH: AtomicU64 = AtomicU64::new(0);
+/// Domain fronting operations performed.
+pub static STEALTH_FRONTING: AtomicU64 = AtomicU64::new(0);
+/// XOR obfuscation operations applied.
+pub static STEALTH_XOR: AtomicU64 = AtomicU64::new(0);
+/// Stealth padding operations via GFNI instructions.
+pub static STEALTH_PADDING_GFNI_OPS: Counter = Counter::new();
+/// HTTP/3 server push promises sent for cover traffic.
+pub static STEALTH_PUSH_PROMISES: Counter = Counter::new();
+/// Total bytes sent via HTTP/3 server push cover traffic.
+pub static STEALTH_PUSH_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Congestion aggregation batches via VNNI.
+pub static CONGESTION_VNNI_BATCHES: Counter = Counter::new();
+/// Congestion aggregation batches via AVX2.
+pub static CONGESTION_AVX2_BATCHES: Counter = Counter::new();
+/// Congestion aggregation batches via NEON.
+pub static CONGESTION_NEON_BATCHES: Counter = Counter::new();
 
-    // Profile metrics
-    pub static ref STEALTH_BROWSER_PROFILE: SafeGauge = SafeGauge::new();
-    pub static ref STEALTH_OS_PROFILE: SafeGauge = SafeGauge::new();
+/// Total bytes sent through MASQUE tunnel.
+pub static MASQUE_BYTES_SENT: Counter = Counter::new();
+/// Total bytes received through MASQUE tunnel.
+pub static MASQUE_BYTES_RECEIVED: Counter = Counter::new();
+/// MASQUE capsule type 0x00 (DATAGRAM) messages processed.
+pub static MASQUE_CAPSULE_00: Counter = Counter::new();
+/// MASQUE capsule type 0x21 (REGISTER_DATA_CONTEXT) messages processed.
+pub static MASQUE_CAPSULE_21: Counter = Counter::new();
+/// MASQUE capsule type 0x22 (CLOSE_DATA_CONTEXT) messages processed.
+pub static MASQUE_CAPSULE_22: Counter = Counter::new();
+/// Total bytes in MASQUE capsule type 0x00 messages.
+pub static MASQUE_CAPSULE_00_BYTES: Counter = Counter::new();
+/// Total bytes in MASQUE capsule type 0x21 messages.
+pub static MASQUE_CAPSULE_21_BYTES: Counter = Counter::new();
+/// Total bytes in MASQUE capsule type 0x22 messages.
+pub static MASQUE_CAPSULE_22_BYTES: Counter = Counter::new();
 
-    // io_uring metrics (Linux-only fast path)
-    pub static ref URING_ACTIVE: AtomicU64 = AtomicU64::new(0);
-    pub static ref URING_SEND_ATTEMPTS: Counter = Counter::new();
-    pub static ref URING_FALLBACKS: Counter = Counter::new();
-    pub static ref URING_BYTES_SENT: Counter = Counter::new();
-    pub static ref URING_BYTES_RECEIVED: Counter = Counter::new();
-    pub static ref URING_SUBMISSIONS: Counter = Counter::new();
-    pub static ref URING_COMPLETIONS: Counter = Counter::new();
-    pub static ref URING_ERRORS: Counter = Counter::new();
-    pub static ref URING_QUEUE_DEPTH: SafeGauge = SafeGauge::new();
+/// Active stealth browser fingerprint profile identifier.
+pub static STEALTH_BROWSER_PROFILE: SafeGauge = SafeGauge::new();
+/// Active stealth OS fingerprint profile identifier.
+pub static STEALTH_OS_PROFILE: SafeGauge = SafeGauge::new();
 
-    // ACK delay telemetry (transport-level)
-    pub static ref ACK_DELAY_LAST_US: AtomicU64 = AtomicU64::new(0);
-    pub static ref ACK_DELAY_BUCKET_LE_1MS: Counter = Counter::new();
-    pub static ref ACK_DELAY_BUCKET_LE_4MS: Counter = Counter::new();
-    pub static ref ACK_DELAY_BUCKET_LE_16MS: Counter = Counter::new();
-    pub static ref ACK_DELAY_BUCKET_LE_64MS: Counter = Counter::new();
-    pub static ref ACK_DELAY_BUCKET_LE_256MS: Counter = Counter::new();
-    pub static ref ACK_DELAY_BUCKET_GT_256MS: Counter = Counter::new();
+/// Most recent ACK delay in microseconds.
+pub static ACK_DELAY_LAST_US: AtomicU64 = AtomicU64::new(0);
+/// ACK delays in the <= 1ms histogram bucket.
+pub static ACK_DELAY_BUCKET_LE_1MS: Counter = Counter::new();
+/// ACK delays in the <= 4ms histogram bucket.
+pub static ACK_DELAY_BUCKET_LE_4MS: Counter = Counter::new();
+/// ACK delays in the <= 16ms histogram bucket.
+pub static ACK_DELAY_BUCKET_LE_16MS: Counter = Counter::new();
+/// ACK delays in the <= 64ms histogram bucket.
+pub static ACK_DELAY_BUCKET_LE_64MS: Counter = Counter::new();
+/// ACK delays in the <= 256ms histogram bucket.
+pub static ACK_DELAY_BUCKET_LE_256MS: Counter = Counter::new();
+/// ACK delays exceeding 256ms.
+pub static ACK_DELAY_BUCKET_GT_256MS: Counter = Counter::new();
 
-    // Choke/pacing telemetry (stealth-level)
-    pub static ref CHOKE_SLEEP_MS: Counter = Counter::new();
-    pub static ref CHOKED_BYTES: Counter = Counter::new();
+/// Cumulative stealth choke/pacing sleep time in milliseconds.
+pub static CHOKE_SLEEP_MS: Counter = Counter::new();
+/// Total bytes delayed by stealth choke/pacing.
+pub static CHOKED_BYTES: Counter = Counter::new();
 
-    // Compression telemetry
-    pub static ref COMPRESS_ATTEMPTS: Counter = Counter::new();
-    pub static ref COMPRESS_SUCCESS: Counter = Counter::new();
-    pub static ref COMPRESS_TRUNCATIONS: Counter = Counter::new();
-    pub static ref COMPRESS_DICT_USED: Counter = Counter::new();
-    pub static ref COMPRESS_BYTES_OUT: Counter = Counter::new();
-    pub static ref COMPRESS_BYTES_IN: Counter = Counter::new();
-    pub static ref ENTROPY_TEXTUAL_SEEN: Counter = Counter::new();
-    pub static ref ENTROPY_SKIP: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_CALLS: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_TEXTUAL: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_BINARY: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_ASCII_BYTES: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_HIGH_BYTES: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_NEWLINES: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_NULLS: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_CHUNKS: Counter = Counter::new();
-    pub static ref COMPRESS_PREPROC_CHUNK_REPEATS: Counter = Counter::new();
+/// Total compression attempts.
+pub static COMPRESS_ATTEMPTS: Counter = Counter::new();
+/// Successful compression operations.
+pub static COMPRESS_SUCCESS: Counter = Counter::new();
+/// Compressed outputs that were truncated to fit buffer.
+pub static COMPRESS_TRUNCATIONS: Counter = Counter::new();
+/// Compression operations that used a shared dictionary.
+pub static COMPRESS_DICT_USED: Counter = Counter::new();
+/// Total bytes output from compression.
+pub static COMPRESS_BYTES_OUT: Counter = Counter::new();
+/// Total bytes input to compression.
+pub static COMPRESS_BYTES_IN: Counter = Counter::new();
+/// Payloads classified as textual by entropy analysis.
+pub static ENTROPY_TEXTUAL_SEEN: Counter = Counter::new();
+/// Compression skipped due to high entropy (incompressible).
+pub static ENTROPY_SKIP: Counter = Counter::new();
+/// Compression preprocessor invocations.
+pub static COMPRESS_PREPROC_CALLS: Counter = Counter::new();
+/// Preprocessor payloads classified as textual.
+pub static COMPRESS_PREPROC_TEXTUAL: Counter = Counter::new();
+/// Preprocessor payloads classified as binary.
+pub static COMPRESS_PREPROC_BINARY: Counter = Counter::new();
+/// ASCII bytes seen by compression preprocessor.
+pub static COMPRESS_PREPROC_ASCII_BYTES: Counter = Counter::new();
+/// High-byte (non-ASCII) bytes seen by preprocessor.
+pub static COMPRESS_PREPROC_HIGH_BYTES: Counter = Counter::new();
+/// Newline characters seen by preprocessor.
+pub static COMPRESS_PREPROC_NEWLINES: Counter = Counter::new();
+/// Null bytes seen by preprocessor.
+pub static COMPRESS_PREPROC_NULLS: Counter = Counter::new();
+/// Chunks emitted by preprocessor.
+pub static COMPRESS_PREPROC_CHUNKS: Counter = Counter::new();
+/// Repeated chunks detected by preprocessor.
+pub static COMPRESS_PREPROC_CHUNK_REPEATS: Counter = Counter::new();
 
-    // Body pool telemetry
-    pub static ref BODY_POOL_BLOCK_SIZE: AtomicU64 = AtomicU64::new(0);
-    pub static ref BODY_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
-    pub static ref BODY_POOL_ALLOCS: Counter = Counter::new();
-}
+/// HTTP body pool block size in bytes.
+pub static BODY_POOL_BLOCK_SIZE: AtomicU64 = AtomicU64::new(0);
+/// HTTP body pool total capacity in blocks.
+pub static BODY_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
+/// Total allocations from the HTTP body pool.
+pub static BODY_POOL_ALLOCS: Counter = Counter::new();
 
-// Split RS metrics into a separate block to avoid macro recursion limit
-lazy_static! {
-    // Adaptive RS telemetry
-    pub static ref RS_ENC_TIME_NS: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_DEC_TIME_NS: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_REPAIR_EMITTED: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_RECOVERED: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_OVERHEAD_PPM: AtomicU64 = AtomicU64::new(0); // (n-k)/k in ppm
-    pub static ref RS_WINDOW_K: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_WINDOW_N: AtomicU64 = AtomicU64::new(0);
-    pub static ref RS_GF_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Last Reed-Solomon encoding time in nanoseconds.
+pub static RS_ENC_TIME_NS: AtomicU64 = AtomicU64::new(0);
+/// Last Reed-Solomon decoding time in nanoseconds.
+pub static RS_DEC_TIME_NS: AtomicU64 = AtomicU64::new(0);
+/// Total RS repair symbols emitted.
+pub static RS_REPAIR_EMITTED: AtomicU64 = AtomicU64::new(0);
+/// Total RS packets recovered from repair data.
+pub static RS_RECOVERED: AtomicU64 = AtomicU64::new(0);
+/// RS overhead ratio (n-k)/k in parts-per-million.
+pub static RS_OVERHEAD_PPM: AtomicU64 = AtomicU64::new(0);
+/// Current RS window data symbol count (k).
+pub static RS_WINDOW_K: AtomicU64 = AtomicU64::new(0);
+/// Current RS window total symbol count (n = k + repair).
+pub static RS_WINDOW_N: AtomicU64 = AtomicU64::new(0);
+/// Current Galois field size used by RS codec.
+pub static RS_GF_SIZE: AtomicU64 = AtomicU64::new(0);
 
-    // Memory pool hit/miss telemetry (separate block to reduce macro size)
-    pub static ref MEM_POOL_HITS_TLS: Counter = Counter::new();
-    pub static ref MEM_POOL_HITS_QUEUE: Counter = Counter::new();
-    pub static ref MEM_POOL_ALLOC_GROW: Counter = Counter::new();
-    pub static ref MEM_POOL_ALLOC_EPHEMERAL: Counter = Counter::new();
-}
-
-/// Emit a simple telemetry text snapshot for core counters.
-pub fn telemetry_snapshot_text() -> String {
-    let mut s = String::new();
-    // MASQUE Kapseln
-    s.push_str("# TYPE quicfuscate_masque_capsule_00_total counter\n");
-    s.push_str(&format!("quicfuscate_masque_capsule_00_total {}\n", MASQUE_CAPSULE_00.get()));
-    s.push_str("# TYPE quicfuscate_masque_capsule_21_total counter\n");
-    s.push_str(&format!("quicfuscate_masque_capsule_21_total {}\n", MASQUE_CAPSULE_21.get()));
-    s.push_str("# TYPE quicfuscate_masque_capsule_22_total counter\n");
-    s.push_str(&format!("quicfuscate_masque_capsule_22_total {}\n", MASQUE_CAPSULE_22.get()));
-
-    // Kompression
-    s.push_str("# TYPE quicfuscate_compress_attempts_total counter\n");
-    s.push_str(&format!("quicfuscate_compress_attempts_total {}\n", COMPRESS_ATTEMPTS.get()));
-    s.push_str("# TYPE quicfuscate_compress_success_total counter\n");
-    s.push_str(&format!("quicfuscate_compress_success_total {}\n", COMPRESS_SUCCESS.get()));
-    s.push_str("# TYPE quicfuscate_compress_bytes_in_total counter\n");
-    s.push_str(&format!("quicfuscate_compress_bytes_in_total {}\n", COMPRESS_BYTES_IN.get()));
-    s.push_str("# TYPE quicfuscate_compress_bytes_out_total counter\n");
-    s.push_str(&format!("quicfuscate_compress_bytes_out_total {}\n", COMPRESS_BYTES_OUT.get()));
-    s.push_str("# TYPE quicfuscate_compress_preproc_calls_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_calls_total {}\n",
-        COMPRESS_PREPROC_CALLS.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_textual_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_textual_total {}\n",
-        COMPRESS_PREPROC_TEXTUAL.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_binary_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_binary_total {}\n",
-        COMPRESS_PREPROC_BINARY.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_ascii_bytes_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_ascii_bytes_total {}\n",
-        COMPRESS_PREPROC_ASCII_BYTES.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_newlines_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_newlines_total {}\n",
-        COMPRESS_PREPROC_NEWLINES.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_nulls_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_nulls_total {}\n",
-        COMPRESS_PREPROC_NULLS.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_high_bytes_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_high_bytes_total {}\n",
-        COMPRESS_PREPROC_HIGH_BYTES.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_chunks_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_chunks_total {}\n",
-        COMPRESS_PREPROC_CHUNKS.get()
-    ));
-    s.push_str("# TYPE quicfuscate_compress_preproc_chunk_repeats_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_compress_preproc_chunk_repeats_total {}\n",
-        COMPRESS_PREPROC_CHUNK_REPEATS.get()
-    ));
-
-    // Pools
-    s.push_str("# TYPE quicfuscate_body_pool_allocs_total counter\n");
-    s.push_str(&format!("quicfuscate_body_pool_allocs_total {}\n", BODY_POOL_ALLOCS.get()));
-    s.push_str("# TYPE quicfuscate_mem_pool_hits_tls_total counter\n");
-    s.push_str(&format!("quicfuscate_mem_pool_hits_tls_total {}\n", MEM_POOL_HITS_TLS.get()));
-    s.push_str("# TYPE quicfuscate_mem_pool_hits_queue_total counter\n");
-    s.push_str(&format!("quicfuscate_mem_pool_hits_queue_total {}\n", MEM_POOL_HITS_QUEUE.get()));
-    s.push_str("# TYPE quicfuscate_mem_pool_alloc_grow_total counter\n");
-    s.push_str(&format!("quicfuscate_mem_pool_alloc_grow_total {}\n", MEM_POOL_ALLOC_GROW.get()));
-    s.push_str("# TYPE quicfuscate_mem_pool_alloc_ephemeral_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_mem_pool_alloc_ephemeral_total {}\n",
-        MEM_POOL_ALLOC_EPHEMERAL.get()
-    ));
-
-    // CPU/Features (Gauges)
-    s.push_str("# TYPE quicfuscate_simd_usage_avx2_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_simd_usage_avx2_total {}\n",
-        SIMD_USAGE_AVX2.load(Ordering::Relaxed)
-    ));
-    s.push_str("# TYPE quicfuscate_simd_usage_avx512_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_simd_usage_avx512_total {}\n",
-        SIMD_USAGE_AVX512.load(Ordering::Relaxed)
-    ));
-    s.push_str("# TYPE quicfuscate_simd_usage_avx10_256_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_simd_usage_avx10_256_total {}\n",
-        SIMD_USAGE_AVX10_256.load(Ordering::Relaxed)
-    ));
-    s.push_str("# TYPE quicfuscate_simd_usage_avx10_512_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_simd_usage_avx10_512_total {}\n",
-        SIMD_USAGE_AVX10_512.load(Ordering::Relaxed)
-    ));
-    s.push_str("# TYPE quicfuscate_simd_usage_sve2_total counter\n");
-    s.push_str(&format!(
-        "quicfuscate_simd_usage_sve2_total {}\n",
-        SIMD_USAGE_SVE2.load(Ordering::Relaxed)
-    ));
-    s.push_str("# TYPE quicfuscate_cpu_feature_mask gauge\n");
-    s.push_str(&format!(
-        "quicfuscate_cpu_feature_mask {}\n",
-        CPU_FEATURE_MASK.load(Ordering::Relaxed)
-    ));
-    s
-}
+/// Memory pool allocations served from thread-local slab.
+pub static MEM_POOL_HITS_TLS: Counter = Counter::new();
+/// Memory pool allocations served from shared queue.
+pub static MEM_POOL_HITS_QUEUE: Counter = Counter::new();
+/// Memory pool grow events (capacity expansion).
+pub static MEM_POOL_ALLOC_GROW: Counter = Counter::new();
+/// Memory pool ephemeral (one-shot) allocations.
+pub static MEM_POOL_ALLOC_EPHEMERAL: Counter = Counter::new();
 
 const CPU_MASK_SSE2: i64 = 1 << 0;
 const CPU_MASK_SSSE3: i64 = 1 << 1;
@@ -954,6 +1213,7 @@ const CPU_MASK_APPLE_AMX: i64 = 1 << 14;
 const CPU_MASK_RVV: i64 = 1 << 15;
 const CPU_MASK_SCALAR: i64 = 1 << 16;
 
+/// Convert a `CpuProfile` to a bitmask of CPU feature flags.
 pub fn cpu_profile_mask(profile: crate::optimize::CpuProfile) -> i64 {
     use crate::optimize::CpuProfile;
     match profile {
@@ -1032,49 +1292,83 @@ pub fn cpu_profile_mask(profile: crate::optimize::CpuProfile) -> i64 {
     }
 }
 
+/// Compute and publish the CPU feature mask to the global telemetry gauge.
 pub fn publish_cpu_profile_mask(profile: crate::optimize::CpuProfile) -> i64 {
     let mask = cpu_profile_mask(profile);
     CPU_FEATURE_MASK.store(mask, Ordering::Relaxed);
     mask
 }
 
-// Static counters
+/// Total QUIC packets sent.
 pub static PACKETS_SENT: Counter = Counter::new();
+/// Total QUIC packets received.
 pub static PACKETS_RECEIVED: Counter = Counter::new();
+/// Total QUIC packets detected as lost.
 pub static PACKETS_LOST: Counter = Counter::new();
+/// Total QUIC connection path migrations.
 pub static PATH_MIGRATIONS: Counter = Counter::new();
+/// Total FEC-encoded packets emitted.
 pub static FEC_PACKETS_ENCODED: Counter = Counter::new();
+/// Total FEC-decoded packets processed.
 pub static FEC_PACKETS_DECODED: Counter = Counter::new();
+/// Total packets recovered via FEC repair.
 pub static FEC_PACKETS_RECOVERED: Counter = Counter::new();
+/// Total stealth-encoded packets produced.
 pub static ENCODED_PACKETS: Counter = Counter::new();
+/// Total stealth-decoded packets consumed.
 pub static DECODED_PACKETS: Counter = Counter::new();
+/// Partially decoded packets (incomplete recovery).
 pub static DECODED_PARTIAL_PACKETS: Counter = Counter::new();
+/// QPACK header pool fallbacks to heap allocation.
 pub static STEALTH_QPACK_POOL_FALLBACKS: Counter = Counter::new();
+/// Stealth HTTP headers generated for cover traffic.
 pub static STEALTH_HEADERS_GENERATED: Counter = Counter::new();
+/// Probing attempts detected by stealth engine.
 pub static STEALTH_PROBE_DETECTED: Counter = Counter::new();
+/// Stealth mode switches triggered by probe detection.
 pub static STEALTH_PROBE_SWITCH: Counter = Counter::new();
+/// Fake responses sent to detected probes.
 pub static STEALTH_PROBE_FAKE: Counter = Counter::new();
+/// Probing connections blocked by stealth engine.
 pub static STEALTH_PROBE_BLOCK: Counter = Counter::new();
+/// Stealth mode escalations (lower to higher stealth).
 pub static STEALTH_MODE_ESCALATED: Counter = Counter::new();
+/// Total Intelligent-mode stealth transitions.
 pub static STEALTH_INTELLIGENT_TRANSITIONS_TOTAL: Counter = Counter::new();
+/// Intelligent escalations triggered by packet loss.
 pub static STEALTH_INTELLIGENT_REASON_LOSS: Counter = Counter::new();
+/// Intelligent escalations triggered by jitter.
 pub static STEALTH_INTELLIGENT_REASON_JITTER: Counter = Counter::new();
+/// Intelligent escalations triggered by connection timeout.
 pub static STEALTH_INTELLIGENT_REASON_TIMEOUT: Counter = Counter::new();
+/// Intelligent escalations triggered by retransmission spike.
 pub static STEALTH_INTELLIGENT_REASON_RETRANSMIT: Counter = Counter::new();
+/// Intelligent escalations triggered by probe detection.
 pub static STEALTH_INTELLIGENT_REASON_PROBE: Counter = Counter::new();
+/// Total Intelligent-mode de-escalations (back to lower stealth).
 pub static STEALTH_INTELLIGENT_DEESCALATIONS_TOTAL: Counter = Counter::new();
+/// ASCII validation bytes processed via AVX2 SIMD.
 pub static STEALTH_ASCII_SIMD_AVX2_BYTES: Counter = Counter::new();
+/// ASCII validation bytes processed via SSE2 SIMD.
 pub static STEALTH_ASCII_SIMD_SSE2_BYTES: Counter = Counter::new();
+/// ASCII validation bytes processed via NEON SIMD.
 pub static STEALTH_ASCII_SIMD_NEON_BYTES: Counter = Counter::new();
+/// ASCII validation bytes processed via scalar fallback.
 pub static STEALTH_ASCII_SCALAR_BYTES: Counter = Counter::new();
+/// Admin API requests rejected due to CSRF token mismatch.
 pub static ADMIN_CSRF_REJECT_TOTAL: Counter = Counter::new();
+/// Admin API requests rejected due to origin header mismatch.
 pub static ADMIN_ORIGIN_REJECT_TOTAL: Counter = Counter::new();
-pub static QKEY_AUTH_FAIL_TOTAL: Counter = Counter::new();
+/// QKey path rebind events (client address change).
 pub static QKEY_PATH_REBIND_TOTAL: Counter = Counter::new();
+/// Engine handshake timeouts.
 pub static ENGINE_HANDSHAKE_TIMEOUT_TOTAL: Counter = Counter::new();
+/// Total packets sent via XDP fast path.
 pub static XDP_PACKETS_SENT: Counter = Counter::new();
+/// Total packets received via XDP fast path.
 pub static XDP_PACKETS_RECEIVED: Counter = Counter::new();
 
+/// Refresh the `MEMORY_USAGE_BYTES` gauge from the OS process stats.
 pub fn update_memory_usage() {
     use sysinfo::ProcessesToUpdate;
     let mut sys = sysinfo::System::new_all();
@@ -1087,6 +1381,7 @@ pub fn update_memory_usage() {
     }
 }
 
+/// Flush telemetry: refresh memory usage and pool metrics if telemetry is enabled.
 pub fn flush() {
     if TELEMETRY_ENABLED.load(Ordering::Relaxed) {
         update_memory_usage();
@@ -1095,8 +1390,7 @@ pub fn flush() {
     }
 }
 
-// TELEMETRY_ENABLED flag for compatibility
-use std::sync::atomic::AtomicBool;
+/// Global flag controlling whether telemetry collection is active.
 pub static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[macro_export]
@@ -1186,5 +1480,144 @@ mod tests {
         assert!(out.contains("quicfuscate_server_push_trigger_loss_total 2"));
         assert!(out.contains("quicfuscate_server_push_trigger_time_total 4"));
         assert!(out.contains("quicfuscate_server_push_trigger_gating_total 1"));
+    }
+
+    #[test]
+    fn io_uring_counters_exported_in_telemetry_text() {
+        let calls_before = IO_URING_SUBMIT_CALLS.get();
+        let packets_before = IO_URING_SUBMIT_PACKETS.get();
+        let fallbacks_before = IO_URING_FALLBACKS.get();
+
+        IO_URING_SUBMIT_CALLS.inc();
+        IO_URING_SUBMIT_PACKETS.inc_by(42);
+        IO_URING_FALLBACKS.inc();
+
+        let out = export_telemetry_text();
+        assert!(
+            out.contains(&format!("quicfuscate_io_uring_submit_calls_total {}", calls_before + 1))
+        );
+        assert!(out.contains(&format!(
+            "quicfuscate_io_uring_submit_packets_total {}",
+            packets_before + 42
+        )));
+        assert!(
+            out.contains(&format!("quicfuscate_io_uring_fallbacks_total {}", fallbacks_before + 1))
+        );
+    }
+
+    #[test]
+    fn crypto_backend_selection_metrics_exported_in_telemetry_text() {
+        let plan_x4_before = PLAN_DECISIONS_X4.get();
+        let plan_x8_before = PLAN_DECISIONS_X8.get();
+        let aegis_l_before = DATA_AEAD_BACKEND_AEGIS_L_TOTAL.get();
+        let aegis_x4_before = DATA_AEAD_BACKEND_AEGIS_X4_TOTAL.get();
+        let aegis_x8_before = DATA_AEAD_BACKEND_AEGIS_X8_TOTAL.get();
+        let morus_before = DATA_AEAD_BACKEND_MORUS_TOTAL.get();
+
+        PLAN_DECISIONS_X4.inc();
+        PLAN_DECISIONS_X8.inc();
+        DATA_AEAD_BACKEND_AEGIS_L_TOTAL.inc();
+        DATA_AEAD_BACKEND_AEGIS_X4_TOTAL.inc();
+        DATA_AEAD_BACKEND_AEGIS_X8_TOTAL.inc();
+        DATA_AEAD_BACKEND_MORUS_TOTAL.inc();
+
+        let out = export_telemetry_text();
+        assert!(out.contains(&format!("quicfuscate_plan_select_x4_total {}", plan_x4_before + 1)));
+        assert!(out.contains(&format!("quicfuscate_plan_select_x8_total {}", plan_x8_before + 1)));
+        assert!(out.contains(&format!(
+            "quicfuscate_data_aead_backend_aegis_l_total {}",
+            aegis_l_before + 1
+        )));
+        assert!(out.contains(&format!(
+            "quicfuscate_data_aead_backend_aegis_x4_total {}",
+            aegis_x4_before + 1
+        )));
+        assert!(out.contains(&format!(
+            "quicfuscate_data_aead_backend_aegis_x8_total {}",
+            aegis_x8_before + 1
+        )));
+        assert!(out
+            .contains(&format!("quicfuscate_data_aead_backend_morus_total {}", morus_before + 1)));
+    }
+
+    #[test]
+    fn test_cpu_profile_mask_arm_profiles_nonzero() {
+        let arm_profiles = [
+            CpuProfile::ARM_A0,
+            CpuProfile::ARM_A1a,
+            CpuProfile::ARM_A1b,
+            CpuProfile::ARM_A1c,
+            CpuProfile::ARM_A1d,
+            CpuProfile::ARM_A2,
+            CpuProfile::Apple_M,
+        ];
+        for profile in arm_profiles {
+            let mask = cpu_profile_mask(profile);
+            assert_ne!(mask, 0, "ARM profile {:?} must produce a non-zero mask", profile);
+            // All ARM profiles must include NEON at minimum
+            assert_ne!(mask & CPU_MASK_NEON, 0, "ARM profile {:?} must include NEON", profile);
+        }
+    }
+
+    #[test]
+    fn test_cpu_profile_mask_scalar_and_rv() {
+        let scalar_mask = cpu_profile_mask(CpuProfile::Scalar);
+        assert_ne!(scalar_mask, 0, "Scalar profile must produce a non-zero mask");
+        assert_ne!(scalar_mask & CPU_MASK_SCALAR, 0, "Scalar profile must set SCALAR bit");
+        // Scalar must NOT set any SIMD bits
+        assert_eq!(scalar_mask & CPU_MASK_AVX2, 0, "Scalar must not have AVX2");
+        assert_eq!(scalar_mask & CPU_MASK_NEON, 0, "Scalar must not have NEON");
+
+        let rvv_mask = cpu_profile_mask(CpuProfile::RVV);
+        assert_ne!(rvv_mask, 0, "RVV profile must produce a non-zero mask");
+        assert_ne!(rvv_mask & CPU_MASK_RVV, 0, "RVV profile must set RVV bit");
+        // RVV must NOT set x86 or ARM bits
+        assert_eq!(rvv_mask & CPU_MASK_AVX2, 0, "RVV must not have AVX2");
+        assert_eq!(rvv_mask & CPU_MASK_NEON, 0, "RVV must not have NEON");
+    }
+
+    #[test]
+    fn test_publish_cpu_profile_mask_idempotent() {
+        let first = publish_cpu_profile_mask(CpuProfile::X86_P3e);
+        let second = publish_cpu_profile_mask(CpuProfile::X86_P3e);
+        assert_eq!(first, second, "same profile must produce identical mask");
+        assert_eq!(
+            CPU_FEATURE_MASK.load(Ordering::Relaxed),
+            first,
+            "gauge must reflect the published value"
+        );
+    }
+
+    #[test]
+    fn test_export_telemetry_text_returns_string() {
+        let text = export_telemetry_text();
+        assert!(!text.is_empty(), "telemetry text must not be empty");
+        // Must contain at least one metric line
+        assert!(text.contains("quicfuscate_"), "output must contain metric lines");
+    }
+
+    #[test]
+    fn test_export_telemetry_text_contains_header_line() {
+        let text = export_telemetry_text();
+        // The very first line should be the xdp_active gauge
+        let first_line = text.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("quicfuscate_xdp_active "),
+            "first line must start with 'quicfuscate_xdp_active ', got: {}",
+            first_line
+        );
+        // Every non-empty line must follow the "metric_name value" format
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(
+                line.starts_with("quicfuscate_"),
+                "each metric line must start with 'quicfuscate_', got: {}",
+                line
+            );
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            assert_eq!(parts.len(), 2, "metric line must have 'name value' format: {}", line);
+        }
     }
 }

@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .verify_peer(false) // Disable for local testing
         .stealth_mode(StealthMode::Auto)
         .aead_preference(quicfuscate::engine::AeadPreference::Auto)
-        .cc_algorithm(quicfuscate::engine::CcAlgorithm::Cubic)
+        .cc_algorithm(quicfuscate::engine::CcAlgorithm::Bbr3)
         .build()?;
 
     println!("   Mode: {:?}", config.engine.mode);
@@ -103,8 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n5. Runtime control examples...");
 
     // Change stealth mode
-    println!("   Setting stealth mode to Max...");
-    engine.set_stealth_mode(StealthMode::Max)?;
+    println!("   Setting stealth mode to AntiDpi...");
+    engine.set_stealth_mode(StealthMode::AntiDpi)?;
     println!("   Stealth mode: {:?}", engine.stealth_mode());
 
     // Enable traffic padding

@@ -62,7 +62,7 @@ while IFS= read -r f; do
   rel="${f#$PROJECT_ROOT/}"
   base="$(basename "$f")"
   is_lib=0
-  [[ "$rel" == "scripts/tests/lib/lib-common.sh" || "$rel" == "scripts/lib/lib-common.sh" ]] && is_lib=1
+  [[ "$rel" == "scripts/tests/lib/lib-common.sh" ]] && is_lib=1
 
   head1="$(head -n 1 "$f" 2>/dev/null || true)"
   if [[ ! "$head1" =~ ^#! ]]; then

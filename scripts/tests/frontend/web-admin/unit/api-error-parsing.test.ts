@@ -1,6 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 
-import { parseErrorMessageBody, sanitizeErrorMessage, ApiError } from "../../../../../apps/web-admin-ui/src/api";
+import {
+  ApiError,
+  parseErrorMessageBody,
+  sanitizeErrorMessage,
+} from "../../../../../apps/svelte-admin/src/lib/api";
 
 describe("parseErrorMessageBody", () => {
   test("returns null for empty input", () => {
@@ -27,8 +31,8 @@ describe("parseErrorMessageBody", () => {
     const long = "x".repeat(260);
     const out = parseErrorMessageBody(long);
     expect(out).not.toBeNull();
-    expect(out!.length).toBe(243);
-    expect(out!.endsWith("...")).toBe(true);
+    expect(out?.length).toBe(243);
+    expect(out?.endsWith("...")).toBe(true);
   });
 });
 

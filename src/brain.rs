@@ -1,12 +1,19 @@
 // QuicFuscate Brain (single-file, removable feature)
 
-#[allow(unused_imports)]
-use log::{info, trace};
+#[cfg(any(test, feature = "rust-tests", feature = "orchestrator"))]
+use log::info;
+use log::trace;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(any(test, feature = "rust-tests"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(any(test, feature = "rust-tests", feature = "orchestrator"))]
+use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use crate::env_utils::env_parse;
 
 use crate::accelerate::brain as brain_accel;
 use crate::fec::KalmanFilter;
@@ -15,29 +22,21 @@ use crate::transport::{Connection, TransportObserver};
 // ===== Global Hints (optional) =================================================
 // Transport can consult these atomics to adapt FEC and timing without creating
 // hard dependencies on Brain internals.
-pub(crate) static FEC_INTERVAL_HINT_PKTS: AtomicU64 = AtomicU64::new(0); // 0 => no hint
-pub(crate) static FEC_REDUNDANCY_PPM: AtomicU32 = AtomicU32::new(0); // parts-per-million; 0 => no hint
-static TIMING_JITTER_HINT_US: AtomicU32 = AtomicU32::new(0); // 0 => no hint
-pub(crate) static INTELLIGENT_STEALTH_LEVEL_HINT: AtomicU32 = AtomicU32::new(0); // 0=perf,1=stealth,2=anti-dpi
+/// Brain-suggested FEC interval in packets (0 = no hint from brain).
+pub(crate) static FEC_INTERVAL_HINT_PKTS: AtomicU64 = AtomicU64::new(0);
+/// Brain-suggested FEC redundancy in parts-per-million (0 = no hint).
+pub(crate) static FEC_REDUNDANCY_PPM: AtomicU32 = AtomicU32::new(0);
+/// Intelligent stealth level: 0 = performance, 1 = stealth, 2 = anti-dpi.
+pub(crate) static INTELLIGENT_STEALTH_LEVEL_HINT: AtomicU32 = AtomicU32::new(0);
 
-/// Returns a base interval in packets for streaming FEC repairs, if the brain
-/// emitted a current hint. 0 means no hint.
-pub fn fec_interval_hint() -> Option<u64> {
-    let v = FEC_INTERVAL_HINT_PKTS.load(Ordering::Relaxed);
-    if v == 0 {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-// Thin aggregator to forward TransportObserver calls to multiple observers
-pub struct CombinedObserver {
+/// Thin aggregator that forwards `TransportObserver` calls to multiple observers.
+pub(crate) struct CombinedObserver {
     observers: Vec<Arc<dyn crate::transport::TransportObserver>>,
 }
 
 impl CombinedObserver {
-    pub fn new(observers: Vec<Arc<dyn crate::transport::TransportObserver>>) -> Arc<Self> {
+    /// Wraps the given observers into a single `Arc<CombinedObserver>`.
+    pub(crate) fn new(observers: Vec<Arc<dyn crate::transport::TransportObserver>>) -> Arc<Self> {
         Arc::new(Self { observers })
     }
 }
@@ -65,24 +64,17 @@ impl crate::transport::TransportObserver for CombinedObserver {
     }
 }
 
-/// Returns a suggested timing jitter in microseconds, if any.
-pub fn timing_jitter_hint_us() -> Option<u32> {
-    let v = TIMING_JITTER_HINT_US.load(Ordering::Relaxed);
-    if v == 0 {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// Set timing jitter hint for stealth mode
-pub fn set_timing_jitter_hint_us(jitter_us: u32) {
-    TIMING_JITTER_HINT_US.store(jitter_us, Ordering::Relaxed);
-}
-
 /// Returns Intelligent mode level hint: 0=performance baseline, 1=stealth, 2=anti-dpi.
-pub fn intelligent_stealth_level_hint() -> u32 {
+pub(crate) fn intelligent_stealth_level_hint() -> u32 {
     INTELLIGENT_STEALTH_LEVEL_HINT.load(Ordering::Relaxed)
+}
+
+/// Resets all global brain hint atomics to zero (test-only).
+#[cfg(test)]
+pub(crate) fn clear_runtime_hints_for_test() {
+    FEC_INTERVAL_HINT_PKTS.store(0, Ordering::Relaxed);
+    FEC_REDUNDANCY_PPM.store(0, Ordering::Relaxed);
+    INTELLIGENT_STEALTH_LEVEL_HINT.store(0, Ordering::Relaxed);
 }
 
 #[inline]
@@ -91,27 +83,32 @@ fn elapsed_since(instant: Instant) -> Duration {
 }
 
 // ===== Config =================================================================
+/// Configuration for the sensor-fusion stealth brain that drives adaptive transport tuning.
 #[derive(Clone, Debug)]
 pub struct StealthBrainConfig {
-    // ACK policy bounds
+    /// Minimum ACK-eliciting threshold the brain may choose.
     pub ack_min: u64,
+    /// Maximum ACK-eliciting threshold the brain may choose.
     pub ack_max: u64,
-    // Jitter bounds for stealth timing (Brain only hints; transport decides)
+    /// Upper bound for jitter hints in microseconds (transport decides actual delay).
     pub jitter_max_us: u32,
-    // Histogram configuration
+    /// Number of bins for the packet-size histogram.
     pub size_bins: usize,
+    /// Number of bins for the inter-arrival-time histogram.
     pub iat_bins: usize,
-    // DPI probe budget (extremely conservative)
+    /// Maximum DPI probes the brain may emit per minute.
     pub probe_max_per_min: u32,
+    /// Minimum milliseconds between successive probe emissions.
     pub probe_cooldown_ms: u64,
-    // Policy cooldown between actuator changes
+    /// Minimum milliseconds between successive policy actuator changes.
     pub policy_cooldown_ms: u64,
-    // Exploration probability (0.0..1.0)
+    /// Epsilon-greedy exploration probability (0.0 - 1.0).
     pub explore_prob: f32,
-    // Histogram exponential decay per apply (0.8..1.0)
+    /// Exponential decay factor applied to histograms each policy tick (0.8 - 1.0).
     pub hist_decay: f32,
-    // Padding dynamic budgets
+    /// Lower padding budget bound (bytes) for low-pressure scenarios.
     pub pad_max_low: usize,
+    /// Upper padding budget bound (bytes) for high-pressure scenarios.
     pub pad_max_high: usize,
 }
 
@@ -120,7 +117,7 @@ impl Default for StealthBrainConfig {
         Self {
             ack_min: 1,
             ack_max: 12,
-            jitter_max_us: 1500,
+            jitter_max_us: 5000,
             size_bins: 16,
             iat_bins: 16,
             probe_max_per_min: 2,
@@ -135,40 +132,41 @@ impl Default for StealthBrainConfig {
 }
 
 impl StealthBrainConfig {
+    /// Constructs a config by reading environment variable overrides on top of defaults.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_ACK_MAX") {
-            cfg.ack_max = v.parse().unwrap_or(cfg.ack_max);
+        if let Some(v) = env_parse("QUICFUSCATE_BRAIN_ACK_MAX") {
+            cfg.ack_max = v;
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_JITTER_MAX_US") {
-            cfg.jitter_max_us = v.parse().unwrap_or(cfg.jitter_max_us);
+        if let Some(v) = env_parse("QUICFUSCATE_BRAIN_JITTER_MAX_US") {
+            cfg.jitter_max_us = v;
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_SIZE_BINS") {
-            cfg.size_bins = v.parse().unwrap_or(cfg.size_bins).clamp(8, 64);
+        if let Some(v) = env_parse::<usize>("QUICFUSCATE_BRAIN_SIZE_BINS") {
+            cfg.size_bins = v.clamp(8, 64);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_IAT_BINS") {
-            cfg.iat_bins = v.parse().unwrap_or(cfg.iat_bins).clamp(8, 64);
+        if let Some(v) = env_parse::<usize>("QUICFUSCATE_BRAIN_IAT_BINS") {
+            cfg.iat_bins = v.clamp(8, 64);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_PROBE_MAX_PER_MIN") {
-            cfg.probe_max_per_min = v.parse().unwrap_or(cfg.probe_max_per_min).min(30);
+        if let Some(v) = env_parse::<u32>("QUICFUSCATE_BRAIN_PROBE_MAX_PER_MIN") {
+            cfg.probe_max_per_min = v.min(30);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_PROBE_COOLDOWN_MS") {
-            cfg.probe_cooldown_ms = v.parse().unwrap_or(cfg.probe_cooldown_ms);
+        if let Some(v) = env_parse("QUICFUSCATE_BRAIN_PROBE_COOLDOWN_MS") {
+            cfg.probe_cooldown_ms = v;
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_POLICY_COOLDOWN_MS") {
-            cfg.policy_cooldown_ms = v.parse().unwrap_or(cfg.policy_cooldown_ms);
+        if let Some(v) = env_parse("QUICFUSCATE_BRAIN_POLICY_COOLDOWN_MS") {
+            cfg.policy_cooldown_ms = v;
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_EXPLORE") {
-            cfg.explore_prob = v.parse().unwrap_or(cfg.explore_prob).clamp(0.0, 0.25);
+        if let Some(v) = env_parse::<f32>("QUICFUSCATE_BRAIN_EXPLORE") {
+            cfg.explore_prob = v.clamp(0.0, 0.25);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_HIST_DECAY") {
-            cfg.hist_decay = v.parse().unwrap_or(cfg.hist_decay).clamp(0.80, 0.999);
+        if let Some(v) = env_parse::<f32>("QUICFUSCATE_BRAIN_HIST_DECAY") {
+            cfg.hist_decay = v.clamp(0.80, 0.999);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_PAD_MAX_LOW") {
-            cfg.pad_max_low = v.parse().unwrap_or(cfg.pad_max_low).clamp(16, 512);
+        if let Some(v) = env_parse::<usize>("QUICFUSCATE_BRAIN_PAD_MAX_LOW") {
+            cfg.pad_max_low = v.clamp(16, 512);
         }
-        if let Ok(v) = std::env::var("QUICFUSCATE_BRAIN_PAD_MAX_HIGH") {
-            cfg.pad_max_high = v.parse().unwrap_or(cfg.pad_max_high).max(cfg.pad_max_low).min(2048);
+        if let Some(v) = env_parse::<usize>("QUICFUSCATE_BRAIN_PAD_MAX_HIGH") {
+            cfg.pad_max_high = v.max(cfg.pad_max_low).min(2048);
         }
         cfg
     }
@@ -222,15 +220,20 @@ struct StealthBrainState {
     last_probe: Instant,
     // Cooldown
     last_policy_change: Instant,
-    // MASQUE hint state (hysteresis)
+    // Compatibility-only MASQUE hint state (hysteresis)
     last_masque_hint: bool,
     last_masque_hint_change: Instant,
     // Last applied decisions to avoid oscillation & redundant calls
     last_ack_thr: u64,
     last_pacing: bool,
+    last_timing_enabled: bool,
     last_jitter_hint: u32,
     last_bias: u8,
     last_gran: u16,
+    last_padding_enabled: bool,
+    last_padding_strategy: u8,
+    last_padding_max: usize,
+    last_cc_profile: crate::transport::recovery::BrowserProfile,
     // ECN deltas and trends
     prev_ect0: u64,
     prev_ect1: u64,
@@ -277,9 +280,14 @@ impl StealthBrainState {
             last_masque_hint_change: crate::time_source::now_instant(),
             last_ack_thr: 0,
             last_pacing: false,
+            last_timing_enabled: false,
             last_jitter_hint: 0,
             last_bias: 0,
             last_gran: 0,
+            last_padding_enabled: false,
+            last_padding_strategy: 0,
+            last_padding_max: 0,
+            last_cc_profile: crate::transport::recovery::BrowserProfile::Chrome,
             prev_ect0: 0,
             prev_ect1: 0,
             prev_ce: 0,
@@ -375,38 +383,100 @@ fn apply_intelligent_level_hysteresis(
     }
 }
 
+#[cfg(any(test, feature = "rust-tests", feature = "orchestrator"))]
+fn should_trigger_server_push_internal(
+    enabled: bool,
+    loss_rate_permille: u32,
+    stealth_active: bool,
+    cpu_usage_percent: u32,
+    memory_pressure: u32,
+    bandwidth_bps: u64,
+    last_trigger: &Mutex<Instant>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    let loss_rate = loss_rate_permille as f32 / 1000.0;
+    let bw_mbps = bandwidth_bps as f32 / 1_000_000.0;
+    let high_loss = loss_rate > 0.05;
+    let time_based = if let Ok(last_trigger) = last_trigger.lock() {
+        elapsed_since(*last_trigger) > Duration::from_secs(30)
+    } else {
+        false
+    };
+    let cpu_ok = cpu_usage_percent < 85;
+    let mem_ok = memory_pressure < 85;
+    let bw_ok = bw_mbps > 5.0 || high_loss;
+    let should_trigger = (high_loss || (stealth_active && time_based)) && cpu_ok && mem_ok && bw_ok;
+    if should_trigger {
+        if let Ok(mut last_trigger) = last_trigger.lock() {
+            *last_trigger = crate::time_source::now_instant();
+        }
+    }
+    should_trigger
+}
+
+#[cfg(any(test, feature = "rust-tests", feature = "orchestrator"))]
+fn server_push_intensity_internal(loss_rate_permille: u32, bandwidth_bps: u64) -> f32 {
+    let loss_rate = loss_rate_permille as f32 / 1000.0;
+    let bandwidth_mbps = bandwidth_bps as f32 / 1_000_000.0;
+    let loss_factor = (loss_rate * 10.0).min(1.0);
+    let bandwidth_factor = (bandwidth_mbps / 100.0).min(1.0);
+    (0.3 + loss_factor * 0.4 + bandwidth_factor * 0.3).min(1.0)
+}
+
 // ===== Brain ==================================================================
+/// Sensor-fusion engine that observes transport signals and emits stealth policy deltas.
+///
+/// Consumes ACK delays, ECN counters, packet sizes, and inter-arrival times to
+/// adaptively tune FEC redundancy, ACK thresholds, padding, timing, and congestion
+/// control profiles via the `TransportObserver` trait.
 pub struct StealthBrain {
     cfg: StealthBrainConfig,
     st: RwLock<StealthBrainState>,
     // Server Push cover-traffic knobs and telemetry inputs
+    #[cfg(any(test, feature = "rust-tests"))]
     server_push_enabled: AtomicBool,
+    #[cfg(any(test, feature = "rust-tests"))]
     server_push_last_trigger: Mutex<Instant>,
+    #[cfg(any(test, feature = "rust-tests"))]
     stealth_active: AtomicBool,
-    loss_rate: AtomicU32,         // 0..1000 => 0.0%..100.0% in 0.1% units
+    loss_rate: AtomicU32, // 0..1000 => 0.0%..100.0% in 0.1% units
+    #[cfg(any(test, feature = "rust-tests"))]
     cpu_usage_percent: AtomicU32, // 0..100
-    memory_pressure: AtomicU32,   // 0..100
-    bandwidth_bps: AtomicU64,     // measured/estimated outbound bandwidth
+    #[cfg(any(test, feature = "rust-tests"))]
+    memory_pressure: AtomicU32, // 0..100
+    #[cfg(any(test, feature = "rust-tests"))]
+    bandwidth_bps: AtomicU64, // measured/estimated outbound bandwidth
 }
 
 impl StealthBrain {
+    /// Creates a new brain instance with the given config, seeding global FEC hints.
     pub fn new(cfg: StealthBrainConfig) -> Arc<Self> {
         let brain = Arc::new(Self {
             st: RwLock::new(StealthBrainState::new(&cfg)),
             cfg,
+            #[cfg(any(test, feature = "rust-tests"))]
             server_push_enabled: AtomicBool::new(false),
+            #[cfg(any(test, feature = "rust-tests"))]
             server_push_last_trigger: Mutex::new(crate::time_source::now_instant()),
+            #[cfg(any(test, feature = "rust-tests"))]
             stealth_active: AtomicBool::new(false),
             loss_rate: AtomicU32::new(0),
+            #[cfg(any(test, feature = "rust-tests"))]
             cpu_usage_percent: AtomicU32::new(0),
+            #[cfg(any(test, feature = "rust-tests"))]
             memory_pressure: AtomicU32::new(0),
+            #[cfg(any(test, feature = "rust-tests"))]
             bandwidth_bps: AtomicU64::new(0),
         });
         FEC_INTERVAL_HINT_PKTS.store(8, Ordering::Relaxed);
         FEC_REDUNDANCY_PPM.store(100_000, Ordering::Relaxed);
         brain
     }
-    pub fn new_default() -> Arc<Self> {
+    /// Creates a brain with environment-derived defaults.
+    pub(crate) fn new_default() -> Arc<Self> {
         Self::new(StealthBrainConfig::from_env())
     }
 
@@ -718,18 +788,8 @@ impl TransportObserver for StealthBrain {
             thr = thr.clamp(2, 4);
         }
         thr = thr.clamp(self.cfg.ack_min, self.cfg.ack_max);
-        // External pacing: enable on clean paths to smooth bursts, disable on high CE
-        let pacing = ce_ratio_recent < 0.01 && ack_us < 8_000.0 && rtt_spike_weight == 0.0;
-        // Timing jitter hint (transport may consult; brain keeps it bounded)
-        let jitter_hint = if pacing {
-            (self.cfg.jitter_max_us as f64 * 0.6) as u32
-        } else if ce_ratio_recent > 0.05 || rtt_spike_weight >= 4.0 {
-            (self.cfg.jitter_max_us as f64 * 0.2) as u32
-        } else {
-            (self.cfg.jitter_max_us as f64 * 0.4) as u32
-        };
-
-        // Brain-level MASQUE preference (central, hysteresis): prefer MASQUE when path looks hostile
+        // Compatibility-only MASQUE hint channel: expose hostile-path pressure
+        // without coupling it to the canonical Intelligent runtime.
         let prefer_masque_brain = ce_ratio_recent > 0.03
             || rtt_spike_weight >= 2.0
             || signal_rst > 0
@@ -764,7 +824,7 @@ impl TransportObserver for StealthBrain {
             } else {
                 0u8
             };
-        // Cooldown 800ms to avoid flapping
+        // Cooldown 800ms to avoid flapping for the compatibility hint channel.
         let prefer_masque_effective = {
             let now = crate::time_source::now_instant();
             let mut st = self.st.write();
@@ -802,13 +862,33 @@ impl TransportObserver for StealthBrain {
                 st.last_masque_hint = prefer_masque_brain;
                 st.last_masque_hint_change = now;
             }
-            st.last_masque_hint || effective_level >= 1
+            st.last_masque_hint
         };
-        // Export hint gauge for StealthManager to follow
+        // Export compatibility hint gauge for StealthManager to follow when the
+        // experimental MASQUE surface was explicitly enabled.
         crate::optimize::telemetry::MASQUE_HINT
             .store(if prefer_masque_effective { 1 } else { 0 }, Ordering::Relaxed);
 
         // Mirror FEC actuators to the transport/FEC observers via atomics.
+
+        // Read back the level that was just stored so we can pass it to policy derivation.
+        let current_level = INTELLIGENT_STEALTH_LEVEL_HINT.load(Ordering::Relaxed) as u8;
+        let mut stealth_policy = crate::stealth::StealthManager::derive_intelligent_runtime_policy(
+            crate::stealth::IntelligentStealthInputs {
+                level_hint: current_level,
+                ce_ratio_recent,
+                ack_us,
+                size_div,
+                iat_div,
+                reorder_ratio,
+                rtt_spike_weight,
+                signal_tos,
+                signal_other,
+                jitter_max_us: self.cfg.jitter_max_us,
+                pad_max_low: self.cfg.pad_max_low,
+                pad_max_high: self.cfg.pad_max_high,
+            },
+        );
 
         // Jitter dithering (+/-10%) to avoid crisp patterns
         let ts = crate::time_source::now_system()
@@ -816,8 +896,9 @@ impl TransportObserver for StealthBrain {
             .unwrap_or(Duration::from_secs(0))
             .subsec_nanos() as u64;
         let dither_pct = ((ts >> 7) % 21) as i64 - 10; // -10..+10
-        let jitter_hint =
-            ((jitter_hint as i64) + ((jitter_hint as i64 * dither_pct) / 100)).max(0) as u32;
+        stealth_policy.timing_max_jitter_us = ((stealth_policy.timing_max_jitter_us as i64)
+            + ((stealth_policy.timing_max_jitter_us as i64 * dither_pct) / 100))
+            .max(0) as u32;
 
         // Throughput-aware ACK threshold bandit (epsilon-greedy)
         let dr_now = conn.delivery_rate();
@@ -884,7 +965,7 @@ impl TransportObserver for StealthBrain {
         }
 
         // Decide whether to apply based on last state and cooldown
-        let (do_ack, do_pacing, do_jitter, do_bias, do_gran, do_cc);
+        let (do_ack, do_pacing, do_timing, do_bias, do_gran, do_cc, do_padding);
         // Smooth target ACK threshold towards last value by stepping one unit per policy tick.
         // Initialize local working copy from current heuristic target.
         let mut thr_local = thr;
@@ -920,103 +1001,97 @@ impl TransportObserver for StealthBrain {
             }
             thr = thr_local;
             // pacing
-            do_pacing = cooldown && (st.last_pacing != pacing);
+            do_pacing = cooldown && (st.last_pacing != stealth_policy.external_pacing);
             if do_pacing {
-                st.last_pacing = pacing;
+                st.last_pacing = stealth_policy.external_pacing;
                 touch_change_stamp = true;
             }
-            // jitter (apply if changed by >20% or 0<->nonzero)
+            // timing (enabled/jitter) applies if the enable flag changes or the bounded hint
+            // moved materially.
             let j_old = st.last_jitter_hint;
-            let j_diff = if j_old == 0 || jitter_hint == 0 {
-                j_old as i64 - jitter_hint as i64
+            let j_new = stealth_policy.timing_max_jitter_us;
+            let j_diff = if j_old == 0 || j_new == 0 {
+                j_old as i64 - j_new as i64
             } else {
-                (j_old as i64 - jitter_hint as i64).abs()
+                (j_old as i64 - j_new as i64).abs()
             };
             let j_rel = if j_old > 0 { (j_diff.abs() as f64) / (j_old as f64) } else { 1.0 };
-            do_jitter = cooldown && (j_old == 0 || jitter_hint == 0 || j_rel > 0.2);
-            if do_jitter {
-                st.last_jitter_hint = jitter_hint;
+            do_timing = cooldown
+                && (st.last_timing_enabled != stealth_policy.timing_enabled
+                    || j_old == 0
+                    || j_new == 0
+                    || j_rel > 0.2);
+            if do_timing {
+                st.last_timing_enabled = stealth_policy.timing_enabled;
+                st.last_jitter_hint = j_new;
                 touch_change_stamp = true;
             }
-            let bias_calc: u8 = if ce_ratio_recent > 0.05 || iat_div > 1.0 || signal_other > 0 {
-                1
-            } else if size_div > 1.0 {
-                2
-            } else if ack_us < 3_000.0 {
-                4
-            } else {
-                3
-            };
-            let gran_calc: u16 = if ce_ratio_recent > 0.10 || signal_other > 0 {
-                32
-            } else if ce_ratio_recent < 0.001 {
-                128
-            } else {
-                64
-            };
-            do_bias = cooldown && (st.last_bias != bias_calc);
-            do_gran = cooldown && (st.last_gran != gran_calc);
+            do_bias = cooldown && (st.last_bias != stealth_policy.mimic_bias);
+            do_gran = cooldown && (st.last_gran != stealth_policy.adaptive_granularity);
             if do_bias {
-                st.last_bias = bias_calc;
+                st.last_bias = stealth_policy.mimic_bias;
                 touch_change_stamp = true;
             }
             if do_gran {
-                st.last_gran = gran_calc;
+                st.last_gran = stealth_policy.adaptive_granularity;
                 touch_change_stamp = true;
             }
-            bias = bias_calc;
-            gran = gran_calc;
-            // cc profile aligns to bias
-            do_cc = do_bias; // change CC only when bias changes
+            bias = stealth_policy.mimic_bias;
+            gran = stealth_policy.adaptive_granularity;
+            do_cc = cooldown && (st.last_cc_profile != stealth_policy.cc_profile);
+            if do_cc {
+                st.last_cc_profile = stealth_policy.cc_profile;
+                touch_change_stamp = true;
+            }
+            do_padding = cooldown
+                && (st.last_padding_enabled != stealth_policy.padding_enabled
+                    || st.last_padding_strategy != stealth_policy.padding_strategy
+                    || st.last_padding_max != stealth_policy.padding_max);
+            if do_padding {
+                st.last_padding_enabled = stealth_policy.padding_enabled;
+                st.last_padding_strategy = stealth_policy.padding_strategy;
+                st.last_padding_max = stealth_policy.padding_max;
+                touch_change_stamp = true;
+            }
             if touch_change_stamp {
                 st.last_policy_change = crate::time_source::now_instant();
             }
         }
 
-        // Apply outside of lock
-        if do_ack {
+        let intelligent_runtime = conn.intelligent_stealth_runtime_enabled();
+        let permissions = conn.brain_runtime_permissions();
+        let mut stealth_delta = crate::transport::StealthRuntimeDelta::default();
+
+        if permissions.ack_threshold && do_ack {
             conn.set_ack_eliciting_threshold(thr);
         }
-        if do_pacing {
-            conn.set_external_pacing(pacing);
+        if intelligent_runtime && permissions.external_pacing && do_pacing {
+            stealth_delta.external_pacing = Some(stealth_policy.external_pacing);
         }
-        if do_jitter {
-            TIMING_JITTER_HINT_US.store(jitter_hint, Ordering::Relaxed);
-            if !pacing {
-                conn.set_stealth_timing(true, jitter_hint);
-            } else {
-                conn.set_stealth_timing(false, 0);
-            }
+        if intelligent_runtime && permissions.timing && do_timing {
+            stealth_delta.timing =
+                Some((stealth_policy.timing_enabled, stealth_policy.timing_max_jitter_us));
         }
         // Do not set FEC actuators from the brain anymore.
-        if do_bias {
-            conn.set_stealth_mimic_bias(bias);
+        if intelligent_runtime && permissions.mimic_bias && do_bias {
+            stealth_delta.mimic_bias = Some(stealth_policy.mimic_bias);
         }
-        if do_gran {
-            conn.set_stealth_adaptive_granularity(gran);
+        if intelligent_runtime && permissions.granularity && do_gran {
+            stealth_delta.adaptive_granularity = Some(stealth_policy.adaptive_granularity);
         }
-        if do_cc {
-            let cc_profile = match bias {
-                1 => crate::transport::recovery::BrowserProfile::Safari,
-                2 => crate::transport::recovery::BrowserProfile::Firefox,
-                4 => crate::transport::recovery::BrowserProfile::Edge,
-                _ => crate::transport::recovery::BrowserProfile::Chrome,
-            };
-            conn.set_cc_stealth_profile(true, cc_profile);
+        if intelligent_runtime && permissions.cc_profile && do_cc {
+            stealth_delta.cc_profile = Some(stealth_policy.cc_profile);
         }
-
-        // Dynamic stealth padding strategy and budget
-        // Strategy: mimic (4) on clean paths with good alignment; adaptive (3) under divergence; random (1) under high CE/reorder
-        let tos_anomaly = signal_tos > 0;
-        let (pad_enabled, pad_strategy, pad_max) =
-            if ce_ratio_recent > 0.08 || reorder_ratio > 0.02 || signal_other > 0 {
-                (true, 1u8, self.cfg.pad_max_low) // random small to blur
-            } else if size_div + iat_div > 1.4 || tos_anomaly {
-                (true, 3u8, self.cfg.pad_max_high.min(512)) // adaptive to alignment
-            } else {
-                (true, 4u8, self.cfg.pad_max_low) // browser mimic small caps
-            };
-        conn.set_stealth_padding(pad_enabled, pad_strategy, pad_max);
+        if intelligent_runtime && permissions.padding && do_padding {
+            stealth_delta.padding = Some((
+                stealth_policy.padding_enabled,
+                stealth_policy.padding_strategy,
+                stealth_policy.padding_max,
+            ));
+        }
+        if intelligent_runtime {
+            conn.apply_brain_stealth_runtime_delta(stealth_delta);
+        }
 
         // Epsilon-greedy exploration for ACK threshold and FEC interval (tiny prob)
         if cooldown_ok && self.cfg.explore_prob > 0.0 {
@@ -1029,7 +1104,9 @@ impl TransportObserver for StealthBrain {
                 let alt_thr = (thr as i64 + if (ts & 1) == 0 { 1 } else { -1 })
                     .clamp(self.cfg.ack_min as i64, self.cfg.ack_max as i64)
                     as u64;
-                conn.set_ack_eliciting_threshold(alt_thr);
+                if permissions.ack_threshold {
+                    conn.set_ack_eliciting_threshold(alt_thr);
+                }
             }
         }
 
@@ -1040,18 +1117,20 @@ impl TransportObserver for StealthBrain {
             self.maybe_emit_dpi_probe(&mut st);
         }
 
-        trace!("brain: policy ack_thr={}{} pacing={}{} bias={}{} gran={}{} pad(strat={},max={}) ce_recent={:.3} ack_us(s/l)={:.0}/{:.0} jitter_us~{:.0} reorder={:.3} size_div={:.3} iat_div={:.3}",
+        trace!("brain: policy ack_thr={}{} pacing={}{} bias={}{} gran={}{} pad(strat={},max={}) intelligent_rt={} ce_recent={:.3} ack_us(s/l)={:.0}/{:.0} jitter_us~{:.0} reorder={:.3} size_div={:.3} iat_div={:.3}",
             thr, if do_ack {"*"} else {""},
-            pacing, if do_pacing {"*"} else {""},
+            stealth_policy.external_pacing, if do_pacing {"*"} else {""},
             bias, if do_bias {"*"} else {""},
             gran, if do_gran {"*"} else {""},
-            pad_strategy, pad_max,
+            stealth_policy.padding_strategy, stealth_policy.padding_max,
+            intelligent_runtime,
             ce_ratio_recent, ack_us, ack_us_long, jitter_us, reorder_ratio, size_div, iat_div);
     }
 }
 
 impl StealthBrain {
     /// **NEW**: Enable Server Push Cover Traffic coordination
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn enable_server_push(&self, enabled: bool) {
         self.server_push_enabled.store(enabled, Ordering::Relaxed);
         if enabled {
@@ -1060,42 +1139,20 @@ impl StealthBrain {
     }
 
     /// **NEW**: Check if Server Push should be triggered based on brain heuristics
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn should_trigger_server_push(&self) -> bool {
-        if !self.server_push_enabled.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        // Trigger based on stealth escalation or high loss rate
-        let loss_rate = self.loss_rate.load(Ordering::Relaxed) as f32 / 1000.0;
-        let stealth_active = self.stealth_active.load(Ordering::Relaxed);
-        let cpu = self.cpu_usage_percent.load(Ordering::Relaxed);
-        let mem = self.memory_pressure.load(Ordering::Relaxed);
-        let bw_bps = self.bandwidth_bps.load(Ordering::Relaxed);
-        let bw_mbps = bw_bps as f32 / 1_000_000.0;
-
-        // Trigger conditions:
-        // 1. High loss rate (>5%) - use cover traffic to mask retransmissions
-        // 2. Stealth mode active and sufficient time passed
-        let high_loss = loss_rate > 0.05;
-        let time_based = if let Ok(last_trigger) = self.server_push_last_trigger.lock() {
-            elapsed_since(*last_trigger) > Duration::from_secs(30)
-        } else {
-            false
-        };
-
-        // Resource gating: avoid cover bursts when CPU/memory are under pressure
-        let cpu_ok = cpu < 85; // <85% CPU
-        let mem_ok = mem < 85; // <85% memory pressure
-                               // Bandwidth gating: prefer when we have some headroom
-        let bw_ok = bw_mbps > 5.0 || high_loss; // if high loss, allow even on low bw
-
-        let should_trigger =
-            (high_loss || (stealth_active && time_based)) && cpu_ok && mem_ok && bw_ok;
-
+        let should_trigger = should_trigger_server_push_internal(
+            self.server_push_enabled.load(Ordering::Relaxed),
+            self.loss_rate.load(Ordering::Relaxed),
+            self.stealth_active.load(Ordering::Relaxed),
+            self.cpu_usage_percent.load(Ordering::Relaxed),
+            self.memory_pressure.load(Ordering::Relaxed),
+            self.bandwidth_bps.load(Ordering::Relaxed),
+            &self.server_push_last_trigger,
+        );
         if should_trigger {
-            if let Ok(mut last_trigger) = self.server_push_last_trigger.lock() {
-                *last_trigger = crate::time_source::now_instant();
-            }
+            let loss_rate = self.loss_rate.load(Ordering::Relaxed) as f32 / 1000.0;
+            let stealth_active = self.stealth_active.load(Ordering::Relaxed);
             trace!(
                 "Brain: Triggering Server Push (loss_rate={:.3}, stealth={})",
                 loss_rate,
@@ -1106,18 +1163,13 @@ impl StealthBrain {
         should_trigger
     }
 
-    /// **NEW**: Get recommended Server Push intensity based on network conditions
+    /// Returns recommended server push intensity (0.0 - 1.0) based on loss and bandwidth.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn get_server_push_intensity(&self) -> f32 {
-        let loss_rate = self.loss_rate.load(Ordering::Relaxed) as f32 / 1000.0;
-        let bandwidth_mbps = self.bandwidth_bps.load(Ordering::Relaxed) as f32 / 1_000_000.0;
-
-        // Higher intensity for:
-        // - Higher loss rates (more cover needed)
-        // - Higher bandwidth (can afford more cover traffic)
-        let loss_factor = (loss_rate * 10.0).min(1.0);
-        let bandwidth_factor = (bandwidth_mbps / 100.0).min(1.0);
-
-        (0.3 + loss_factor * 0.4 + bandwidth_factor * 0.3).min(1.0)
+        server_push_intensity_internal(
+            self.loss_rate.load(Ordering::Relaxed),
+            self.bandwidth_bps.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1139,6 +1191,7 @@ pub struct DeepIntegrationOrchestrator {
 
 #[cfg(feature = "orchestrator")]
 impl DeepIntegrationOrchestrator {
+    /// Creates a new orchestrator with the given brain config and pool hints.
     pub fn new(config: StealthBrainConfig, _pool_capacity: usize, _block_size: usize) -> Arc<Self> {
         Arc::new(Self {
             _cfg: config,
@@ -1152,6 +1205,7 @@ impl DeepIntegrationOrchestrator {
         })
     }
 
+    /// Enables or disables server push cover traffic coordination.
     pub fn enable_server_push(&self, enabled: bool) {
         self.server_push_enabled.store(enabled, Ordering::Relaxed);
         if enabled {
@@ -1159,10 +1213,13 @@ impl DeepIntegrationOrchestrator {
         }
     }
 
+    /// Returns whether server push coordination is currently enabled.
+    #[cfg(any(test, feature = "rust-tests"))]
     pub fn server_push_enabled(&self) -> bool {
         self.server_push_enabled.load(Ordering::Relaxed)
     }
 
+    /// Updates runtime telemetry signals used by server push trigger heuristics.
     pub fn update_runtime_signals(
         &self,
         loss_rate_permille: u32,
@@ -1178,46 +1235,25 @@ impl DeepIntegrationOrchestrator {
         self.stealth_active.store(stealth_active, Ordering::Relaxed);
     }
 
+    /// Returns whether server push cover traffic should fire based on current signals.
     pub fn should_trigger_server_push(&self) -> bool {
-        if !self.server_push_enabled.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        let loss_rate = self.loss_rate.load(Ordering::Relaxed) as f32 / 1000.0;
-        let stealth_active = self.stealth_active.load(Ordering::Relaxed);
-        let cpu = self.cpu_usage_percent.load(Ordering::Relaxed);
-        let mem = self.memory_pressure.load(Ordering::Relaxed);
-        let bw_bps = self.bandwidth_bps.load(Ordering::Relaxed);
-        let bw_mbps = bw_bps as f32 / 1_000_000.0;
-
-        let high_loss = loss_rate > 0.05;
-        let time_based = if let Ok(last_trigger) = self.server_push_last_trigger.lock() {
-            elapsed_since(*last_trigger) > Duration::from_secs(30)
-        } else {
-            false
-        };
-
-        let cpu_ok = cpu < 85;
-        let mem_ok = mem < 85;
-        let bw_ok = bw_mbps > 5.0 || high_loss;
-
-        let should_trigger =
-            (high_loss || (stealth_active && time_based)) && cpu_ok && mem_ok && bw_ok;
-        if should_trigger {
-            if let Ok(mut last_trigger) = self.server_push_last_trigger.lock() {
-                *last_trigger = crate::time_source::now_instant();
-            }
-        }
-        should_trigger
+        should_trigger_server_push_internal(
+            self.server_push_enabled.load(Ordering::Relaxed),
+            self.loss_rate.load(Ordering::Relaxed),
+            self.stealth_active.load(Ordering::Relaxed),
+            self.cpu_usage_percent.load(Ordering::Relaxed),
+            self.memory_pressure.load(Ordering::Relaxed),
+            self.bandwidth_bps.load(Ordering::Relaxed),
+            &self.server_push_last_trigger,
+        )
     }
 
+    /// Returns recommended server push intensity (0.0 - 1.0) based on loss and bandwidth.
     pub fn get_server_push_intensity(&self) -> f32 {
-        let loss_rate = self.loss_rate.load(Ordering::Relaxed) as f32 / 1000.0;
-        let bandwidth_mbps = self.bandwidth_bps.load(Ordering::Relaxed) as f32 / 1_000_000.0;
-
-        let loss_factor = (loss_rate * 10.0).min(1.0);
-        let bandwidth_factor = (bandwidth_mbps / 100.0).min(1.0);
-        (0.3 + loss_factor * 0.4 + bandwidth_factor * 0.3).min(1.0)
+        server_push_intensity_internal(
+            self.loss_rate.load(Ordering::Relaxed),
+            self.bandwidth_bps.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1271,6 +1307,10 @@ mod intelligent_hysteresis_tests {
 mod time_source_tests {
     use super::*;
     use crate::time_source::TimeSource;
+    use crate::transport::{
+        BrainRuntimePermissions, Config, Connection, TransportObserver, PROTOCOL_VERSION,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -1305,6 +1345,15 @@ mod time_source_tests {
         }
     }
 
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    fn test_connection(local_port: u16, peer_port: u16) -> Connection {
+        let config = Config::new_with_version(PROTOCOL_VERSION).expect("config");
+        Connection::new_client(&[7; 8], addr(local_port), addr(peer_port), config)
+    }
+
     #[test]
     fn server_push_time_gate_uses_time_source() {
         let base_instant = Instant::now();
@@ -1323,6 +1372,93 @@ mod time_source_tests {
 
         manual.advance(Duration::from_secs(31));
         assert!(brain.should_trigger_server_push());
+    }
+
+    #[test]
+    fn brain_preserves_non_intelligent_preset_stealth_knobs() {
+        let base_instant = Instant::now();
+        let base_system = UNIX_EPOCH + Duration::from_secs(20);
+        let manual = Arc::new(ManualTimeSource::new(base_instant, base_system));
+        let _time_guard = crate::time_source::install_for_test(manual.clone());
+
+        clear_runtime_hints_for_test();
+        let brain = StealthBrain::new(StealthBrainConfig::default());
+        let mut conn = test_connection(4460, 4461);
+        conn.set_intelligent_stealth_runtime_for_test(false);
+        conn.set_stealth_timing(true, 750);
+        conn.set_stealth_padding(true, 4, 86);
+
+        manual.advance(Duration::from_millis(400));
+        brain.apply_policy(&mut conn);
+
+        assert!(!conn.intelligent_stealth_runtime_enabled_for_test());
+        assert!(!conn.external_pacing_enabled());
+        assert!(conn.stealth_timing_enabled_for_test());
+        assert_eq!(conn.stealth_timing_max_jitter_us_for_test(), 750);
+        assert!(conn.stealth_padding_enabled_for_test());
+        assert_eq!(conn.stealth_padding_strategy_for_test(), 4);
+
+        clear_runtime_hints_for_test();
+    }
+
+    #[test]
+    fn brain_can_steer_stealth_runtime_when_connection_is_intelligent() {
+        let base_instant = Instant::now();
+        let base_system = UNIX_EPOCH + Duration::from_secs(30);
+        let manual = Arc::new(ManualTimeSource::new(base_instant, base_system));
+        let _time_guard = crate::time_source::install_for_test(manual.clone());
+
+        clear_runtime_hints_for_test();
+        let brain = StealthBrain::new(StealthBrainConfig::default());
+        let mut conn = test_connection(4462, 4463);
+        conn.set_intelligent_stealth_runtime_for_test(true);
+
+        manual.advance(Duration::from_millis(400));
+        brain.apply_policy(&mut conn);
+
+        assert!(conn.intelligent_stealth_runtime_enabled_for_test());
+        assert!(conn.external_pacing_enabled());
+        // Level 0 (clean path, no pressure) disables padding to keep Intelligent near-zero overhead.
+        assert!(!conn.stealth_padding_enabled_for_test());
+
+        clear_runtime_hints_for_test();
+    }
+
+    #[test]
+    fn brain_respects_locked_transport_override_permissions() {
+        let base_instant = Instant::now();
+        let base_system = UNIX_EPOCH + Duration::from_secs(40);
+        let manual = Arc::new(ManualTimeSource::new(base_instant, base_system));
+        let _time_guard = crate::time_source::install_for_test(manual.clone());
+
+        clear_runtime_hints_for_test();
+        let brain = StealthBrain::new(StealthBrainConfig::default());
+        let mut conn = test_connection(4464, 4465);
+        conn.set_intelligent_stealth_runtime_for_test(true);
+        conn.set_brain_runtime_permissions_for_test(BrainRuntimePermissions {
+            ack_threshold: false,
+            external_pacing: false,
+            timing: false,
+            padding: false,
+            mimic_bias: false,
+            granularity: false,
+            cc_profile: false,
+        });
+        conn.set_ack_eliciting_threshold(7);
+        conn.set_stealth_timing(true, 777);
+        conn.set_stealth_padding(true, 4, 86);
+
+        manual.advance(Duration::from_millis(400));
+        brain.apply_policy(&mut conn);
+
+        assert_eq!(conn.ack_eliciting_threshold(), 7);
+        assert!(!conn.external_pacing_enabled());
+        assert!(conn.stealth_timing_enabled_for_test());
+        assert_eq!(conn.stealth_timing_max_jitter_us_for_test(), 777);
+        assert!(conn.stealth_padding_enabled_for_test());
+        assert_eq!(conn.stealth_padding_strategy_for_test(), 4);
+
+        clear_runtime_hints_for_test();
     }
 }
 

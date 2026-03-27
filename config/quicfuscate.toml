@@ -14,14 +14,18 @@
 # Options: "client", "server"
 mode = "client"
 
-# Log level (overrides [logging].level if set)
+# Log level (overrides [logging].level when set to a non-default value)
+# Wired: takes precedence over [logging].level at server startup if explicitly changed.
 # Options: "error", "warn", "info", "debug", "trace"
 log_level = "info"
 
 # Auto-start on engine creation
+# NOTE: Engine API design requires explicit .start() call. This field is parsed
+# but intentionally not auto-triggered to avoid surprising embedders.
 auto_start = false
 
 # Graceful shutdown timeout (milliseconds)
+# Wired: engine stop() waits up to this duration for the server loop thread to exit.
 shutdown_timeout_ms = 5000
 
 # ==============================================================================
@@ -56,21 +60,51 @@ sni = ""
 # Connection idle timeout (milliseconds, 0 = no timeout)
 idle_timeout_ms = 30000
 
-# Enable 0-RTT early data (reduces handshake latency)
-# WARNING: 0-RTT data can be replayed - only use for idempotent operations
+# Enable 0-RTT early data - ENGINE LEVEL (server + client, controls quiche TransportConfig).
+# Reduces handshake latency by one round-trip.
+# Requires [anti_replay] enabled = true for production use.
+# Relationship to [transport].enable_early_data: both activate the same quiche
+# transport 0-RTT mechanism but at different points:
+#   - This field (connection.enable_0rtt) is applied in the engine initialization path
+#     (engine.rs) and affects server accept + the engine-managed transport config.
+#   - [transport].enable_early_data is applied in the client connection setup path
+#     (client/connection.rs) and controls the per-connection QUIC transport config.
+# For full 0-RTT, enable BOTH fields. Disabling either disables 0-RTT on that path.
 enable_0rtt = true
 
 # Maximum bidirectional streams
+# Wired: overrides [transport].initial_max_streams_bidi when set to a different non-zero value.
+# Both fields are accepted for convenience; [transport] is the primary source.
 max_streams_bidi = 100
 
-# Maximum unidirectional streams  
+# Maximum unidirectional streams
+# Wired: overrides [transport].initial_max_streams_uni when set to a different non-zero value.
 max_streams_uni = 100
 
-# Connection migration support
+# Connection migration support (new paths must complete PATH_CHALLENGE/PATH_RESPONSE validation)
 enable_migration = true
 
-# Retry token validation (server mode)
-enable_retry = true
+# ==============================================================================
+# 0-RTT ANTI-REPLAY PROTECTION
+# ==============================================================================
+
+[anti_replay]
+# Enable anti-replay protection for 0-RTT early data (server mode only).
+# A strike register tracks seen 0-RTT packets and rejects replays.
+# Per RFC 8446 Section 8 and RFC 9001 Section 9.2.
+enabled = true
+
+# Maximum ticket age in seconds before 0-RTT is rejected.
+# RFC 8446 recommends a small window. Default: 10 seconds.
+max_ticket_age_secs = 10
+
+# Maximum entries in the strike register.
+# Each entry is ~48 bytes. 100,000 entries = ~5 MB memory.
+max_entries = 100000
+
+# Maximum early data size in bytes per connection.
+# Limits how much 0-RTT data the server accepts. Default: 16384 (16 KB).
+max_early_data_size = 16384
 
 # ==============================================================================
 # CRYPTO CONFIGURATION
@@ -78,33 +112,15 @@ enable_retry = true
 
 [crypto]
 # AEAD cipher preference
-# Options: "auto", "aegis-128l", "aegis-128x4", "aegis-128x8", "morus", "aes-gcm"
+# Options: "auto", "aegis-128l", "morus"
 # - auto: Select best based on CPU features (recommended)
 # - aegis-128l: Prefer AEGIS-128L when hardware AES is available
-# - aegis-128x4: Prefer AEGIS-128X4 when hardware AES is available
-# - aegis-128x8: Prefer AEGIS-128X8 when hardware AES is available
 # - morus: Prefer MORUS-1280-128
-# - aes-gcm: Standard AES-GCM (widest compatibility)
 aead_preference = "auto"
 
-# Enable post-quantum cryptography (hybrid Kyber + X25519)
-# WARNING: Increases handshake size significantly (~1KB)
-enable_pq = false
-
-# Post-quantum signature algorithm (when enable_pq = true)
-# Options: "dilithium3", "falcon512"
-pq_signature = "dilithium3"
-
-# Force specific AEAD (overrides preference)
-# Options: "auto", "aegis-128l", "aegis-128x4", "aegis-128x8", "morus", "aes-gcm"
+# Force specific AEAD (overrides preference, useful for testing or constrained deployments)
+# Options: "auto", "aegis-128l", "morus" (empty string = use preference above)
 force_aead = ""
-
-# Key update interval (packets, 0 = automatic per QUIC spec)
-key_update_interval = 0
-
-# Header protection algorithm
-# Options: "aes", "chacha20"
-header_protection = "aes"
 
 # ==============================================================================
 # STEALTH CONFIGURATION
@@ -112,11 +128,13 @@ header_protection = "aes"
 
 [stealth]
 # Stealth operation mode
-# Options: "off", "auto", "max", "manual"
-# - off: No stealth features enabled
-# - auto: Balanced stealth without performance impact (default)
-# - max: All features with aggressive settings
-# - manual: Custom configuration (use settings below)
+# Options: "off", "performance", "stealth", "anti-dpi", "intelligent", "manual"
+# - off:          No stealth features enabled
+# - performance:  Minimal fingerprinting, costly features off (alias: "base")
+# - stealth:      Balanced features with minimal overhead
+# - anti-dpi:     Ultra stealth with aggressive settings (alias: "max")
+# - intelligent:  Adaptive mode, escalates on probe detection (alias: "auto")
+# - manual:       Custom configuration (use settings below)
 mode = "auto"
 
 # Manual mode settings (only used when mode = "manual")
@@ -127,9 +145,6 @@ enable_domain_fronting = true
 
 # HTTP/3 masquerading - Make QUIC traffic look like HTTP/3
 enable_http3_masquerading = true
-
-# XOR obfuscation - Encrypt packet payloads with rolling key
-enable_xor_obfuscation = true
 
 # TLS Cover - Use synthetic cover handshakes for DPI evasion
 # When false, uses real TLS only
@@ -147,6 +162,9 @@ enable_traffic_padding = false
 enable_timing_obfuscation = false
 
 # Protocol mimicry - Make QUIC look like other protocols
+# Wired: contributes to StealthConfig::is_active() composite check and flows through
+# client connection + subsystems initialization. QUIC traffic mimicry is achieved via
+# TLS Cover and HTTP/3 masquerading (above); this flag enables/disables that as a group.
 enable_protocol_mimicry = true
 
 # DNS-over-HTTPS - Use encrypted DNS resolution
@@ -189,6 +207,7 @@ interval_secs = 300  # 5 minutes
 # - fixed: Single profile, no rotation
 # - slots: Rotate through configured profile_slots
 # - all: Rotate through all available profiles
+# Wired: Fixed = no rotation, Slots = rotate through profile_slots, All = all browser/OS combos.
 mode = "fixed"
 
 # Profile slots for rotation (up to 3)
@@ -206,18 +225,14 @@ profile_slots = [
 
 [fec]
 # FEC operation mode
-# Options: "off", "auto", "manual"
-# - off: No FEC
-# - auto: Adaptive FEC based on network conditions (default)
-# - manual: Fixed FEC parameters (use settings below)
+# Options: "auto", "off"
+# - auto: Adaptive FEC controller adjusts redundancy based on measured packet loss (default)
+# - off: Disable FEC entirely
 mode = "auto"
 
-# Manual mode settings (only used when mode = "manual")
-# ------------------------------------------------------------------------------
-
-# Initial FEC mode (for manual configuration)
-# Options: "dynamic", "static", "bursty", "streaming"
-initial_mode = "dynamic"
+# Initial bootstrap mode for the adaptive controller
+# Options: "auto", "off"
+initial_mode = "auto"
 
 # FEC window sizes for different quality levels
 window_excellent = 0    # No FEC when network is excellent
@@ -246,8 +261,9 @@ stream_every = 5
 
 [transport]
 # Congestion control algorithm
-# Options: "reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion"
-cc_algorithm = "cubic"
+# Congestion control algorithm.
+# Options: "reno" (RFC 6582), "bbr2" (IETF draft, interim BBR3 fallback), "bbr3" (stealth, recommended)
+cc_algorithm = "bbr3"
 
 # Maximum Transmission Unit (bytes)
 mtu = 1400
@@ -258,11 +274,9 @@ max_udp_payload = 1350
 # Maximum idle timeout (milliseconds)
 max_idle_timeout = 30000
 
-# Initial RTT estimate (milliseconds, used before measurements)
+# Initial RTT estimate (milliseconds, used before first real measurement arrives)
+# Wired: applied to Recovery::set_initial_rtt() on connection construction.
 initial_rtt_ms = 100
-
-# Enable spin bit (for RTT measurement by middleboxes)
-enable_spin_bit = true
 
 # Enable pacing (smoother packet transmission)
 enable_pacing = true
@@ -283,14 +297,12 @@ initial_max_streams_bidi = 100
 # Initial maximum streams (unidirectional)
 initial_max_streams_uni = 100
 
-# Enable 0-RTT (reduces handshake latency but less secure)
+# Enable 0-RTT early data - CLIENT CONNECTION LEVEL (per-connection QUIC transport config).
+# Relationship to [connection].enable_0rtt: see that field for the full explanation.
+# This field gates 0-RTT on the client-side connection path (client/connection.rs).
+# Default is false here because [connection].enable_0rtt = true already covers the
+# engine-level path. Set both to true to enable 0-RTT on every code path.
 enable_early_data = false
-
-# GSO (Generic Segmentation Offload) batch size
-gso_batch_size = 16
-
-# GRO (Generic Receive Offload) max batch
-gro_batch_size = 16
 
 # QUIC DATAGRAM queue lengths (0 disables datagrams)
 dgram_recv_queue_len = 1024
@@ -304,23 +316,15 @@ disable_pmtud = false
 # ==============================================================================
 
 [optimization]
-# CPU feature detection mode
-# Options: "auto", "manual", "disabled"
-cpu_features_mode = "auto"
-
-# Manual CPU features (only used when mode = "manual")
-enable_avx2 = true
-enable_avx512 = false
-enable_aesni = true
-enable_vaes = false
-enable_neon = false  # ARM only
-
-# Memory pool configuration
+# Memory pool size in bytes. Pool is used for packet buffers and frame allocation.
+# 0 = auto-detect based on available RAM (recommended).
 memory_pool_size = 67108864  # 64MB
-memory_pool_alignment = 64   # Cache line alignment
 
-# Parallel processing
-num_worker_threads = 0  # 0 = auto-detect
+# Memory pool alignment in bytes. Should match CPU cache line size (64 bytes).
+memory_pool_alignment = 64
+
+# Number of Tokio worker threads. 0 = use default (8 threads).
+num_worker_threads = 0
 
 # ==============================================================================
 # INTERFACE CONFIGURATION
@@ -329,6 +333,7 @@ num_worker_threads = 0  # 0 = auto-detect
 [interface]
 # Interface type
 # Options: "tun", "tap", "xdp", "raw_socket"
+# "xdp" is compatibility/experimental only in this fork and is not the canonical production runtime path.
 type = "tun"
 
 # TUN/TAP configuration
@@ -336,10 +341,13 @@ tun_name = "quicfuse0"
 tun_mtu = 1500
 
 # Enable packet coalescing
+# Wired: UdpFastPath::new_with_flags() accepts GSO/GRO toggles. The main server runtime
+# uses tokio UdpSocket (not UdpFastPath) so these flags affect the harness/xdp fallback
+# paths only. Values flow through interface config for future server path integration.
 enable_gso = true
 enable_gro = true
 
-# XDP configuration (Linux only)
+# XDP configuration (Linux only, compatibility/experimental only in this fork)
 xdp_mode = "skb"  # Options: "skb", "driver", "hardware"
 xdp_flags = ["update_if_noexist"]
 
@@ -348,13 +356,16 @@ xdp_flags = ["update_if_noexist"]
 # ==============================================================================
 
 [telemetry]
-# Enable telemetry collection
+# Enable telemetry collection (controls TELEMETRY_ENABLED global flag)
 enabled = true
 
 # Telemetry export interval (seconds)
+# NOTE: Telemetry uses a pull-based HTTP server (/telemetry endpoint) that responds
+# on demand. This interval field is reserved for a future periodic push exporter.
 export_interval = 60
 
 # Metrics to collect
+# Wired: each flag gates its category in the /telemetry export output.
 collect_packet_stats = true
 collect_stream_stats = true
 collect_congestion_stats = true
@@ -363,9 +374,13 @@ collect_stealth_stats = true
 
 [logging]
 # Log level: "error", "warn", "info", "debug", "trace"
+# Wired: applied at server startup via LoggingConfig::effective() which respects mode overrides.
+# RUST_LOG env var or admin API can further override at runtime.
 level = "info"
 
 # Log targets
+# Wired: log_to_stdout=false (via mode=no-log or explicit) suppresses all stdout logging.
+# log_to_file is parsed but file-based logging requires env_logger file target setup.
 log_to_file = false
 log_file_path = "/var/log/quicfuscate.log"
 log_to_stdout = true
@@ -393,7 +408,6 @@ log_to_stdout = true
 # [preset.performance]
 # stealth.mode = "off"
 # fec.mode = "off"
-# optimization.cpu_features_mode = "auto"
 # interface.enable_gso = true
 # interface.enable_gro = true
 

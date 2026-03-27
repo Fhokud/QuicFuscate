@@ -2,13 +2,8 @@
 
 # Upstream vendored sources removed — project is Cargo-only.
 
-# Generated/build artifacts
-releases/** linguist-generated
-scripts/artifacts/logs/** linguist-generated
-
 # Documentation
 docs/** linguist-documentation
-ui/** linguist-documentation
 
 # Common documentation assets
 *.png linguist-documentation

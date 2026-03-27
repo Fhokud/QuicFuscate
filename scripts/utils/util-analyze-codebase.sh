@@ -5,15 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
-[[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
+source "$SCRIPT_DIR/../tests/lib/lib-common.sh" || { echo "ERROR: lib-common.sh not found at $SCRIPT_DIR/../tests/lib/lib-common.sh" >&2; exit 1; }
 
-OUTPUT_DIR=""; RUSTFLAGS_EXTRA=""
+OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
+    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR]"; exit 0;;
     *) break;;
   esac
@@ -63,18 +62,30 @@ echo "+===============================================================+"
 
 echo -e "\n> Core modules:"
 for module in crypto fec stealth transport optimize interface; do
+    target=""
+    label=""
     if [[ -f "src/$module.rs" ]]; then
-        lines=$(wc -l "src/$module.rs" | awk '{print $1}')
-        functions=$(count_matches '^[[:space:]]*(pub )?(async )?fn ' "src/$module.rs")
-        structs=$(count_matches '^[[:space:]]*(pub )?struct ' "src/$module.rs")
-        impls=$(count_matches '^[[:space:]]*impl ' "src/$module.rs")
-        tests=$(count_matches '#\[test\]' "src/$module.rs")
-        unsafe_blocks=$(count_matches '\bunsafe\b' "src/$module.rs")
-
-        echo -e "\n  $module.rs:"
-        echo "    Lines: $lines | Functions: $functions | Structs: $structs"
-        echo "    Impls: $impls | Tests: $tests | Unsafe: $unsafe_blocks"
+        target="src/$module.rs"
+        label="$module.rs"
+        lines=$(wc -l "$target" | awk '{print $1}')
+    elif [[ -d "src/$module" ]]; then
+        target="src/$module"
+        label="$module/ (directory)"
+        lines=$(find "$target" -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+        [[ -z "$lines" ]] && continue
+    else
+        continue
     fi
+
+    functions=$(count_matches '^[[:space:]]*(pub )?(async )?fn ' "$target" --glob '*.rs')
+    structs=$(count_matches '^[[:space:]]*(pub )?struct ' "$target" --glob '*.rs')
+    impls=$(count_matches '^[[:space:]]*impl ' "$target" --glob '*.rs')
+    tests=$(count_matches '#\[test\]' "$target" --glob '*.rs')
+    unsafe_blocks=$(count_matches '\bunsafe\b' "$target" --glob '*.rs')
+
+    echo -e "\n  $label:"
+    echo "    Lines: $lines | Functions: $functions | Structs: $structs"
+    echo "    Impls: $impls | Tests: $tests | Unsafe: $unsafe_blocks"
 done
 
 echo -e "\n+===============================================================+"
@@ -89,9 +100,9 @@ echo "  x86_64 SIMD blocks: $(count_matches 'target_arch.*x86_64' src/ --glob '*
 echo "  ARM SIMD blocks: $(count_matches 'target_arch.*aarch64' src/ --glob '*.rs')"
 
 echo -e "\n> Feature gates:"
-echo "  with_aegis: $(count_matches 'feature.*with_aegis' src/ --glob '*.rs') uses"
-echo "  uring: $(count_matches 'feature.*uring' src/ --glob '*.rs') uses"
-echo "  xdp: $(count_matches 'feature.*xdp' src/ --glob '*.rs') uses"
+echo "  aes (hw): $(count_matches 'feature.*\"aes\"' src/ --glob '*.rs') uses"
+echo "  io_uring: $(count_matches 'feature.*io_uring' src/ --glob '*.rs') uses"
+echo "  internal_af_xdp_experimental: $(count_matches 'feature.*internal_af_xdp_experimental' src/ --glob '*.rs') uses"
 echo "  benches: $(count_matches 'feature.*benches' src/ --glob '*.rs') uses"
 
 echo -e "\n+===============================================================+"

@@ -48,6 +48,8 @@ pub struct EngineConfig {
     pub fingerprint_rotation: FingerprintRotationConfig,
     /// Performance optimization settings
     pub optimization: OptimizationConfig,
+    /// 0-RTT anti-replay protection settings
+    pub anti_replay: AntiReplaySection,
 }
 
 impl EngineConfig {
@@ -70,6 +72,12 @@ impl EngineConfig {
         self.transport.validate()?;
         self.crypto.validate()?;
         self.interface.validate()?;
+        if self.connection.enable_0rtt && !self.anti_replay.enabled {
+            log::warn!(
+                "[config] 0-RTT enabled without anti-replay protection. \
+                 Set [anti_replay] enabled = true for production use."
+            );
+        }
         Ok(())
     }
 
@@ -79,11 +87,16 @@ impl EngineConfig {
     }
 }
 
-/// Configuration errors.
+/// Configuration errors returned during file loading, TOML parsing, or validation.
+///
+/// Each variant carries a human-readable description of the failure.
 #[derive(Debug, Clone)]
 pub enum ConfigError {
+    /// Filesystem I/O error (file not found, permission denied, etc.)
     Io(String),
+    /// TOML deserialization error (syntax, missing fields, type mismatches)
     Parse(String),
+    /// Semantic validation error (invalid ranges, conflicting settings)
     Validation(String),
 }
 
@@ -145,8 +158,10 @@ impl EngineSection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineMode {
+    /// Run as a VPN client connecting to a remote server.
     #[default]
     Client,
+    /// Run as a VPN server accepting incoming connections.
     Server,
 }
 
@@ -188,10 +203,8 @@ pub struct ConnectionConfig {
     pub max_streams_bidi: u64,
     /// Maximum unidirectional streams
     pub max_streams_uni: u64,
-    /// Enable connection migration
+    /// Enable validated connection migration
     pub enable_migration: bool,
-    /// Enable retry tokens (server mode)
-    pub enable_retry: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -212,7 +225,6 @@ impl Default for ConnectionConfig {
             max_streams_bidi: 100,
             max_streams_uni: 100,
             enable_migration: true,
-            enable_retry: true,
         }
     }
 }
@@ -253,8 +265,6 @@ pub struct TransportConfig {
     pub max_idle_timeout: u64,
     /// Initial RTT estimate in milliseconds
     pub initial_rtt_ms: u64,
-    /// Enable spin bit
-    pub enable_spin_bit: bool,
     /// Enable pacing
     pub enable_pacing: bool,
     /// Initial maximum data
@@ -271,10 +281,6 @@ pub struct TransportConfig {
     pub initial_max_streams_uni: u64,
     /// Enable 0-RTT early data
     pub enable_early_data: bool,
-    /// GSO batch size
-    pub gso_batch_size: u16,
-    /// GRO batch size
-    pub gro_batch_size: u16,
     /// QUIC DATAGRAM receive queue length (0 = disabled)
     pub dgram_recv_queue_len: usize,
     /// QUIC DATAGRAM send queue length (0 = disabled)
@@ -286,12 +292,11 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            cc_algorithm: CcAlgorithm::Cubic,
+            cc_algorithm: CcAlgorithm::Bbr3,
             mtu: 1400,
             max_udp_payload: 1350,
             max_idle_timeout: 30000,
             initial_rtt_ms: 100,
-            enable_spin_bit: true,
             enable_pacing: true,
             initial_max_data: 10_000_000,
             initial_max_stream_data_bidi_local: 1_000_000,
@@ -300,8 +305,6 @@ impl Default for TransportConfig {
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
             enable_early_data: false,
-            gso_batch_size: 16,
-            gro_batch_size: 16,
             dgram_recv_queue_len: 1024,
             dgram_send_queue_len: 1024,
             disable_pmtud: false,
@@ -337,13 +340,13 @@ impl TransportConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CcAlgorithm {
+    /// TCP New Reno (RFC 6582) - conservative AIMD baseline.
     Reno,
-    #[default]
-    Cubic,
-    Bbr,
+    /// BBR v2 (IETF draft-ietf-ccwg-bbr) - loss-aware model-based CC.
     Bbr2,
-    #[serde(rename = "bbr2_gcongestion")]
-    Bbr2Gcongestion,
+    /// BBR v3 with stealth browser-profile shaping (default, recommended).
+    #[default]
+    Bbr3,
 }
 
 // ============================================================================
@@ -356,27 +359,15 @@ pub enum CcAlgorithm {
 pub struct CryptoConfig {
     /// AEAD cipher preference
     pub aead_preference: AeadPreference,
-    /// Enable post-quantum cryptography
-    pub enable_pq: bool,
-    /// Post-quantum signature algorithm
-    pub pq_signature: PqSignature,
-    /// Force specific AEAD (for testing)
+    /// Force specific AEAD (for testing or deployment constraints)
     pub force_aead: String,
-    /// Key update interval (packets, 0 = automatic)
-    pub key_update_interval: u64,
-    /// Header protection algorithm
-    pub header_protection: HeaderProtection,
 }
 
 impl Default for CryptoConfig {
     fn default() -> Self {
         Self {
             aead_preference: AeadPreference::Auto,
-            enable_pq: false,
-            pq_signature: PqSignature::Dilithium3,
             force_aead: String::new(),
-            key_update_interval: 0,
-            header_protection: HeaderProtection::Aes,
         }
     }
 }
@@ -399,10 +390,6 @@ impl CryptoConfig {
                     | "morus"
                     | "morus-1280-128"
                     | "morus1280-128"
-                    | "aes-gcm"
-                    | "aesgcm"
-                    | "aes-128-gcm"
-                    | "aes128gcm"
             );
             if !ok {
                 return Err(ConfigError::Validation(format!(
@@ -419,35 +406,14 @@ impl CryptoConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AeadPreference {
+    /// Automatically select the best AEAD for the detected CPU features.
     #[default]
     Auto,
-    #[serde(rename = "aegis-128l")]
+    /// Prefer AEGIS-128L (or AEGIS-128x4/x8 on capable hardware).
+    #[serde(rename = "aegis-128l", alias = "aegis-128x4", alias = "aegis-128x8")]
     Aegis128L,
-    #[serde(rename = "aegis-128x4")]
-    Aegis128X4,
-    #[serde(rename = "aegis-128x8")]
-    Aegis128X8,
+    /// Prefer MORUS-1280-128 AEAD.
     Morus,
-    #[serde(rename = "aes-gcm")]
-    AesGcm,
-}
-
-/// Post-quantum signature algorithm.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PqSignature {
-    #[default]
-    Dilithium3,
-    Falcon512,
-}
-
-/// Header protection algorithm.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HeaderProtection {
-    #[default]
-    Aes,
-    Chacha20,
 }
 
 // ============================================================================
@@ -475,6 +441,12 @@ pub struct InterfaceConfig {
     pub enable_gso: bool,
     /// Enable GRO
     pub enable_gro: bool,
+    /// TUN gateway address (default: 10.8.0.1)
+    pub tun_gateway: Option<IpAddr>,
+    /// TUN subnet prefix length (default: 24)
+    pub tun_subnet_prefix: Option<u8>,
+    /// DNS servers to use when VPN is active (default: [1.1.1.1, 8.8.8.8])
+    pub dns_servers: Vec<IpAddr>,
     /// XDP mode (Linux only)
     pub xdp_mode: XdpMode,
     /// XDP flags
@@ -492,6 +464,12 @@ impl Default for InterfaceConfig {
             zero_copy: true,
             enable_gso: true,
             enable_gro: true,
+            tun_gateway: None,
+            tun_subnet_prefix: None,
+            dns_servers: vec![
+                IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            ],
             xdp_mode: XdpMode::Skb,
             xdp_flags: vec!["update_if_noexist".to_string()],
         }
@@ -527,10 +505,14 @@ impl InterfaceConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InterfaceType {
+    /// Layer 3 TUN device (IP packets).
     #[default]
     Tun,
+    /// Layer 2 TAP device (Ethernet frames).
     Tap,
+    /// Linux XDP fast-path (AF_XDP socket).
     Xdp,
+    /// Raw socket interface.
     #[serde(rename = "raw_socket")]
     RawSocket,
 }
@@ -539,9 +521,12 @@ pub enum InterfaceType {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum XdpMode {
+    /// Generic SKB mode (software fallback, any NIC).
     #[default]
     Skb,
+    /// Native driver mode (requires NIC driver support).
     Driver,
+    /// Hardware offload mode (requires NIC hardware support).
     Hardware,
 }
 
@@ -604,10 +589,14 @@ impl Default for TelemetryConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LoggingMode {
+    /// Full debug logging with all metadata to disk and stdout.
     Verbose,
+    /// Info-level default operation.
     #[default]
     Normal,
+    /// Warn-level only with client metadata stripped.
     Minimal,
+    /// Strict privacy mode - in-memory ring buffer only, zero disk writes.
     NoLog,
 }
 
@@ -679,14 +668,17 @@ impl LoggingConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FecSection {
-    /// FEC mode: off, auto, manual
+    /// FEC mode: auto, off
     pub mode: FecMode,
-    /// Initial FEC mode for manual configuration
+    /// Initial adaptive FEC bootstrap hint. Canonical product value: auto.
     pub initial_mode: String,
-    /// Window sizes for quality levels
+    /// FEC window size for excellent link quality (0 = disabled).
     pub window_excellent: usize,
+    /// FEC window size for good link quality.
     pub window_good: usize,
+    /// FEC window size for fair link quality.
     pub window_fair: usize,
+    /// FEC window size for poor link quality.
     pub window_poor: usize,
     /// Enable partial recovery
     pub enable_partial: bool,
@@ -704,7 +696,7 @@ impl Default for FecSection {
     fn default() -> Self {
         Self {
             mode: FecMode::Auto,
-            initial_mode: "dynamic".to_string(),
+            initial_mode: "auto".to_string(),
             window_excellent: 0,
             window_good: 10,
             window_fair: 30,
@@ -722,10 +714,11 @@ impl Default for FecSection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FecMode {
+    /// FEC disabled entirely.
     Off,
+    /// Adaptive FEC - automatically adjusts redundancy based on measured loss.
     #[default]
     Auto,
-    Manual,
 }
 
 // ============================================================================
@@ -742,8 +735,6 @@ pub struct StealthSection {
     pub enable_domain_fronting: bool,
     /// Enable HTTP/3 masquerading
     pub enable_http3_masquerading: bool,
-    /// Enable XOR obfuscation
-    pub enable_xor_obfuscation: bool,
     /// Use TLS Cover
     pub use_tls_cover: bool,
     /// Use QPACK headers
@@ -776,7 +767,6 @@ impl Default for StealthSection {
             mode: StealthMode::Auto,
             enable_domain_fronting: true,
             enable_http3_masquerading: true,
-            enable_xor_obfuscation: true,
             use_tls_cover: true,
             use_qpack_headers: true,
             enable_traffic_padding: false,
@@ -797,11 +787,26 @@ impl Default for StealthSection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StealthMode {
+    /// Stealth disabled - no obfuscation applied.
     Off,
-    #[default]
-    Auto,
-    Max,
+    /// Zero-overhead stealth: domain fronting, HTTP/3 masquerading, TLS cover, DoH only.
+    /// No padding, no jitter, no rotation. Fastest possible with solid base cover.
+    Performance,
+    /// Balanced stealth: adds adaptive padding, timing jitter, protocol mimicry and light
+    /// server push cover traffic. Good DPI resistance without heavy performance cost.
+    Stealth,
+    /// Maximum anti-DPI: all features at aggressive settings. Browser-mimic padding (256B),
+    /// 3ms timing jitter, fingerprint rotation every 2 minutes, server push cover traffic.
+    /// Accepts performance cost for maximum censorship resistance.
+    #[serde(rename = "anti-dpi", alias = "antidpi", alias = "max")]
+    AntiDpi,
+    /// Manual control - each stealth feature toggled individually via sub-fields.
     Manual,
+    /// Adaptive mode: starts like Performance, escalates features on detected censorship
+    /// pressure (packet loss, ECN marks, RTT spikes, active probes). Alias: "auto".
+    #[default]
+    #[serde(alias = "intelligent")]
+    Auto,
 }
 
 // ============================================================================
@@ -841,9 +846,12 @@ impl Default for FingerprintRotationConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RotationMode {
+    /// Use a single fixed fingerprint profile.
     #[default]
     Fixed,
+    /// Rotate through configured profile slots.
     Slots,
+    /// Rotate through all available browser/OS combinations.
     All,
 }
 
@@ -855,50 +863,97 @@ pub enum RotationMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OptimizationConfig {
-    /// CPU features detection mode
-    pub cpu_features_mode: CpuFeaturesMode,
-    /// Manual: enable AVX2
-    pub enable_avx2: bool,
-    /// Manual: enable AVX-512
-    pub enable_avx512: bool,
-    /// Manual: enable AES-NI
-    pub enable_aesni: bool,
-    /// Manual: enable VAES
-    pub enable_vaes: bool,
-    /// Manual: enable NEON (ARM)
-    pub enable_neon: bool,
-    /// Memory pool size (bytes)
+    /// Memory pool size (bytes). 0 = auto-detect based on available RAM.
     pub memory_pool_size: usize,
-    /// Memory pool alignment
+    /// Memory pool alignment (bytes, should be cache line size = 64).
     pub memory_pool_alignment: usize,
-    /// Number of worker threads (0 = auto)
+    /// Number of Tokio worker threads (0 = use default of 8).
     pub num_worker_threads: usize,
 }
 
 impl Default for OptimizationConfig {
     fn default() -> Self {
         Self {
-            cpu_features_mode: CpuFeaturesMode::Auto,
-            enable_avx2: true,
-            enable_avx512: false,
-            enable_aesni: true,
-            enable_vaes: false,
-            enable_neon: false,
-            memory_pool_size: 67_108_864, // 64 MB
+            memory_pool_size: auto_memory_pool_size(),
             memory_pool_alignment: 64,
             num_worker_threads: 0,
         }
     }
 }
 
-/// CPU features detection mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CpuFeaturesMode {
-    #[default]
-    Auto,
-    Manual,
-    Disabled,
+const MIN_POOL_BYTES: usize = 16 * 1024 * 1024; // 16 MB floor
+const MAX_POOL_BYTES: usize = 256 * 1024 * 1024; // 256 MB cap
+const FALLBACK_POOL_BYTES: usize = 64 * 1024 * 1024; // 64 MB fallback default
+
+/// Determine the memory pool size with the following priority:
+/// 1. Environment variable `QUICFUSCATE_MEMORY_POOL_MB` (explicit override, in megabytes)
+/// 2. Auto-scale: 5% of total system RAM (clamped to 16 MB..256 MB)
+/// 3. Fallback: 64 MB (if sysinfo detection fails)
+fn auto_memory_pool_size() -> usize {
+    // Priority 1: environment variable override
+    if let Ok(val) = std::env::var("QUICFUSCATE_MEMORY_POOL_MB") {
+        if let Ok(mb) = val.trim().parse::<usize>() {
+            if mb > 0 {
+                let bytes = mb.saturating_mul(1024 * 1024);
+                log::info!("Memory pool size from QUICFUSCATE_MEMORY_POOL_MB: {} MB", mb);
+                return bytes;
+            }
+        }
+    }
+
+    // Priority 2: auto-scale based on system RAM
+    let sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+    );
+    let total_ram = sys.total_memory() as usize; // bytes
+
+    if total_ram > 0 {
+        let five_percent = total_ram / 20;
+        let clamped = five_percent.clamp(MIN_POOL_BYTES, MAX_POOL_BYTES);
+        log::info!(
+            "Memory pool auto-scaled: {} MB (system RAM: {} MB, 5% = {} MB)",
+            clamped / (1024 * 1024),
+            total_ram / (1024 * 1024),
+            five_percent / (1024 * 1024),
+        );
+        return clamped;
+    }
+
+    // Priority 3: fallback
+    log::info!("Memory pool using fallback default: {} MB", FALLBACK_POOL_BYTES / (1024 * 1024));
+    FALLBACK_POOL_BYTES
+}
+
+// ============================================================================
+// ANTI-REPLAY SECTION (0-RTT)
+// ============================================================================
+
+/// 0-RTT anti-replay protection settings.
+///
+/// When enabled, a strike register rejects replayed 0-RTT packets per
+/// RFC 8446 Section 8 and RFC 9001 Section 9.2.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AntiReplaySection {
+    /// Enable 0-RTT anti-replay protection (server mode only).
+    pub enabled: bool,
+    /// Maximum ticket age in seconds before 0-RTT is rejected (default: 10).
+    pub max_ticket_age_secs: u64,
+    /// Maximum entries in the strike register (default: 100000).
+    pub max_entries: usize,
+    /// Maximum early data size in bytes per connection (default: 16384).
+    pub max_early_data_size: u32,
+}
+
+impl Default for AntiReplaySection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_ticket_age_secs: 10,
+            max_entries: 100_000,
+            max_early_data_size: 16384,
+        }
+    }
 }
 
 // ============================================================================
@@ -948,12 +1003,6 @@ impl EngineConfigBuilder {
         self
     }
 
-    /// Enable post-quantum cryptography.
-    pub fn enable_pq(mut self, enable: bool) -> Self {
-        self.config.crypto.enable_pq = enable;
-        self
-    }
-
     /// Set congestion control algorithm.
     pub fn cc_algorithm(mut self, cc: CcAlgorithm) -> Self {
         self.config.transport.cc_algorithm = cc;
@@ -975,7 +1024,7 @@ mod tests {
     fn test_default_config() {
         let config = EngineConfig::default();
         assert_eq!(config.engine.mode, EngineMode::Client);
-        assert_eq!(config.transport.cc_algorithm, CcAlgorithm::Cubic);
+        assert_eq!(config.transport.cc_algorithm, CcAlgorithm::Bbr3);
         assert_eq!(config.crypto.aead_preference, AeadPreference::Auto);
     }
 
@@ -984,12 +1033,12 @@ mod tests {
         let config = EngineConfig::builder()
             .mode(EngineMode::Server)
             .remote("0.0.0.0:4433")
-            .stealth_mode(StealthMode::Max)
+            .stealth_mode(StealthMode::AntiDpi)
             .build()
             .unwrap();
 
         assert_eq!(config.engine.mode, EngineMode::Server);
-        assert_eq!(config.stealth.mode, StealthMode::Max);
+        assert_eq!(config.stealth.mode, StealthMode::AntiDpi);
     }
 
     #[test]

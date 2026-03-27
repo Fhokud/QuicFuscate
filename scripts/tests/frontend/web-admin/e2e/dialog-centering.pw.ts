@@ -9,7 +9,6 @@ const CONFIG_TOML = [
   "mode = \"manual\"",
   "enable_domain_fronting = true",
   "enable_http3_masquerading = true",
-  "enable_xor_obfuscation = true",
   "use_tls_cover = true",
   "use_qpack_headers = true",
   "enable_traffic_padding = false",
@@ -21,10 +20,15 @@ const CONFIG_TOML = [
   "initial_mode = \"normal\"",
   "",
   "[transport]",
-  "cc_algorithm = \"cubic\"",
+  "cc_algorithm = \"bbr3\"",
   "mtu = 1400",
   "",
 ].join("\n");
+
+async function selectLogMode(page: Page, modeLabel: "Verbose" | "Normal" | "Minimal" | "No-Log"): Promise<void> {
+  const modeKey = modeLabel.toLowerCase().replace(/[^a-z]+/g, "-");
+  await page.getByTestId(`log-mode-${modeKey}`).click();
+}
 
 async function stubAdminApi(page: Page, opts: StubOptions = {}) {
   const auth401 = Boolean(opts.auth401);
@@ -266,7 +270,7 @@ test.describe("Dialog Centering [Web-Admin]", () => {
     await stubAdminApi(page);
     await page.goto("/");
     await page.getByRole("navigation", { name: "Primary" }).getByRole("button", { name: "Logs" }).click();
-    await page.getByText("Verbose", { exact: true }).first().click();
+    await selectLogMode(page, "Verbose");
     await page.getByRole("navigation", { name: "Primary" }).getByRole("button", { name: "Dashboard" }).click();
     await expect(page.getByRole("dialog", { name: "Unsaved Changes" })).toBeVisible();
     await assertDialogCenteredInStage(page, testInfo, "unsaved-confirm");

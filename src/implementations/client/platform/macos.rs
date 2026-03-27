@@ -5,15 +5,90 @@ use std::net::IpAddr;
 use std::process::Command;
 use std::sync::Mutex;
 
+// ---------------------------------------------------------------------------
+// macOS kernel control socket constants (not exposed by libc crate)
+// ---------------------------------------------------------------------------
+
+/// Protocol for PF_SYSTEM control sockets.
+const SYSPROTO_CONTROL: libc::c_int = 2;
+
+/// Sub-address family: system control.
+const AF_SYS_CONTROL: u16 = 2;
+
+/// ioctl request to resolve a kernel control name to its ID.
+/// Equivalent to `_IOWR('N', 3, struct ctl_info)` on macOS.
+const CTLIOCGINFO: libc::c_ulong = 0xc064_6e03;
+
+/// Kernel control name for utun devices.
+const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
+
+/// Kernel control info structure (passed to CTLIOCGINFO ioctl).
+#[repr(C)]
+struct CtlInfo {
+    ctl_id: u32,
+    ctl_name: [u8; 96],
+}
+
+/// Socket address for kernel control sockets.
+#[repr(C)]
+struct SockaddrCtl {
+    sc_len: u8,
+    sc_family: u8,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [u32; 5],
+}
+
+/// RAII guard that closes an fd on drop unless explicitly disarmed.
+/// Prevents fd leaks when an intermediate step fails.
+struct FdGuard {
+    fd: libc::c_int,
+    armed: bool,
+}
+
+impl FdGuard {
+    fn new(fd: libc::c_int) -> Self {
+        Self { fd, armed: true }
+    }
+
+    /// Disarm the guard so the fd will NOT be closed on drop.
+    /// Call this once the fd has been successfully handed off.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.armed && self.fd >= 0 {
+            // SAFETY: `self.fd` is a valid open file descriptor set in `FdGuard::new`.
+            // The guard is only constructed with an fd obtained from a successful
+            // `libc::socket()` call. `armed` is set to false via `disarm()` once the fd
+            // is successfully handed off, so this close path only runs when the fd would
+            // otherwise leak. The guard itself is dropped only once.
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
 /// macOS platform backend.
 pub struct MacOSPlatform {
     utun_counter: std::sync::atomic::AtomicU32,
     dns_service: Mutex<Option<String>>,
+    /// Original DNS servers saved before VPN connection for proper restore
+    original_dns: Mutex<Option<Vec<String>>>,
 }
 
 impl MacOSPlatform {
     pub fn new() -> Self {
-        Self { utun_counter: std::sync::atomic::AtomicU32::new(10), dns_service: Mutex::new(None) }
+        Self {
+            utun_counter: std::sync::atomic::AtomicU32::new(10),
+            dns_service: Mutex::new(None),
+            original_dns: Mutex::new(None),
+        }
     }
 
     /// Run route command.
@@ -120,6 +195,20 @@ impl MacOSPlatform {
         Ok(service)
     }
 
+    /// Capture current DNS servers for a given network service.
+    fn capture_current_dns(&self, service: &str) -> Vec<String> {
+        let output = match Command::new("networksetup").args(["-getdnsservers", service]).output() {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // "There aren't any DNS Servers set on ..." means DHCP - return empty
+        if stdout.contains("There aren't any DNS Servers") {
+            return Vec::new();
+        }
+        stdout.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).collect()
+    }
+
     fn prefix_to_netmask(prefix: u8) -> String {
         if prefix == 0 {
             return "0.0.0.0".to_string();
@@ -150,6 +239,8 @@ impl PlatformBackend for MacOSPlatform {
     }
 
     fn is_elevated(&self) -> bool {
+        // SAFETY: `geteuid()` is always safe to call - it is a simple syscall with no
+        // preconditions and cannot cause undefined behaviour.
         unsafe { libc::geteuid() == 0 }
     }
 
@@ -161,43 +252,160 @@ impl PlatformBackend for MacOSPlatform {
     }
 
     fn create_tun(&self, config: &TunDeviceConfig) -> Result<TunHandle, PlatformError> {
-        // macOS uses utun devices via a system socket
-        // The tun2 crate handles this properly
+        // macOS utun creation: full kernel control socket sequence.
+        //
+        // 1. socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)
+        // 2. ioctl(CTLIOCGINFO) to resolve "com.apple.net.utun_control" -> ctl_id
+        // 3. connect() with sockaddr_ctl (sc_id, sc_unit = utun_number + 1)
+        // 4. Set non-blocking
+        //
+        // The sc_unit field determines the utun interface number:
+        //   sc_unit = 0 -> kernel picks the next available utun number
+        //   sc_unit = N -> creates utun(N-1)
 
         let utun_num = self.utun_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let name = format!("utun{}", utun_num);
 
-        // Create utun socket
-        let fd = unsafe {
-            let sock = libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, 2); // SYSPROTO_CONTROL = 2
-            if sock < 0 {
-                return Err(PlatformError::DeviceError("Failed to create utun socket".to_string()));
+        // Step 1: Create PF_SYSTEM control socket
+        // SAFETY: `socket()` is a standard POSIX syscall with well-defined semantics.
+        // The arguments are valid constants (PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL).
+        // The returned fd is checked for < 0 immediately below; on error it equals -1
+        // which the OS guarantees is not a valid fd, so no resource is created.
+        let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
+        if fd < 0 {
+            return Err(PlatformError::DeviceError(format!(
+                "Failed to create utun socket: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut guard = FdGuard::new(fd);
+
+        // Step 2: Resolve "com.apple.net.utun_control" to a kernel control ID
+        // SAFETY: `CtlInfo` is a `#[repr(C)]` struct containing only a u32 and a fixed
+        // C char array. Zero is a valid bit pattern for both. We overwrite `ctl_name`
+        // with the control name bytes before passing it to the kernel. `fd` is valid
+        // (checked above) and `CTLIOCGINFO` expects a pointer to `struct ctl_info`
+        // with the identical layout. On failure we return early via `?` before using
+        // the partially-filled struct.
+        let ctl_id = unsafe {
+            let mut info: CtlInfo = std::mem::zeroed();
+            // Copy control name into the fixed-size buffer
+            let name_len = UTUN_CONTROL_NAME.len().min(info.ctl_name.len());
+            info.ctl_name[..name_len].copy_from_slice(&UTUN_CONTROL_NAME[..name_len]);
+
+            if libc::ioctl(fd, CTLIOCGINFO, &mut info as *mut CtlInfo) < 0 {
+                return Err(PlatformError::DeviceError(format!(
+                    "ioctl CTLIOCGINFO failed: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
-            sock
+            info.ctl_id
         };
 
-        // Configure the interface
-        self.run_ifconfig(&[
+        // Step 3: Connect with sockaddr_ctl to create the utun interface
+        // sc_unit = utun_num + 1 (unit 0 means "auto-assign", unit N creates utun(N-1))
+        let sc_unit = utun_num + 1;
+        // SAFETY: `SockaddrCtl` is a `#[repr(C)]` struct with the exact layout required
+        // by the macOS kernel control socket API. `fd` is a valid PF_SYSTEM socket (the
+        // FdGuard is still armed). We cast `&addr` to `*const libc::sockaddr`, which is
+        // the standard C idiom for `connect()`; the kernel only reads `sc_len` bytes.
+        // On failure we return an error before the fd is used further.
+        unsafe {
+            let addr = SockaddrCtl {
+                sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
+                sc_family: libc::AF_SYSTEM as u8,
+                ss_sysaddr: AF_SYS_CONTROL,
+                sc_id: ctl_id,
+                sc_unit,
+                sc_reserved: [0; 5],
+            };
+
+            let ret = libc::connect(
+                fd,
+                &addr as *const SockaddrCtl as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                return Err(PlatformError::DeviceError(format!(
+                    "connect() for utun{} (sc_unit={}) failed: {}",
+                    utun_num,
+                    sc_unit,
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        // Step 4: Set socket to non-blocking mode
+        // SAFETY: `fd` is a valid, connected PF_SYSTEM socket (guard is still armed).
+        // `F_GETFL` / `F_SETFL` are standard POSIX fcntl commands that cannot cause UB.
+        // Adding `O_NONBLOCK` to the existing flags is the conventional idiom for
+        // non-blocking I/O; no other invariants of the socket are affected.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(PlatformError::DeviceError(format!(
+                    "fcntl F_GETFL failed on utun{}: {}",
+                    utun_num,
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(PlatformError::DeviceError(format!(
+                    "fcntl F_SETFL O_NONBLOCK failed on utun{}: {}",
+                    utun_num,
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        // Socket is now fully bound and connected - disarm the RAII guard
+        guard.disarm();
+
+        let name = format!("utun{}", utun_num);
+
+        // Configure the interface (IP, netmask, MTU, bring up)
+        if let Err(e) = self.run_ifconfig(&[
             &name,
             &config.address.to_string(),
-            &config.address.to_string(), // Point-to-point
+            &config.address.to_string(), // Point-to-point destination
             "netmask",
             &Self::prefix_to_netmask(config.netmask),
             "mtu",
             &config.mtu.to_string(),
             "up",
-        ])?;
+        ]) {
+            // ifconfig failed after socket creation - close the fd manually
+            // SAFETY: `fd` is a valid open socket obtained from `libc::socket()` above.
+            // The FdGuard was already disarmed at this point, so this is the sole close
+            // of the fd on this error path. We return immediately after, so `fd` is
+            // never used again.
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(e);
+        }
 
-        log::info!("Created utun device {} with IP {}", name, config.address);
+        log::info!(
+            "Created utun device {} (ctl_id={}, sc_unit={}) with IP {}",
+            name,
+            ctl_id,
+            sc_unit,
+            config.address
+        );
 
         Ok(TunHandle { name, id: utun_num, fd })
     }
 
     fn destroy_tun(&self, handle: TunHandle) -> Result<(), PlatformError> {
         // Bring down interface
-        let _ = self.run_ifconfig(&[&handle.name, "down"]);
+        if let Err(e) = self.run_ifconfig(&[&handle.name, "down"]) {
+            log::debug!("Failed to bring {} down during destroy: {}", handle.name, e);
+        }
 
         // Close socket
+        // SAFETY: `handle.fd` is the raw file descriptor of the utun socket created in
+        // `create_tun`. Ownership transfers into `TunHandle` at that point. `destroy_tun`
+        // consumes the handle by value and is the single place that closes this fd.
+        // The fd is not used after this call.
         unsafe {
             libc::close(handle.fd);
         }
@@ -217,17 +425,35 @@ impl PlatformBackend for MacOSPlatform {
     }
 
     fn remove_route(&self, route: &RouteConfig) -> Result<(), PlatformError> {
-        let _ = self.run_route(&[
+        if let Err(e) = self.run_route(&[
             "-n",
             "delete",
             "-net",
             &format!("{}/{}", route.destination, route.prefix_len),
-        ]);
+        ]) {
+            log::debug!(
+                "Failed to remove route {}/{} on macOS: {}",
+                route.destination,
+                route.prefix_len,
+                e
+            );
+        }
         Ok(())
     }
 
     fn set_dns(&self, config: &DnsConfig) -> Result<(), PlatformError> {
         let service = self.dns_service_name()?;
+
+        // Save original DNS servers before overwriting (only if not already saved)
+        {
+            let mut guard = self.original_dns.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                let current = self.capture_current_dns(&service);
+                *guard = Some(current);
+                log::debug!("Saved original DNS servers: {:?}", guard.as_ref());
+            }
+        }
+
         let mut args = vec!["-setdnsservers".to_string(), service];
         args.extend(config.servers.iter().map(|s| s.to_string()));
         if config.servers.is_empty() {
@@ -241,11 +467,30 @@ impl PlatformBackend for MacOSPlatform {
     }
 
     fn restore_dns(&self) -> Result<(), PlatformError> {
-        // Reset DNS to DHCP
         let service = self.dns_service_name()?;
-        self.run_networksetup(&["-setdnsservers", &service, "Empty"])?;
 
-        log::info!("DNS restored to DHCP");
+        // Restore original DNS servers instead of blindly resetting to DHCP
+        let saved = {
+            let mut guard = self.original_dns.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+
+        match saved {
+            Some(servers) if !servers.is_empty() => {
+                // Restore the exact original DNS servers
+                let mut args = vec!["-setdnsservers", &service];
+                let server_refs: Vec<&str> = servers.iter().map(String::as_str).collect();
+                args.extend(server_refs);
+                self.run_networksetup(&args)?;
+                log::info!("DNS restored to original servers: {:?}", servers);
+            }
+            _ => {
+                // Original was DHCP (no DNS set) - "Empty" is correct here
+                self.run_networksetup(&["-setdnsservers", &service, "Empty"])?;
+                log::info!("DNS restored to DHCP (original state)");
+            }
+        }
+
         Ok(())
     }
 

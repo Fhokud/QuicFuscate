@@ -109,6 +109,8 @@ pub struct ClientBackend {
     connection: Option<ClientConnection>,
     /// TUN device handle
     tun_handle: Option<TunHandle>,
+    /// Active gateway used for routing (stored for disconnect cleanup)
+    active_gateway: Option<IpAddr>,
     /// Statistics
     stats: ClientStatsInternal,
 }
@@ -141,6 +143,7 @@ impl ClientBackend {
             state: ConnectionState::Disconnected,
             connection: None,
             tun_handle: None,
+            active_gateway: None,
             stats: ClientStatsInternal::default(),
         }
     }
@@ -152,6 +155,7 @@ impl ClientBackend {
             state: ConnectionState::Disconnected,
             connection: None,
             tun_handle: None,
+            active_gateway: None,
             stats: ClientStatsInternal::default(),
         }
     }
@@ -218,9 +222,10 @@ impl ClientBackend {
             let s = stealth.trim().to_ascii_lowercase();
             config.stealth.mode = match s.as_str() {
                 "off" => crate::engine::StealthMode::Off,
+                "performance" => crate::engine::StealthMode::Performance,
+                "stealth" => crate::engine::StealthMode::Stealth,
+                "anti-dpi" | "antidpi" | "anti_dpi" | "max" => crate::engine::StealthMode::AntiDpi,
                 "manual" => crate::engine::StealthMode::Manual,
-                "max" | "anti-dpi" | "antidpi" | "anti_dpi" => crate::engine::StealthMode::Max,
-                "auto" | "intelligent" | "dynamic" => crate::engine::StealthMode::Auto,
                 _ => crate::engine::StealthMode::Auto,
             };
         }
@@ -229,8 +234,7 @@ impl ClientBackend {
             let f = fec.trim().to_ascii_lowercase();
             config.fec.mode = match f.as_str() {
                 "off" | "zero" => crate::engine::FecMode::Off,
-                "auto" | "dynamic" => crate::engine::FecMode::Auto,
-                "on" | "manual" | "normal" => crate::engine::FecMode::Manual,
+                "auto" | "dynamic" | "on" | "manual" | "normal" => crate::engine::FecMode::Auto,
                 _ => crate::engine::FecMode::Auto,
             };
         }
@@ -272,7 +276,8 @@ impl ClientBackend {
         self.connection = Some(connection);
 
         // Add routes (route all traffic through VPN)
-        let gateway: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 8, 0, 1));
+        let default_gateway = IpAddr::V4(std::net::Ipv4Addr::new(10, 8, 0, 1));
+        let gateway: IpAddr = config.interface.tun_gateway.unwrap_or(default_gateway);
         self.platform.add_route(&RouteConfig {
             destination: IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             prefix_len: 1,
@@ -286,14 +291,19 @@ impl ClientBackend {
             metric: 10,
         })?;
 
-        // Configure DNS
-        self.platform.set_dns(&DnsConfig {
-            servers: vec![
+        // Configure DNS (from config or defaults)
+        let dns_servers = if config.interface.dns_servers.is_empty() {
+            vec![
                 IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
                 IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            ],
-            search_domains: vec![],
-        })?;
+            ]
+        } else {
+            config.interface.dns_servers.clone()
+        };
+        self.platform.set_dns(&DnsConfig { servers: dns_servers, search_domains: vec![] })?;
+
+        // Store active gateway for disconnect cleanup
+        self.active_gateway = Some(gateway);
 
         // Update state
         self.stats.connect_time = Some(std::time::Instant::now());
@@ -317,27 +327,39 @@ impl ClientBackend {
             conn.close(0, b"user disconnect");
         }
 
-        // Restore DNS
-        let _ = self.platform.restore_dns();
+        // Restore DNS - retry once on failure, then propagate error
+        if let Err(e) = self.platform.restore_dns() {
+            log::warn!("DNS restore failed, retrying: {}", e);
+            if let Err(e2) = self.platform.restore_dns() {
+                return Err(BackendError::Platform(e2));
+            }
+        }
 
         // Remove routes
-        let gateway: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 8, 0, 1));
-        let _ = self.platform.remove_route(&RouteConfig {
+        let default_gateway = IpAddr::V4(std::net::Ipv4Addr::new(10, 8, 0, 1));
+        let gateway: IpAddr = self.active_gateway.take().unwrap_or(default_gateway);
+        if let Err(e) = self.platform.remove_route(&RouteConfig {
             destination: IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             prefix_len: 1,
             gateway,
             metric: 10,
-        });
-        let _ = self.platform.remove_route(&RouteConfig {
+        }) {
+            log::warn!("Failed to remove default route half 0.0.0.0/1: {}", e);
+        }
+        if let Err(e) = self.platform.remove_route(&RouteConfig {
             destination: IpAddr::V4(std::net::Ipv4Addr::new(128, 0, 0, 0)),
             prefix_len: 1,
             gateway,
             metric: 10,
-        });
+        }) {
+            log::warn!("Failed to remove default route half 128.0.0.0/1: {}", e);
+        }
 
         // Destroy TUN device
         if let Some(handle) = self.tun_handle.take() {
-            let _ = self.platform.destroy_tun(handle);
+            if let Err(e) = self.platform.destroy_tun(handle) {
+                log::warn!("Failed to destroy TUN device during disconnect: {}", e);
+            }
         }
 
         // Reset state
@@ -363,7 +385,9 @@ impl Default for ClientBackend {
 impl Drop for ClientBackend {
     fn drop(&mut self) {
         // Ensure cleanup on drop
-        let _ = self.disconnect();
+        if let Err(e) = self.disconnect() {
+            log::warn!("ClientBackend drop cleanup failed: {}", e);
+        }
     }
 }
 

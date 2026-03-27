@@ -91,13 +91,32 @@ impl PlatformBackend for WindowsPlatform {
         Err(PlatformError::PermissionDenied("Please run as Administrator".to_string()))
     }
 
+    /// Create and configure a TUN device on Windows.
+    ///
+    /// # WinTUN Prerequisite
+    ///
+    /// Windows does not ship with a built-in TUN driver. The WinTUN driver must
+    /// be installed before QuicFuscate can create tunnel interfaces:
+    ///
+    /// 1. Download the WinTUN driver from <https://www.wintun.net/>
+    /// 2. Install the driver (requires Administrator privileges)
+    /// 3. Create a TUN adapter named "QuicFuscate" (or the name in your config)
+    ///
+    /// Without WinTUN, this function returns `PlatformError::Unsupported` with
+    /// a descriptive message including the download URL.
     fn create_tun(&self, config: &TunDeviceConfig) -> Result<TunHandle, PlatformError> {
         let name = config.name.clone().unwrap_or_else(|| "QuicFuscate".to_string());
 
         if !self.interface_exists(&name)? {
             return Err(PlatformError::Unsupported(format!(
-                "Interface '{}' not found. Create a WinTUN adapter with this name before connecting.",
-                name
+                "TUN interface '{}' not found. The WinTUN driver is required on Windows.\n\
+                 \n\
+                 To fix this:\n\
+                 1. Download WinTUN from https://www.wintun.net/\n\
+                 2. Install the driver (requires Administrator)\n\
+                 3. Create a TUN adapter named '{}'\n\
+                 4. Run QuicFuscate as Administrator",
+                name, name
             )));
         }
 
@@ -146,7 +165,9 @@ impl PlatformBackend for WindowsPlatform {
     }
 
     fn remove_route(&self, route: &RouteConfig) -> Result<(), PlatformError> {
-        let _ = self.run_route(&["delete", &route.destination.to_string()]);
+        if let Err(e) = self.run_route(&["delete", &route.destination.to_string()]) {
+            log::debug!("Failed to remove Windows route {}: {}", route.destination, e);
+        }
         Ok(())
     }
 

@@ -19,19 +19,20 @@ pub fn global() -> Arc<GlobalMetrics> {
 /// Global metrics collector.
 #[derive(Debug)]
 pub struct GlobalMetrics {
-    // Server metrics
+    /// Server-side connection and session metrics.
     pub server: ServerMetrics,
-    // Client metrics
+    /// Client-side connection metrics.
     pub client: ClientMetrics,
-    // Transport metrics
+    /// Transport layer traffic and congestion metrics.
     pub transport: TransportMetrics,
-    // Stealth metrics
+    /// Stealth mode and fingerprint metrics.
     pub stealth: StealthMetrics,
-    // FEC metrics
+    /// Forward error correction metrics.
     pub fec: FecMetrics,
 }
 
 impl GlobalMetrics {
+    /// Create a new `GlobalMetrics` with all counters at zero.
     pub fn new() -> Self {
         Self {
             server: ServerMetrics::new(),
@@ -81,24 +82,31 @@ impl Default for GlobalMetrics {
 /// Server-specific metrics.
 #[derive(Debug)]
 pub struct ServerMetrics {
+    /// Instant when the server started (for uptime calculation).
     pub start_time: std::time::Instant,
 
-    // Connection metrics
+    /// Currently connected clients (gauge).
     pub clients_active: AtomicU64,
+    /// Cumulative total clients that have connected.
     pub clients_total: AtomicU64,
+    /// Total accepted connections.
     pub connections_accepted: AtomicU64,
+    /// Total rejected connections.
     pub connections_rejected: AtomicU64,
 
-    // Session metrics
+    /// Total sessions created.
     pub sessions_created: AtomicU64,
+    /// Total sessions expired.
     pub sessions_expired: AtomicU64,
 
-    // Error metrics
+    /// Total authentication failures.
     pub auth_failed: AtomicU64,
+    /// Total rate-limited events.
     pub rate_limited: AtomicU64,
 }
 
 impl ServerMetrics {
+    /// Create a new `ServerMetrics` with start time set to now.
     pub fn new() -> Self {
         Self {
             start_time: std::time::Instant::now(),
@@ -113,36 +121,43 @@ impl ServerMetrics {
         }
     }
 
+    /// Return seconds elapsed since server start.
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
 
+    /// Record a new client connection (increments active + total).
     pub fn client_connected(&self) {
         self.clients_active.fetch_add(1, Ordering::Relaxed);
         self.clients_total.fetch_add(1, Ordering::Relaxed);
-        self.connections_accepted.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a client disconnection (decrements active count).
     pub fn client_disconnected(&self) {
         self.clients_active.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Record a rejected connection attempt.
     pub fn connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a new session creation.
     pub fn session_created(&self) {
         self.sessions_created.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a session expiration.
     pub fn session_expired(&self) {
         self.sessions_expired.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an authentication failure.
     pub fn auth_failure(&self) {
         self.auth_failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a rate-limit enforcement event.
     pub fn rate_limit_hit(&self) {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
@@ -205,7 +220,7 @@ impl ServerMetrics {
             self.auth_failed.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP quicfuscate_rate_limited Rate limited connections\n");
+        out.push_str("# HELP quicfuscate_rate_limited Rate-limited events\n");
         out.push_str("# TYPE quicfuscate_rate_limited counter\n");
         out.push_str(&format!(
             "quicfuscate_rate_limited {}\n\n",
@@ -223,14 +238,20 @@ impl Default for ServerMetrics {
 /// Client-specific metrics.
 #[derive(Debug)]
 pub struct ClientMetrics {
+    /// Total connection attempts initiated by the client.
     pub connection_attempts: AtomicU64,
+    /// Successful connection establishments.
     pub connection_successes: AtomicU64,
+    /// Failed connection attempts.
     pub connection_failures: AtomicU64,
+    /// Automatic reconnection events.
     pub reconnects: AtomicU64,
+    /// Client uptime in seconds (updated periodically).
     pub uptime_secs: AtomicU64,
 }
 
 impl ClientMetrics {
+    /// Create a new `ClientMetrics` with all counters at zero.
     pub fn new() -> Self {
         Self {
             connection_attempts: AtomicU64::new(0),
@@ -241,18 +262,22 @@ impl ClientMetrics {
         }
     }
 
+    /// Record a connection attempt.
     pub fn connection_attempt(&self) {
         self.connection_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a successful connection.
     pub fn connection_success(&self) {
         self.connection_successes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a failed connection attempt.
     pub fn connection_failure(&self) {
         self.connection_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an automatic reconnection event.
     pub fn reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
@@ -267,26 +292,36 @@ impl Default for ClientMetrics {
 /// Transport layer metrics.
 #[derive(Debug)]
 pub struct TransportMetrics {
-    // Traffic
+    /// Total bytes received.
     pub bytes_in: AtomicU64,
+    /// Total bytes sent.
     pub bytes_out: AtomicU64,
+    /// Total packets received.
     pub packets_in: AtomicU64,
+    /// Total packets sent.
     pub packets_out: AtomicU64,
 
-    // QUIC specific
+    /// QUIC streams opened.
     pub streams_opened: AtomicU64,
+    /// QUIC streams closed.
     pub streams_closed: AtomicU64,
+    /// QUIC datagrams sent.
     pub datagrams_sent: AtomicU64,
+    /// QUIC datagrams received.
     pub datagrams_received: AtomicU64,
 
-    // Congestion
+    /// Packets detected as lost.
     pub packets_lost: AtomicU64,
+    /// Packets retransmitted.
     pub packets_retransmitted: AtomicU64,
+    /// Number of RTT samples collected.
     pub rtt_samples: AtomicU64,
+    /// Cumulative RTT sum in microseconds (for averaging).
     pub rtt_sum_us: AtomicU64,
 }
 
 impl TransportMetrics {
+    /// Create a new `TransportMetrics` with all counters at zero.
     pub fn new() -> Self {
         Self {
             bytes_in: AtomicU64::new(0),
@@ -304,31 +339,38 @@ impl TransportMetrics {
         }
     }
 
+    /// Add received bytes to the counter.
     pub fn record_bytes_in(&self, bytes: u64) {
         self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Add sent bytes to the counter.
     pub fn record_bytes_out(&self, bytes: u64) {
         self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Increment the received packet counter.
     pub fn record_packet_in(&self) {
         self.packets_in.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the sent packet counter.
     pub fn record_packet_out(&self) {
         self.packets_out.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a packet loss event.
     pub fn record_packet_loss(&self) {
         self.packets_lost.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an RTT sample in microseconds.
     pub fn record_rtt(&self, rtt_us: u64) {
         self.rtt_samples.fetch_add(1, Ordering::Relaxed);
         self.rtt_sum_us.fetch_add(rtt_us, Ordering::Relaxed);
     }
 
+    /// Compute the average RTT in milliseconds from collected samples.
     pub fn avg_rtt_ms(&self) -> f64 {
         let samples = self.rtt_samples.load(Ordering::Relaxed);
         if samples == 0 {
@@ -338,6 +380,7 @@ impl TransportMetrics {
         (sum as f64 / samples as f64) / 1000.0
     }
 
+    /// Compute the packet loss rate as a percentage.
     pub fn loss_rate(&self) -> f64 {
         let sent = self.packets_out.load(Ordering::Relaxed);
         if sent == 0 {
@@ -402,16 +445,24 @@ impl Default for TransportMetrics {
 /// Stealth mode metrics.
 #[derive(Debug)]
 pub struct StealthMetrics {
+    /// Times stealth mode was set to "off".
     pub mode_off: AtomicU64,
+    /// Times stealth mode was set to "auto".
     pub mode_auto: AtomicU64,
+    /// Times stealth mode was set to "max".
     pub mode_max: AtomicU64,
+    /// Clients currently using HTTP/3 stealth path.
     pub http3_active: AtomicU64,
+    /// Clients currently using TLS 1.3 stealth path.
     pub tls13_active: AtomicU64,
+    /// Total padding bytes injected for stealth.
     pub padding_bytes: AtomicU64,
+    /// Total fingerprint rotation events.
     pub fingerprint_rotations: AtomicU64,
 }
 
 impl StealthMetrics {
+    /// Create a new `StealthMetrics` with all counters at zero.
     pub fn new() -> Self {
         Self {
             mode_off: AtomicU64::new(0),
@@ -424,6 +475,7 @@ impl StealthMetrics {
         }
     }
 
+    /// Record a stealth mode selection ("off", "auto", or "max").
     pub fn record_mode(&self, mode: &str) {
         match mode {
             "off" => self.mode_off.fetch_add(1, Ordering::Relaxed),
@@ -433,14 +485,17 @@ impl StealthMetrics {
         };
     }
 
+    /// Record padding bytes injected for stealth.
     pub fn record_padding(&self, bytes: u64) {
         self.padding_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Set the count of clients using HTTP/3 stealth.
     pub fn set_http3_active(&self, count: u64) {
         self.http3_active.store(count, Ordering::Relaxed);
     }
 
+    /// Set the count of clients using TLS 1.3 stealth.
     pub fn set_tls13_active(&self, count: u64) {
         self.tls13_active.store(count, Ordering::Relaxed);
     }
@@ -478,14 +533,20 @@ impl Default for StealthMetrics {
 /// FEC (Forward Error Correction) metrics.
 #[derive(Debug)]
 pub struct FecMetrics {
+    /// Total packets processed by FEC encoder.
     pub packets_encoded: AtomicU64,
+    /// Total packets processed by FEC decoder.
     pub packets_decoded: AtomicU64,
+    /// Total packets successfully recovered via FEC.
     pub packets_recovered: AtomicU64,
+    /// Total FEC recovery failures.
     pub recovery_failures: AtomicU64,
+    /// Total redundancy bytes added by FEC.
     pub redundancy_bytes: AtomicU64,
 }
 
 impl FecMetrics {
+    /// Create a new `FecMetrics` with all counters at zero.
     pub fn new() -> Self {
         Self {
             packets_encoded: AtomicU64::new(0),
@@ -496,26 +557,32 @@ impl FecMetrics {
         }
     }
 
+    /// Record a FEC encode operation.
     pub fn record_encode(&self) {
         self.packets_encoded.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a FEC decode operation.
     pub fn record_decode(&self) {
         self.packets_decoded.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a successful FEC packet recovery.
     pub fn record_recovery(&self) {
         self.packets_recovered.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a failed FEC recovery attempt.
     pub fn record_recovery_failure(&self) {
         self.recovery_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record redundancy bytes added by FEC encoding.
     pub fn record_redundancy(&self, bytes: u64) {
         self.redundancy_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Compute the FEC recovery success rate as a percentage.
     pub fn recovery_rate(&self) -> f64 {
         let total = self.packets_recovered.load(Ordering::Relaxed)
             + self.recovery_failures.load(Ordering::Relaxed);
@@ -581,6 +648,20 @@ mod tests {
 
         assert_eq!(metrics.server.clients_active.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.server.clients_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_server_client_connected_does_not_imply_connection_accepted() {
+        let metrics = GlobalMetrics::new();
+
+        metrics.server.client_connected();
+
+        assert_eq!(metrics.server.clients_active.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.server.clients_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.server.connections_accepted.load(Ordering::Relaxed), 0);
+
+        metrics.server.connections_accepted.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(metrics.server.connections_accepted.load(Ordering::Relaxed), 1);
     }
 
     #[test]

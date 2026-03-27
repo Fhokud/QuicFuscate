@@ -3,272 +3,10 @@
 
 use crate::optimize::telemetry;
 use crate::optimize::{CpuFeature, FeatureDetector};
-#[allow(unused_imports)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::simd::CpuProfile;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__m256;
-
-/// Mean and variance with SIMD - 4x faster (AVX2+FMA/NEON)
-#[inline(always)]
-pub fn compute_statistics(data: &[f32]) -> (f32, f32) {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { compute_statistics_avx2_fma(data) };
-        }
-        CpuProfile::X86_P1f
-        | CpuProfile::X86_P1b
-        | CpuProfile::X86_P1a
-        | CpuProfile::X86_P0b
-        | CpuProfile::X86_P0a => {
-            return unsafe { compute_statistics_sse2(data) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A2 => {
-            return unsafe { compute_statistics_sve2(data) };
-        }
-        CpuProfile::ARM_A1c | CpuProfile::ARM_A1d | CpuProfile::Apple_M => {
-            return unsafe { compute_statistics_neon(data) };
-        }
-        _ => {}
-    }
-
-    // Scalar fallback
-    let n = data.len() as f32;
-    let sum: f32 = data.iter().sum();
-    let mean = sum / n;
-    let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
-    (mean, variance)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn compute_statistics_avx2_fma(data: &[f32]) -> (f32, f32) {
-    use std::arch::x86_64::*;
-
-    let n = data.len() as f32;
-    let mut sum_vec = _mm256_setzero_ps();
-    let mut i = 0;
-
-    // Compute sum with AVX2
-    while i + 8 <= data.len() {
-        let vals = _mm256_loadu_ps(data.as_ptr().add(i));
-        sum_vec = _mm256_add_ps(sum_vec, vals);
-        i += 8;
-    }
-
-    // Horizontal sum
-    let sum_128 = _mm_add_ps(_mm256_extractf128_ps(sum_vec, 0), _mm256_extractf128_ps(sum_vec, 1));
-    let sum_64 = _mm_add_ps(sum_128, _mm_movehl_ps(sum_128, sum_128));
-    let sum_32 = _mm_add_ss(sum_64, _mm_shuffle_ps(sum_64, sum_64, 0x01));
-    let mut sum = _mm_cvtss_f32(sum_32);
-
-    // Add remainder
-    while i < data.len() {
-        sum += data[i];
-        i += 1;
-    }
-
-    let mean = sum / n;
-    let mean_vec = _mm256_set1_ps(mean);
-
-    // Compute variance with FMA
-    let mut var_vec = _mm256_setzero_ps();
-    i = 0;
-
-    while i + 8 <= data.len() {
-        let vals = _mm256_loadu_ps(data.as_ptr().add(i));
-        let diff = _mm256_sub_ps(vals, mean_vec);
-        var_vec = _mm256_fmadd_ps(diff, diff, var_vec);
-        i += 8;
-    }
-
-    // Horizontal sum for variance
-    let var_128 = _mm_add_ps(_mm256_extractf128_ps(var_vec, 0), _mm256_extractf128_ps(var_vec, 1));
-    let var_64 = _mm_add_ps(var_128, _mm_movehl_ps(var_128, var_128));
-    let var_32 = _mm_add_ss(var_64, _mm_shuffle_ps(var_64, var_64, 0x01));
-    let mut variance = _mm_cvtss_f32(var_32);
-
-    // Add remainder
-    while i < data.len() {
-        let diff = data[i] - mean;
-        variance += diff * diff;
-        i += 1;
-    }
-
-    (mean, variance / n)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn compute_statistics_sse2(data: &[f32]) -> (f32, f32) {
-    use std::arch::x86_64::*;
-
-    let n = data.len() as f32;
-    if n == 0.0 {
-        return (0.0, 0.0);
-    }
-
-    let mut sum_vec = _mm_setzero_ps();
-    let mut i = 0usize;
-
-    while i + 4 <= data.len() {
-        let vals = _mm_loadu_ps(data.as_ptr().add(i));
-        sum_vec = _mm_add_ps(sum_vec, vals);
-        i += 4;
-    }
-
-    let mut sum = horizontal_sum_ps_sse(sum_vec);
-    while i < data.len() {
-        sum += data[i];
-        i += 1;
-    }
-
-    let mean = sum / n;
-    let mean_vec = _mm_set1_ps(mean);
-
-    let mut var_vec = _mm_setzero_ps();
-    i = 0;
-    while i + 4 <= data.len() {
-        let vals = _mm_loadu_ps(data.as_ptr().add(i));
-        let diff = _mm_sub_ps(vals, mean_vec);
-        var_vec = _mm_add_ps(var_vec, _mm_mul_ps(diff, diff));
-        i += 4;
-    }
-
-    let mut variance = horizontal_sum_ps_sse(var_vec);
-    while i < data.len() {
-        let diff = data[i] - mean;
-        variance += diff * diff;
-        i += 1;
-    }
-
-    (mean, variance / n)
-}
-
-/// NEON-optimized mean and variance with FMA - 4x faster on ARM
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn compute_statistics_neon(data: &[f32]) -> (f32, f32) {
-    use std::arch::aarch64::*;
-
-    let n = data.len() as f32;
-    let mut sum_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-
-    // Compute sum with NEON (4x f32 per iteration)
-    while i + 4 <= data.len() {
-        let vals = vld1q_f32(data.as_ptr().add(i));
-        sum_vec = vaddq_f32(sum_vec, vals);
-        i += 4;
-    }
-
-    // Horizontal sum (NEON pairwise add)
-    let sum_pair = vpadd_f32(vget_low_f32(sum_vec), vget_high_f32(sum_vec));
-    let sum_scalar = vpadd_f32(sum_pair, sum_pair);
-    let mut sum = vget_lane_f32::<0>(sum_scalar);
-
-    // Add remainder
-    while i < data.len() {
-        sum += data[i];
-        i += 1;
-    }
-
-    let mean = sum / n;
-    let mean_vec = vdupq_n_f32(mean);
-
-    // Compute variance with NEON FMA
-    let mut var_vec = vdupq_n_f32(0.0);
-    i = 0;
-
-    while i + 4 <= data.len() {
-        let vals = vld1q_f32(data.as_ptr().add(i));
-        let diff = vsubq_f32(vals, mean_vec);
-        // FMA: var_vec += diff * diff
-        var_vec = vfmaq_f32(var_vec, diff, diff);
-        i += 4;
-    }
-
-    // Horizontal sum for variance
-    let var_pair = vpadd_f32(vget_low_f32(var_vec), vget_high_f32(var_vec));
-    let var_scalar = vpadd_f32(var_pair, var_pair);
-    let mut variance = vget_lane_f32::<0>(var_scalar);
-
-    // Add remainder
-    while i < data.len() {
-        let diff = data[i] - mean;
-        variance += diff * diff;
-        i += 1;
-    }
-
-    (mean, variance / n)
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn compute_statistics_sve2(data: &[f32]) -> (f32, f32) {
-    #[cfg(target_feature = "sve2")]
-    {
-        compute_statistics_sve2_impl(data)
-    }
-
-    #[cfg(not(target_feature = "sve2"))]
-    {
-        compute_statistics_neon(data)
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-#[target_feature(enable = "sve2")]
-unsafe fn compute_statistics_sve2_impl(data: &[f32]) -> (f32, f32) {
-    use std::arch::aarch64::*;
-
-    let n = data.len();
-    if n == 0 {
-        return (0.0, 0.0);
-    }
-
-    let mut offset = 0usize;
-    let mut sum_vec = svdup_f32(0.0);
-
-    while offset < n {
-        let pg = svwhilelt_b32(offset as u64, n as u64);
-        let vals = svld1_f32(pg, data.as_ptr().add(offset));
-        sum_vec = svadd_f32_m(pg, sum_vec, vals);
-        offset += svcntw() as usize;
-    }
-
-    let total_sum = svaddv_f32(svptrue_b32(), sum_vec);
-    let mean = total_sum / (n as f32);
-
-    offset = 0;
-    let mean_vec = svdup_f32(mean);
-    let mut var_vec = svdup_f32(0.0);
-
-    while offset < n {
-        let pg = svwhilelt_b32(offset as u64, n as u64);
-        let vals = svld1_f32(pg, data.as_ptr().add(offset));
-        let diff = svsub_f32_x(pg, vals, mean_vec);
-        var_vec = svmla_f32_m(pg, var_vec, diff, diff);
-        offset += svcntw() as usize;
-    }
-
-    let variance = svaddv_f32(svptrue_b32(), var_vec) / (n as f32);
-    (mean, variance)
-}
 
 /// Apply exponential decay to histogram bins (u64) using SIMD fast paths.
 #[inline(always)]
@@ -287,7 +25,7 @@ pub fn decay_histogram(bins: &mut [u64], decay: f64) {
         return;
     }
 
-    #[allow(unused_variables)]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let detector = FeatureDetector::instance();
 
     #[cfg(target_arch = "x86_64")]
@@ -354,7 +92,7 @@ pub fn jensen_shannon_divergence(bins: &[u64], total: u64, target: &[f64]) -> f6
         return 0.0;
     }
 
-    #[allow(unused_variables)]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let detector = FeatureDetector::instance();
 
     #[cfg(target_arch = "x86_64")]
@@ -930,259 +668,6 @@ unsafe fn vlogq_f64_neon(v: std::arch::aarch64::float64x2_t) -> std::arch::aarch
     std::arch::aarch64::vld1q_f64(tmp.as_ptr())
 }
 
-/// Correlation with SIMD dot product - 5x faster (AVX2/NEON)
-#[inline(always)]
-pub fn compute_correlation(x: &[f32], y: &[f32]) -> f32 {
-    let _profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => {
-            return unsafe { compute_correlation_avx2(x, y) };
-        }
-        CpuProfile::X86_P1f
-        | CpuProfile::X86_P1b
-        | CpuProfile::X86_P1a
-        | CpuProfile::X86_P0b
-        | CpuProfile::X86_P0a => {
-            return unsafe { compute_correlation_sse2(x, y) };
-        }
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match _profile {
-        CpuProfile::ARM_A2 => {
-            return unsafe { compute_correlation_sve2(x, y) };
-        }
-        CpuProfile::ARM_A1c | CpuProfile::ARM_A1d | CpuProfile::Apple_M => {
-            return unsafe { compute_correlation_neon(x, y) };
-        }
-        _ => {}
-    }
-
-    // Scalar fallback
-    let n = x.len().min(y.len()) as f32;
-    if n == 0.0 {
-        return 0.0;
-    }
-    let (mean_x, _) = compute_statistics(x);
-    let (mean_y, _) = compute_statistics(y);
-
-    let mut cov = 0.0;
-    let mut var_x = 0.0;
-    let mut var_y = 0.0;
-
-    for i in 0..x.len().min(y.len()) {
-        let dx = x[i] - mean_x;
-        let dy = y[i] - mean_y;
-        cov += dx * dy;
-        var_x += dx * dx;
-        var_y += dy * dy;
-    }
-
-    cov / (var_x * var_y).sqrt()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn compute_correlation_avx2(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let n = x.len().min(y.len());
-    let (mean_x, _) = compute_statistics_avx2_fma(x);
-    let (mean_y, _) = compute_statistics_avx2_fma(y);
-
-    let mean_x_vec = _mm256_set1_ps(mean_x);
-    let mean_y_vec = _mm256_set1_ps(mean_y);
-
-    let mut cov_vec = _mm256_setzero_ps();
-    let mut var_x_vec = _mm256_setzero_ps();
-    let mut var_y_vec = _mm256_setzero_ps();
-
-    let mut i = 0;
-    while i + 8 <= n {
-        let x_vals = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y_vals = _mm256_loadu_ps(y.as_ptr().add(i));
-
-        let dx = _mm256_sub_ps(x_vals, mean_x_vec);
-        let dy = _mm256_sub_ps(y_vals, mean_y_vec);
-
-        cov_vec = _mm256_fmadd_ps(dx, dy, cov_vec);
-        var_x_vec = _mm256_fmadd_ps(dx, dx, var_x_vec);
-        var_y_vec = _mm256_fmadd_ps(dy, dy, var_y_vec);
-
-        i += 8;
-    }
-
-    // Horizontal sums
-    let cov = horizontal_sum_ps(cov_vec);
-    let var_x = horizontal_sum_ps(var_x_vec);
-    let var_y = horizontal_sum_ps(var_y_vec);
-
-    cov / (var_x * var_y).sqrt()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn compute_correlation_sse2(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let n = x.len().min(y.len());
-    if n == 0 {
-        return 0.0;
-    }
-
-    let (mean_x, _) = compute_statistics_sse2(x);
-    let (mean_y, _) = compute_statistics_sse2(y);
-
-    let mean_x_vec = _mm_set1_ps(mean_x);
-    let mean_y_vec = _mm_set1_ps(mean_y);
-
-    let mut cov_vec = _mm_setzero_ps();
-    let mut var_x_vec = _mm_setzero_ps();
-    let mut var_y_vec = _mm_setzero_ps();
-
-    let mut i = 0usize;
-    while i + 4 <= n {
-        let x_vals = _mm_loadu_ps(x.as_ptr().add(i));
-        let y_vals = _mm_loadu_ps(y.as_ptr().add(i));
-
-        let dx = _mm_sub_ps(x_vals, mean_x_vec);
-        let dy = _mm_sub_ps(y_vals, mean_y_vec);
-
-        cov_vec = _mm_add_ps(cov_vec, _mm_mul_ps(dx, dy));
-        var_x_vec = _mm_add_ps(var_x_vec, _mm_mul_ps(dx, dx));
-        var_y_vec = _mm_add_ps(var_y_vec, _mm_mul_ps(dy, dy));
-        i += 4;
-    }
-
-    let mut cov = horizontal_sum_ps_sse(cov_vec);
-    let mut var_x = horizontal_sum_ps_sse(var_x_vec);
-    let mut var_y = horizontal_sum_ps_sse(var_y_vec);
-
-    while i < n {
-        let dx = x[i] - mean_x;
-        let dy = y[i] - mean_y;
-        cov += dx * dy;
-        var_x += dx * dx;
-        var_y += dy * dy;
-        i += 1;
-    }
-
-    cov / (var_x * var_y).sqrt()
-}
-
-/// NEON-optimized correlation with FMA - 5x faster on ARM
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn compute_correlation_neon(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-
-    let n = x.len().min(y.len());
-    let (mean_x, _) = compute_statistics_neon(x);
-    let (mean_y, _) = compute_statistics_neon(y);
-
-    let mean_x_vec = vdupq_n_f32(mean_x);
-    let mean_y_vec = vdupq_n_f32(mean_y);
-
-    let mut cov_vec = vdupq_n_f32(0.0);
-    let mut var_x_vec = vdupq_n_f32(0.0);
-    let mut var_y_vec = vdupq_n_f32(0.0);
-
-    let mut i = 0;
-    while i + 4 <= n {
-        let x_vals = vld1q_f32(x.as_ptr().add(i));
-        let y_vals = vld1q_f32(y.as_ptr().add(i));
-
-        let dx = vsubq_f32(x_vals, mean_x_vec);
-        let dy = vsubq_f32(y_vals, mean_y_vec);
-
-        // FMA: cov += dx * dy, var_x += dx * dx, var_y += dy * dy
-        cov_vec = vfmaq_f32(cov_vec, dx, dy);
-        var_x_vec = vfmaq_f32(var_x_vec, dx, dx);
-        var_y_vec = vfmaq_f32(var_y_vec, dy, dy);
-
-        i += 4;
-    }
-
-    // Horizontal sums (NEON pairwise)
-    let cov_pair = vpadd_f32(vget_low_f32(cov_vec), vget_high_f32(cov_vec));
-    let cov = vget_lane_f32::<0>(vpadd_f32(cov_pair, cov_pair));
-
-    let var_x_pair = vpadd_f32(vget_low_f32(var_x_vec), vget_high_f32(var_x_vec));
-    let var_x = vget_lane_f32::<0>(vpadd_f32(var_x_pair, var_x_pair));
-
-    let var_y_pair = vpadd_f32(vget_low_f32(var_y_vec), vget_high_f32(var_y_vec));
-    let var_y = vget_lane_f32::<0>(vpadd_f32(var_y_pair, var_y_pair));
-
-    cov / (var_x * var_y).sqrt()
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn compute_correlation_sve2(x: &[f32], y: &[f32]) -> f32 {
-    #[cfg(target_feature = "sve2")]
-    {
-        compute_correlation_sve2_impl(x, y)
-    }
-
-    #[cfg(not(target_feature = "sve2"))]
-    {
-        compute_correlation_neon(x, y)
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-#[target_feature(enable = "sve2")]
-unsafe fn compute_correlation_sve2_impl(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-
-    let n = x.len().min(y.len());
-    if n == 0 {
-        return 0.0;
-    }
-
-    let (mean_x, _) = compute_statistics_sve2_impl(&x[..n]);
-    let (mean_y, _) = compute_statistics_sve2_impl(&y[..n]);
-
-    let mean_x_vec = svdup_f32(mean_x);
-    let mean_y_vec = svdup_f32(mean_y);
-
-    let mut cov_vec = svdup_f32(0.0);
-    let mut var_x_vec = svdup_f32(0.0);
-    let mut var_y_vec = svdup_f32(0.0);
-
-    let mut offset = 0usize;
-    while offset < n {
-        let pg = svwhilelt_b32(offset as u64, n as u64);
-        let x_vals = svld1_f32(pg, x.as_ptr().add(offset));
-        let y_vals = svld1_f32(pg, y.as_ptr().add(offset));
-
-        let dx = svsub_f32_x(pg, x_vals, mean_x_vec);
-        let dy = svsub_f32_x(pg, y_vals, mean_y_vec);
-
-        cov_vec = svmla_f32_m(pg, cov_vec, dx, dy);
-        var_x_vec = svmla_f32_m(pg, var_x_vec, dx, dx);
-        var_y_vec = svmla_f32_m(pg, var_y_vec, dy, dy);
-
-        offset += svcntw() as usize;
-    }
-
-    let cov = svaddv_f32(svptrue_b32(), cov_vec);
-    let var_x = svaddv_f32(svptrue_b32(), var_x_vec);
-    let var_y = svaddv_f32(svptrue_b32(), var_y_vec);
-
-    cov / (var_x * var_y).sqrt()
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn horizontal_sum_ps(v: __m256) -> f32 {
@@ -1514,379 +999,6 @@ unsafe fn moving_average_neon(data: &[f32], window: usize) -> Vec<f32> {
     }
 
     result
-}
-
-/// Matrix multiply with AMX/AVX512 - 10x faster
-#[inline(always)]
-pub fn matrix_multiply(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    #[allow(unused_variables)]
-    let profile = FeatureDetector::instance().profile();
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "amx-int8"))]
-    if FeatureDetector::instance().has_feature(crate::optimize::CpuFeature::AMX_TILE) {
-        unsafe {
-            matrix_multiply_amx(a, b, c, m, k, n);
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    match profile {
-        CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            matrix_multiply_avx512(a, b, c, m, k, n);
-            return;
-        },
-        CpuProfile::X86_P2a | CpuProfile::X86_P2b => unsafe {
-            matrix_multiply_avx2_fma(a, b, c, m, k, n);
-            return;
-        },
-        _ => {}
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let detector = FeatureDetector::instance();
-
-        if detector.has_feature(CpuFeature::SVE2) {
-            unsafe {
-                matrix_multiply_sve2(a, b, c, m, k, n);
-            }
-            return;
-        }
-
-        if profile == CpuProfile::Apple_M {
-            unsafe {
-                matrix_multiply_apple_amx(a, b, c, m, k, n);
-            }
-            return;
-        }
-
-        if detector.has_feature(CpuFeature::NEON) {
-            unsafe {
-                matrix_multiply_neon(a, b, c, m, k, n);
-            }
-            return;
-        }
-    }
-
-    // Scalar fallback
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0.0;
-            for kk in 0..k {
-                sum += a[i * k + kk] * b[kk * n + j];
-            }
-            c[i * n + j] = sum;
-        }
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-unsafe fn matrix_multiply_apple_amx(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    // Apple AMX ultra-sophisticated matrix multiplication
-    // Using undocumented but reverse-engineered AMX instructions
-
-    // Tile dimensions for Apple Silicon
-    const TILE_M: usize = 32;
-    const TILE_N: usize = 32;
-    const TILE_K: usize = 32;
-
-    // Initialize AMX coprocessor
-    std::arch::asm!(
-        ".word 0x00201000", // AMX_START
-        options(nostack, preserves_flags)
-    );
-
-    // Configure tiles for FP32
-    let tile_config = [
-        (TILE_M as u64) | ((TILE_N as u64) << 16) | ((TILE_K as u64) << 32),
-        0x00000001, // FP32 mode
-        0x00000000, // No masking
-        0x00000000, // Reserved
-    ];
-
-    // Load configuration
-    std::arch::asm!(
-        ".word 0x00201100", // AMX_LDCFG
-        in("x0") tile_config.as_ptr(),
-        options(nostack)
-    );
-
-    for tile_i in (0..m).step_by(TILE_M) {
-        for tile_j in (0..n).step_by(TILE_N) {
-            for tile_k in (0..k).step_by(TILE_K) {
-                // Load A tile to X registers
-                let a_tile_ptr = a.as_ptr().add(tile_i * k + tile_k);
-                std::arch::asm!(
-                    ".word 0x00201201", // AMX_LDX with stride
-                    in("x0") a_tile_ptr,
-                    in("x1") (k * std::mem::size_of::<f32>()) as u64,
-                    in("x2") 0u64, // X register index
-                    options(nostack)
-                );
-
-                // Load B tile to Y registers
-                let b_tile_ptr = b.as_ptr().add(tile_k * n + tile_j);
-                std::arch::asm!(
-                    ".word 0x00201202", // AMX_LDY with stride
-                    in("x0") b_tile_ptr,
-                    in("x1") (n * std::mem::size_of::<f32>()) as u64,
-                    in("x2") 0u64, // Y register index
-                    options(nostack)
-                );
-
-                // Perform FMA operation: Z += X * Y
-                std::arch::asm!(
-                    ".word 0x00201805", // AMX_FMADDPS
-                    in("x0") 0u64, // X tile
-                    in("x1") 0u64, // Y tile
-                    in("x2") 0u64, // Z tile (accumulator)
-                    options(nostack)
-                );
-
-                // Store result tile
-                let c_tile_ptr = c.as_mut_ptr().add(tile_i * n + tile_j);
-                std::arch::asm!(
-                    ".word 0x00201403", // AMX_STZ with stride
-                    in("x0") c_tile_ptr,
-                    in("x1") (n * std::mem::size_of::<f32>()) as u64,
-                    in("x2") 0u64, // Z register index
-                    options(nostack)
-                );
-
-                // Fallback for partial tiles
-                for i in tile_i..tile_i.min(tile_i + TILE_M).min(m) {
-                    for j in tile_j..tile_j.min(tile_j + TILE_N).min(n) {
-                        if i >= tile_i + TILE_M || j >= tile_j + TILE_N {
-                            continue;
-                        }
-                        let mut sum = c[i * n + j];
-                        for kk in tile_k..tile_k.min(tile_k + TILE_K).min(k) {
-                            sum += a[i * k + kk] * b[kk * n + j];
-                        }
-                        c[i * n + j] = sum;
-                    }
-                }
-            }
-        }
-    }
-
-    // Finalize AMX
-    std::arch::asm!(
-        ".word 0x00201001", // AMX_STOP
-        options(nostack, preserves_flags)
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn matrix_multiply_avx512(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    use std::arch::x86_64::*;
-
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum_vec = _mm512_setzero_ps();
-            let mut kk = 0;
-
-            // Process 16 elements at once
-            while kk + 16 <= k {
-                let a_vec = _mm512_loadu_ps(a.as_ptr().add(i * k + kk));
-
-                // Gather b values
-                let mut b_vals = [0.0f32; 16];
-                for idx in 0..16 {
-                    b_vals[idx] = b[(kk + idx) * n + j];
-                }
-                let b_vec = _mm512_loadu_ps(b_vals.as_ptr());
-
-                sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
-                kk += 16;
-            }
-
-            // Reduce to scalar
-            let sum = _mm512_reduce_add_ps(sum_vec);
-
-            // Handle remainder
-            let mut remainder_sum = 0.0;
-            while kk < k {
-                remainder_sum += a[i * k + kk] * b[kk * n + j];
-                kk += 1;
-            }
-
-            c[i * n + j] = sum + remainder_sum;
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn matrix_multiply_avx2_fma(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    use std::arch::x86_64::*;
-
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum_vec = _mm256_setzero_ps();
-            let mut kk = 0;
-
-            // Process 8 elements at once
-            while kk + 8 <= k {
-                let a_vec = _mm256_loadu_ps(a.as_ptr().add(i * k + kk));
-
-                // Gather b values
-                let mut b_vals = [0.0f32; 8];
-                for idx in 0..8 {
-                    b_vals[idx] = b[(kk + idx) * n + j];
-                }
-                let b_vec = _mm256_loadu_ps(b_vals.as_ptr());
-
-                sum_vec = _mm256_fmadd_ps(a_vec, b_vec, sum_vec);
-                kk += 8;
-            }
-
-            // Horizontal sum
-            let sum = horizontal_sum_ps(sum_vec);
-
-            // Handle remainder
-            let mut remainder_sum = 0.0;
-            while kk < k {
-                remainder_sum += a[i * k + kk] * b[kk * n + j];
-                kk += 1;
-            }
-
-            c[i * n + j] = sum + remainder_sum;
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "amx-int8"))]
-#[inline(always)]
-unsafe fn matrix_multiply_amx(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    // Intel AMX path not yet implemented; delegate to AVX-512 variant.
-    matrix_multiply_avx512(a, b, c, m, k, n);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn matrix_multiply_neon(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    use std::arch::aarch64::*;
-
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = vdupq_n_f32(0.0);
-            let mut kk = 0;
-
-            // Process 4 elements at once
-            while kk + 4 <= k {
-                let a_vec = vld1q_f32(a.as_ptr().add(i * k + kk));
-
-                // Gather b values
-                let b0 = b[(kk) * n + j];
-                let b1 = b[(kk + 1) * n + j];
-                let b2 = b[(kk + 2) * n + j];
-                let b3 = b[(kk + 3) * n + j];
-                let b_vec = vld1q_f32([b0, b1, b2, b3].as_ptr());
-
-                sum = vfmaq_f32(sum, a_vec, b_vec);
-                kk += 4;
-            }
-
-            // Horizontal sum
-            let sum_scalar = vaddvq_f32(sum);
-
-            // Handle remainder
-            let mut remainder_sum = 0.0;
-            while kk < k {
-                remainder_sum += a[i * k + kk] * b[kk * n + j];
-                kk += 1;
-            }
-
-            c[i * n + j] = sum_scalar + remainder_sum;
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn matrix_multiply_sve2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    #[cfg(target_feature = "sve2")]
-    {
-        return matrix_multiply_sve2_impl(a, b, c, m, k, n);
-    }
-
-    #[cfg(not(target_feature = "sve2"))]
-    {
-        matrix_multiply_neon(a, b, c, m, k, n)
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-#[target_feature(enable = "sve2")]
-unsafe fn matrix_multiply_sve2_impl(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    use std::arch::aarch64::*;
-
-    let vl = svcntw() as usize;
-    let mut scratch: [f32; 64] = [0.0; 64];
-
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum_vec = svdup_f32(0.0);
-            let mut kk = 0usize;
-
-            while kk + vl <= k {
-                let a_vec = svld1_f32(svptrue_b32(), a.as_ptr().add(i * k + kk));
-
-                for lane in 0..vl {
-                    scratch[lane] = b[(kk + lane) * n + j];
-                }
-                let b_vec = svld1_f32(svptrue_b32(), scratch.as_ptr());
-                sum_vec = svmla_f32_m(svptrue_b32(), sum_vec, a_vec, b_vec);
-
-                kk += vl;
-            }
-
-            let mut accum = svaddv_f32(svptrue_b32(), sum_vec);
-
-            while kk < k {
-                accum += a[i * k + kk] * b[kk * n + j];
-                kk += 1;
-            }
-
-            c[i * n + j] = accum;
-        }
-    }
 }
 
 /// Percentile calculation with AVX2 minmax - 2x faster
@@ -2518,4 +1630,388 @@ unsafe fn fast_exp_ps(x: __m256) -> __m256 {
     let sum = _mm256_add_ps(sum, term2);
     let sum = _mm256_add_ps(sum, term3);
     _mm256_add_ps(sum, term4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // decay_histogram
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_decay_histogram_half_decay_floors_correctly() {
+        let mut bins = vec![100, 201, 50, 1, 0, 999];
+        decay_histogram(&mut bins, 0.5);
+        // floor(100*0.5)=50, floor(201*0.5)=100, floor(50*0.5)=25,
+        // floor(1*0.5)=0, 0*0.5=0, floor(999*0.5)=499
+        assert_eq!(bins, vec![50, 100, 25, 0, 0, 499]);
+    }
+
+    #[test]
+    fn test_decay_histogram_decay_one_is_noop() {
+        let original = vec![10, 20, 30, 40, 50];
+        let mut bins = original.clone();
+        decay_histogram(&mut bins, 1.0);
+        assert_eq!(bins, original);
+    }
+
+    #[test]
+    fn test_decay_histogram_decay_zero_clears_all() {
+        let mut bins = vec![100, 200, 300, u64::MAX];
+        decay_histogram(&mut bins, 0.0);
+        assert_eq!(bins, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_decay_histogram_negative_decay_clamps_to_zero() {
+        let mut bins = vec![42, 99];
+        decay_histogram(&mut bins, -5.0);
+        // decay clamped to 0.0 -> zeros all
+        assert_eq!(bins, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_decay_histogram_above_one_clamps_to_noop() {
+        let original = vec![7, 13, 255];
+        let mut bins = original.clone();
+        decay_histogram(&mut bins, 2.5);
+        // decay clamped to 1.0 -> noop
+        assert_eq!(bins, original);
+    }
+
+    #[test]
+    fn test_decay_histogram_empty_slice() {
+        let mut bins: Vec<u64> = Vec::new();
+        decay_histogram(&mut bins, 0.5);
+        assert!(bins.is_empty());
+    }
+
+    #[test]
+    fn test_decay_histogram_single_element() {
+        let mut bins = vec![7];
+        decay_histogram(&mut bins, 0.9);
+        // floor(7 * 0.9) = floor(6.3) = 6
+        assert_eq!(bins, vec![6]);
+    }
+
+    #[test]
+    fn test_decay_histogram_large_vector_consistency() {
+        // Test with sizes that exercise SIMD remainder paths (odd lengths)
+        for len in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33] {
+            let mut bins: Vec<u64> = (1..=len as u64).collect();
+            let mut expected: Vec<u64> = bins.clone();
+            let decay = 0.75;
+            for b in expected.iter_mut() {
+                *b = ((*b as f64) * decay).floor() as u64;
+            }
+            decay_histogram(&mut bins, decay);
+            assert_eq!(bins, expected, "mismatch at len={len}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // jensen_shannon_divergence
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_jsd_identical_distributions_is_zero() {
+        // When P == Q, JSD should be 0 (or extremely close due to epsilon)
+        let bins = vec![25, 25, 25, 25];
+        let total = 100u64;
+        let target = vec![0.25, 0.25, 0.25, 0.25];
+        let jsd = jensen_shannon_divergence(&bins, total, &target);
+        assert!(jsd.abs() < 1e-6, "JSD of identical distributions should be ~0, got {jsd}");
+    }
+
+    #[test]
+    fn test_jsd_completely_different_distributions() {
+        // P is concentrated in bin 0, Q is uniform
+        let bins = vec![1000, 0, 0, 0];
+        let total = 1000u64;
+        let target = vec![0.25, 0.25, 0.25, 0.25];
+        let jsd = jensen_shannon_divergence(&bins, total, &target);
+        // JSD is bounded by ln(2) ~ 0.693 for base-e
+        assert!(jsd > 0.0, "JSD of different distributions must be > 0");
+        assert!(jsd <= 0.7, "JSD must be <= ln(2), got {jsd}");
+    }
+
+    #[test]
+    fn test_jsd_empty_bins_returns_zero() {
+        let bins: Vec<u64> = Vec::new();
+        let target: Vec<f64> = Vec::new();
+        let jsd = jensen_shannon_divergence(&bins, 0, &target);
+        assert_eq!(jsd, 0.0);
+    }
+
+    #[test]
+    fn test_jsd_zero_total_returns_zero() {
+        let bins = vec![0, 0, 0];
+        let target = vec![0.33, 0.33, 0.34];
+        let jsd = jensen_shannon_divergence(&bins, 0, &target);
+        assert_eq!(jsd, 0.0);
+    }
+
+    #[test]
+    fn test_jsd_mismatched_lengths_uses_minimum() {
+        // bins has 2 elements, target has 4 - should use min(2,4) = 2
+        let bins = vec![50, 50];
+        let total = 100u64;
+        let target = vec![0.5, 0.5, 0.0, 0.0];
+        let jsd = jensen_shannon_divergence(&bins, total, &target);
+        // P=[0.5,0.5] vs Q=[0.5,0.5] over 2 bins -> ~0
+        assert!(jsd.abs() < 1e-6, "JSD of matching 2-bin dists should be ~0, got {jsd}");
+    }
+
+    // ---------------------------------------------------------------
+    // scalar_jensen_shannon (internal, exercised through public API)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_scalar_jsd_symmetry_property() {
+        // JSD(P||Q) should equal JSD(Q||P) when computed via the symmetric formula
+        let bins_a = vec![60, 30, 10];
+        let total_a = 100u64;
+        let target_a = vec![0.1, 0.3, 0.6];
+        let jsd_forward = scalar_jensen_shannon(&bins_a, total_a, &target_a);
+
+        // Reverse: bins represent the target, target represents the hist
+        let bins_b = vec![10, 30, 60];
+        let total_b = 100u64;
+        let target_b = vec![0.6, 0.3, 0.1];
+        let jsd_reverse = scalar_jensen_shannon(&bins_b, total_b, &target_b);
+
+        assert!(
+            (jsd_forward - jsd_reverse).abs() < 1e-10,
+            "JSD must be symmetric: forward={jsd_forward}, reverse={jsd_reverse}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // moving_average
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_moving_average_simple_window() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = moving_average(&data, 3);
+        assert_eq!(result.len(), 5);
+        // Ramp-up: avg(1)=1.0, avg(1,2)=1.5, then full window:
+        // avg(1,2,3)=2.0, avg(2,3,4)=3.0, avg(3,4,5)=4.0
+        let expected = [1.0, 1.5, 2.0, 3.0, 4.0];
+        for (i, (&r, &e)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (r - e).abs() < 1e-5,
+                "moving_average[{i}]: got {r}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_moving_average_window_one_returns_identity() {
+        let data = vec![5.0, 3.0, 8.0, 1.0];
+        let result = moving_average(&data, 1);
+        for (i, (&r, &d)) in result.iter().zip(data.iter()).enumerate() {
+            assert!(
+                (r - d).abs() < 1e-5,
+                "window=1 should return identity at [{i}]: got {r}, expected {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_moving_average_window_equals_length() {
+        let data = vec![2.0, 4.0, 6.0];
+        let result = moving_average(&data, 3);
+        // Ramp-up: 2/1=2, (2+4)/2=3, (2+4+6)/3=4
+        let expected = [2.0, 3.0, 4.0];
+        for (i, (&r, &e)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (r - e).abs() < 1e-5,
+                "moving_average window==len [{i}]: got {r}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_moving_average_window_exceeds_length() {
+        let data = vec![10.0, 20.0];
+        let result = moving_average(&data, 100);
+        // Never reaches full window, so ramp-up only: 10/1, (10+20)/2
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 10.0).abs() < 1e-5);
+        assert!((result[1] - 15.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_moving_average_empty_data() {
+        let data: Vec<f32> = Vec::new();
+        let result = moving_average(&data, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero")]
+    fn test_moving_average_window_zero_panics() {
+        let data = vec![1.0, 2.0];
+        let _ = moving_average(&data, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // compute_percentile
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_compute_percentile_median() {
+        let mut data = vec![5.0, 1.0, 3.0, 9.0, 7.0];
+        let p50 = compute_percentile(&mut data, 50.0);
+        // Sorted: [1, 3, 5, 7, 9], k = floor(0.5*5)=2 -> data[2]=5.0
+        assert!((p50 - 5.0).abs() < 1e-5, "50th percentile should be 5.0, got {p50}");
+    }
+
+    #[test]
+    fn test_compute_percentile_zero_returns_minimum() {
+        let mut data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let p0 = compute_percentile(&mut data, 0.0);
+        // k = floor(0.0*5) = 0 -> smallest element = 10.0
+        assert!((p0 - 10.0).abs() < 1e-5, "0th percentile should be min, got {p0}");
+    }
+
+    #[test]
+    fn test_compute_percentile_high() {
+        let mut data: Vec<f32> = (1..=100).map(|x| x as f32).collect();
+        let p99 = compute_percentile(&mut data, 99.0);
+        // k = floor(0.99*100) = 99 -> 100.0
+        assert!((p99 - 100.0).abs() < 1e-5, "99th percentile of 1..100 should be 100.0, got {p99}");
+    }
+
+    // ---------------------------------------------------------------
+    // relu_batch
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_relu_batch_clamps_negatives_to_zero() {
+        let mut data = vec![-3.0, -1.0, 0.0, 1.0, 5.0, -0.001];
+        relu_batch(&mut data);
+        assert_eq!(data, vec![0.0, 0.0, 0.0, 1.0, 5.0, 0.0]);
+    }
+
+    #[test]
+    fn test_relu_batch_all_positive_unchanged() {
+        let mut data = vec![1.0, 2.5, 100.0, 0.001];
+        let original = data.clone();
+        relu_batch(&mut data);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_relu_batch_empty() {
+        let mut data: Vec<f32> = Vec::new();
+        relu_batch(&mut data);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_relu_batch_various_lengths() {
+        // Exercise SIMD remainder paths across different vector sizes
+        for len in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
+            let mut data: Vec<f32> = (0..len).map(|i| (i as f32) - (len as f32 / 2.0)).collect();
+            relu_batch(&mut data);
+            for (i, &v) in data.iter().enumerate() {
+                let original = (i as f32) - (len as f32 / 2.0);
+                let expected = original.max(0.0);
+                assert!(
+                    (v - expected).abs() < 1e-5,
+                    "relu len={len} [{i}]: got {v}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // softmax_batch
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_softmax_batch_sums_to_one() {
+        let mut data = vec![1.0, 2.0, 3.0, 4.0];
+        softmax_batch(&mut data);
+        let sum: f32 = data.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "softmax output should sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_softmax_batch_monotonic_ordering() {
+        let mut data = vec![1.0, 2.0, 3.0];
+        softmax_batch(&mut data);
+        // Larger input -> larger softmax probability
+        assert!(data[0] < data[1], "softmax should preserve ordering: data[0]={} < data[1]={}", data[0], data[1]);
+        assert!(data[1] < data[2], "softmax should preserve ordering: data[1]={} < data[2]={}", data[1], data[2]);
+    }
+
+    #[test]
+    fn test_softmax_batch_all_equal_yields_uniform() {
+        let mut data = vec![5.0, 5.0, 5.0, 5.0];
+        softmax_batch(&mut data);
+        for (i, &v) in data.iter().enumerate() {
+            assert!(
+                (v - 0.25).abs() < 1e-4,
+                "softmax of equal inputs should be uniform: [{i}]={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_batch_all_outputs_non_negative() {
+        let mut data = vec![-10.0, -5.0, 0.0, 5.0, 10.0];
+        softmax_batch(&mut data);
+        for (i, &v) in data.iter().enumerate() {
+            assert!(v >= 0.0, "softmax output must be >= 0: [{i}]={v}");
+        }
+    }
+
+    #[test]
+    fn test_softmax_batch_single_element() {
+        let mut data = vec![42.0];
+        softmax_batch(&mut data);
+        assert!(
+            (data[0] - 1.0).abs() < 1e-5,
+            "softmax of single element should be 1.0, got {}",
+            data[0]
+        );
+    }
+
+    #[test]
+    fn test_softmax_batch_empty() {
+        let mut data: Vec<f32> = Vec::new();
+        softmax_batch(&mut data);
+        assert!(data.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // softmax_scalar (internal, direct unit test)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_softmax_scalar_matches_definition() {
+        let mut data = vec![1.0f32, 2.0, 3.0];
+        softmax_scalar(&mut data);
+        // Verify against manual computation
+        let max = 3.0f32;
+        let e0 = (1.0 - max).exp();
+        let e1 = (2.0 - max).exp();
+        let e2 = (3.0 - max).exp();
+        let sum = e0 + e1 + e2;
+        let expected = [e0 / sum, e1 / sum, e2 / sum];
+        for (i, (&got, &exp)) in data.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "softmax_scalar[{i}]: got {got}, expected {exp}"
+            );
+        }
+    }
 }

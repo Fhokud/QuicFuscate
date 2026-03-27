@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -5,22 +6,34 @@ use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// pub mod accelerate; // consolidated into crate::accelerate::transport_io
+// Explicit rust parity/test-only surface. Not part of the normal runtime API.
+/// 0-RTT anti-replay protection via strike register.
+pub mod anti_replay;
+/// Batch packet processing utilities (test-only).
+#[cfg(any(test, feature = "rust-tests"))]
+#[doc(hidden)]
 pub mod batch;
+/// QUIC connection configuration and transport parameter setters.
 pub mod config;
+/// QUIC connection state machine and stream/datagram I/O.
 pub mod connection;
+/// QUIC frame encoding and decoding.
 pub mod frames;
+/// HTTP/3 layer over QUIC transport.
 pub mod h3;
+/// QUIC packet header parsing, protection, and encryption.
 pub mod packet;
+/// Packet number spaces, connection IDs, varint codec, range sets, and RNG.
 pub mod pn;
+/// Pluggable congestion control: Reno, BBR3, StealthShaper wrapper.
+pub mod cc;
+/// Loss recovery and congestion control integration.
 pub mod recovery;
+/// High-performance UDP send/recv with GSO/GRO and batch I/O.
 pub mod udpfast;
-#[cfg(all(target_os = "linux", feature = "uring_sys"))]
-pub mod uring;
-pub mod xdp;
+mod xdp;
 
-pub use crate::accelerate::transport as accel;
-pub use batch::BatchProcessor;
+pub use anti_replay::{AntiReplayConfig, StrikeRegister};
 pub use config::Config;
 #[cfg(feature = "stream_ring_buffer")]
 pub use connection::StreamRingBuffer;
@@ -28,16 +41,121 @@ pub use connection::{Connection, PathEvent};
 pub use pn::{cid, pnspace, rand, range_buf, ranges, varint};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
-// use crate::crypto::aead::{AeadOpen, AeadSeal}; // use fully-qualified paths below
-// use crate::transport::packet::HeaderProtector; // local trait defined below
-// use crate::native;
 
-// FEC Control Delta struct for managing FEC parameter changes
+/// Best-effort socket capability setup shared across runtime hotpaths.
+#[doc(hidden)]
+pub fn init_socket_acceleration(socket: &std::net::UdpSocket) -> std::io::Result<()> {
+    let gso_enabled = crate::accelerate::transport_io::UdpGsoConfig::enable(socket)
+        .map(|cfg| cfg.enabled)
+        .unwrap_or(false);
+
+    log::info!("Network acceleration initialized:");
+    log::info!("  GSO: {}", gso_enabled);
+
+    Ok(())
+}
+
+/// Experimental AF_XDP constructor probe kept behind the transport root,
+/// which is the sole retained owner for explicit AF_XDP compatibility hooks.
+#[cfg(all(
+    target_os = "linux",
+    any(test, feature = "rust-tests"),
+    feature = "internal_af_xdp_experimental"
+))]
+/// Probes whether AF_XDP sockets are usable on the given NIC queue (experimental).
+#[doc(hidden)]
+pub fn run_xdp_experimental_socket_probe(
+    ifindex: u32,
+    queue_id: u32,
+    frame_size: usize,
+    frame_count: usize,
+) -> std::io::Result<()> {
+    let _socket = xdp::linux::XdpSocket::new(ifindex, queue_id, frame_size, frame_count)?;
+    Ok(())
+}
+
+/// Pending FEC parameter changes to be consumed by the adaptive FEC controller.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FecControlDelta {
+    /// Override for the streaming FEC emission interval (packets between FEC frames).
     pub stream_every: Option<usize>,
+    /// Override for FEC redundancy in parts-per-million.
     pub redundancy_ppm: Option<u32>,
+    /// When true, forces FEC into streaming mode for minimal latency.
     pub force_streaming: bool,
+}
+
+/// Per-connection permission flags controlling which stealth actuators the Brain may adjust.
+#[derive(Debug, Clone, Copy)]
+pub struct BrainRuntimePermissions {
+    /// Allow Brain to adjust the ACK-eliciting threshold.
+    pub ack_threshold: bool,
+    /// Allow Brain to toggle external pacing control.
+    pub external_pacing: bool,
+    /// Allow Brain to adjust stealth timing jitter.
+    pub timing: bool,
+    /// Allow Brain to adjust stealth padding parameters.
+    pub padding: bool,
+    /// Allow Brain to change the browser mimic bias code.
+    pub mimic_bias: bool,
+    /// Allow Brain to adjust adaptive padding granularity.
+    pub granularity: bool,
+    /// Allow Brain to switch the congestion control browser profile.
+    pub cc_profile: bool,
+}
+
+impl Default for BrainRuntimePermissions {
+    fn default() -> Self {
+        Self {
+            ack_threshold: true,
+            external_pacing: true,
+            timing: true,
+            padding: true,
+            mimic_bias: true,
+            granularity: true,
+            cc_profile: true,
+        }
+    }
+}
+
+/// Snapshot of all stealth runtime parameters for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StealthRuntimePolicy {
+    /// Whether external pacing control is active.
+    pub external_pacing: bool,
+    /// Whether stealth timing jitter injection is enabled.
+    pub timing_enabled: bool,
+    /// Maximum timing jitter in microseconds.
+    pub timing_max_jitter_us: u32,
+    /// Browser mimic bias code (1=Safari, 2=Firefox, 3=Chromium, 4=Android).
+    pub mimic_bias: u8,
+    /// Adaptive padding granularity in bytes.
+    pub adaptive_granularity: u16,
+    /// Congestion control browser profile for traffic shaping.
+    pub cc_profile: crate::transport::recovery::BrowserProfile,
+    /// Whether stealth padding is enabled.
+    pub padding_enabled: bool,
+    /// Padding strategy (0=off, 1=random, 2=fixed, 3=adaptive, 4=browser-mimic).
+    pub padding_strategy: u8,
+    /// Maximum padding size in bytes.
+    pub padding_max: usize,
+}
+
+/// Incremental stealth parameter update emitted by the Brain sensor-fusion engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StealthRuntimeDelta {
+    /// New external pacing toggle, if changed.
+    pub external_pacing: Option<bool>,
+    /// New timing (enabled, max_jitter_us) pair, if changed.
+    pub timing: Option<(bool, u32)>,
+    /// New browser mimic bias code, if changed.
+    pub mimic_bias: Option<u8>,
+    /// New adaptive padding granularity in bytes, if changed.
+    pub adaptive_granularity: Option<u16>,
+    /// New congestion control browser profile, if changed.
+    pub cc_profile: Option<crate::transport::recovery::BrowserProfile>,
+    /// New padding (enabled, strategy, max_size) triple, if changed.
+    pub padding: Option<(bool, u8, usize)>,
 }
 
 // ============================================================================
@@ -57,348 +175,26 @@ pub const PROTOCOL_VERSION: u32 = 0x00000001;
 
 /// Maximum connection ID length
 pub const MAX_CONN_ID_LEN: usize = 20;
+/// Maximum packet number encoding length in bytes (RFC 9000).
 pub const MAX_PKT_NUM_LEN: usize = 4;
 
-// Telemetry counters
-// static BATCH_SENDS: AtomicUsize = AtomicUsize::new(0);
-// static BATCH_RECVS: AtomicUsize = AtomicUsize::new(0);
-// static PACKETS_BATCHED: AtomicUsize = AtomicUsize::new(0);
-
-// /// Ultra-fast batch packet processor with network acceleration
-// pub struct BatchProcessor {
-//     /// Preallocated buffers for zero-copy batch operations
-//     send_buffers: Vec<Vec<u8>>,
-//     recv_buffers: Vec<Vec<u8>>,
-//     /// IO vectors for sendmmsg/recvmmsg
-//     #[cfg(target_os = "linux")]
-//     send_msgs: Vec<libc::mmsghdr>,
-//     #[cfg(target_os = "linux")]
-//     recv_msgs: Vec<libc::mmsghdr>,
-//     /// Batch size based on CPU features
-//     batch_size: usize,
-//     /// Network acceleration features
-//     gso_config: Option<accelerate::UdpGsoConfig>,
-//     zero_copy: Option<accelerate::ZeroCopySocket>,
-//     busy_poll: Option<accelerate::BusyPollSocket>,
-// }
-//
-// impl BatchProcessor {
-//     pub fn new() -> Self {
-//         let features = FeatureDetector::instance();
-//
-//         // Determine optimal batch size based on CPU
-//         let batch_size = if features.has_avx512() {
-//             MAX_BATCH_SIZE  // 64 packets with AVX-512
-//         } else if features.has_avx2() {
-//             OPTIMAL_BATCH_SIZE  // 32 packets with AVX2
-//         } else {
-//             16  // Conservative for older CPUs
-//         };
-//
-//         log::info!("BatchProcessor: {} packet batches", batch_size);
-//
-//         // Preallocate buffers
-//         let mut send_buffers = Vec::with_capacity(batch_size);
-//         let mut recv_buffers = Vec::with_capacity(batch_size);
-//
-//         for _ in 0..batch_size {
-//             send_buffers.push(vec![0u8; 1500]);  // MTU size
-//             recv_buffers.push(vec![0u8; 1500]);
-//         }
-//
-//         #[cfg(target_os = "linux")]
-//         let (send_msgs, recv_msgs) = Self::init_mmsg_headers(batch_size);
-//
-//         Self {
-//             send_buffers,
-//             recv_buffers,
-//             #[cfg(target_os = "linux")]
-//             send_msgs,
-//             #[cfg(target_os = "linux")]
-//             recv_msgs,
-//             batch_size,
-//             gso_config: None,
-//             zero_copy: None,
-//             busy_poll: None,
-//         }
-//     }
-//
-//     #[cfg(target_os = "linux")]
-//     fn init_mmsg_headers(batch_size: usize) -> (Vec<libc::mmsghdr>, Vec<libc::mmsghdr>) {
-//         let mut send_msgs = Vec::with_capacity(batch_size);
-//         let mut recv_msgs = Vec::with_capacity(batch_size);
-//
-//         for _ in 0..batch_size {
-//             send_msgs.push(unsafe { std::mem::zeroed() });
-//             recv_msgs.push(unsafe { std::mem::zeroed() });
-//         }
-//
-//         (send_msgs, recv_msgs)
-//     }
-//
-//     /// Initialize network acceleration for a socket
-//     pub fn init_acceleration(&mut self, socket: &UdpSocket) -> std::io::Result<()> {
-//         // Try to enable GSO
-//         self.gso_config = accelerate::UdpGsoConfig::enable(socket).ok();
-//
-//         // Try to enable zero-copy
-//         if let Ok(sock_clone) = socket.try_clone() {
-//             self.zero_copy = accelerate::ZeroCopySocket::new(sock_clone).ok();
-//         }
-//
-//         // Enable busy polling for low latency if configured
-//         if std::env::var("QUICFUSCATE_BUSY_POLL").is_ok() {
-//             if let Ok(sock_clone) = socket.try_clone() {
-//                 self.busy_poll = accelerate::BusyPollSocket::new(sock_clone, 50).ok();
-//             }
-//         }
-//
-//         log::info!("Network acceleration initialized:");
-//         log::info!("  GSO: {}", self.gso_config.as_ref().map_or(false, |g| g.enabled));
-//         log::info!("  Zero-copy: {}", self.zero_copy.is_some());
-//         log::info!("  Busy-poll: {}", self.busy_poll.is_some());
-//
-//         Ok(())
-//     }
-//
-//     /// Batch send packets with sendmmsg and acceleration (Linux)
-//     #[cfg(target_os = "linux")]
-//     pub fn batch_send(&mut self, socket: i32, packets: &[(&[u8], SocketAddr)]) -> std::io::Result<usize> {
-//         // Try accelerated batch send first
-//         #[cfg(target_os = "linux")]
-//         {
-//             // Create a temporary UdpSocket from raw fd for accelerate API
-//             use std::os::unix::io::FromRawFd;
-//             let sock = unsafe { UdpSocket::from_raw_fd(socket) };
-//
-//             // Use sendmmsg through accelerate
-//             let result = accelerate::send_batch(&sock, packets);
-//
-//             // Release socket without closing fd
-//             let _ = sock.into_raw_fd();
-//
-//             if let Ok(sent) = result {
-//                 BATCH_SENDS.fetch_add(1, Ordering::Relaxed);
-//                 PACKETS_BATCHED.fetch_add(sent, Ordering::Relaxed);
-//                 crate::optimize::telemetry::ZERO_COPY_SENDS.inc_by(sent as u64);
-//                 return Ok(sent);
-//             }
-//         }
-//
-//         // Fallback to original implementation
-//         use std::mem;
-//         use std::ptr;
-//
-//         let batch_count = packets.len().min(self.batch_size);
-//         if batch_count == 0 {
-//             return Ok(0);
-//         }
-//
-//         // Prepare messages with SIMD copy
-//         for (i, (data, addr)) in packets.iter().take(batch_count).enumerate() {
-//             // Use SIMD memcpy for packet data
-//             let len = data.len().min(self.send_buffers[i].len());
-//             SimdDispatch::memcpy_fast(&mut self.send_buffers[i][..len], data);
-//
-//             // Setup message header
-//             let mut sa: libc::sockaddr_storage = unsafe { mem::zeroed() };
-//             let sa_len = match addr {
-//                 SocketAddr::V4(v4) => {
-//                     let sa4 = &mut sa as *mut _ as *mut libc::sockaddr_in;
-//                     unsafe {
-//                         (*sa4).sin_family = libc::AF_INET as u16;
-//                         (*sa4).sin_port = v4.port().to_be();
-//                         (*sa4).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-//                     }
-//                     mem::size_of::<libc::sockaddr_in>()
-//                 }
-//                 SocketAddr::V6(v6) => {
-//                     let sa6 = &mut sa as *mut _ as *mut libc::sockaddr_in6;
-//                     unsafe {
-//                         (*sa6).sin6_family = libc::AF_INET6 as u16;
-//                         (*sa6).sin6_port = v6.port().to_be();
-//                         (*sa6).sin6_addr.s6_addr = v6.ip().octets();
-//                         (*sa6).sin6_flowinfo = v6.flowinfo();
-//                         (*sa6).sin6_scope_id = v6.scope_id();
-//                     }
-//                     mem::size_of::<libc::sockaddr_in6>()
-//                 }
-//             };
-//
-//             // Setup iovec
-//             let mut iov = libc::iovec {
-//                 iov_base: self.send_buffers[i].as_mut_ptr() as *mut _,
-//                 iov_len: len,
-//             };
-//
-//             // Setup mmsghdr
-//             self.send_msgs[i] = libc::mmsghdr {
-//                 msg_hdr: libc::msghdr {
-//                     msg_name: &mut sa as *mut _ as *mut _,
-//                     msg_namelen: sa_len as u32,
-//                     msg_iov: &mut iov,
-//                     msg_iovlen: 1,
-//                     msg_control: ptr::null_mut(),
-//                     msg_controllen: 0,
-//                     msg_flags: 0,
-//                 },
-//                 msg_len: 0,
-//             };
-//         }
-//
-//         // Send all packets in one syscall (non-blocking)!
-//         let sent = unsafe {
-//             libc::sendmmsg(
-//                 socket,
-//                 self.send_msgs.as_mut_ptr(),
-//                 batch_count as u32,
-//                 libc::MSG_DONTWAIT,
-//             )
-//         };
-//
-//         if sent < 0 {
-//             return Err(std::io::Error::last_os_error());
-//         }
-//
-//         BATCH_SENDS.fetch_add(1, Ordering::Relaxed);
-//         PACKETS_BATCHED.fetch_add(sent as usize, Ordering::Relaxed);
-//         crate::optimize::telemetry::ZERO_COPY_SENDS.inc_by(sent as u64);
-//
-//         Ok(sent as usize)
-//     }
-//
-//     /// Batch receive packets with recvmmsg (Linux)
-//     #[cfg(target_os = "linux")]
-//     pub fn batch_recv(&mut self, socket: i32, timeout: Option<Duration>) -> std::io::Result<Vec<(Vec<u8>, SocketAddr)>> {
-//         use std::mem;
-//
-//         let mut results = Vec::new();
-//
-//         // Setup timeout
-//         let ts = timeout.map(|d| libc::timespec {
-//             tv_sec: d.as_secs() as i64,
-//             tv_nsec: d.subsec_nanos() as i64,
-//         });
-//
-//         // Setup receive messages
-//         for i in 0..self.batch_size {
-//             let mut sa: libc::sockaddr_storage = unsafe { mem::zeroed() };
-//
-//             let mut iov = libc::iovec {
-//                 iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
-//                 iov_len: self.recv_buffers[i].len(),
-//             };
-//
-//             self.recv_msgs[i] = libc::mmsghdr {
-//                 msg_hdr: libc::msghdr {
-//                     msg_name: &mut sa as *mut _ as *mut _,
-//                     msg_namelen: mem::size_of::<libc::sockaddr_storage>() as u32,
-//                     msg_iov: &mut iov,
-//                     msg_iovlen: 1,
-//                     msg_control: std::ptr::null_mut(),
-//                     msg_controllen: 0,
-//                     msg_flags: 0,
-//                 },
-//                 msg_len: 0,
-//             };
-//         }
-//
-//         // Receive all packets in one syscall!
-//         let received = unsafe {
-//             libc::recvmmsg(
-//                 socket,
-//                 self.recv_msgs.as_mut_ptr(),
-//                 self.batch_size as u32,
-//                 libc::MSG_DONTWAIT,
-//                 ts.as_ref().map_or(std::ptr::null(), |t| t as *const _),
-//             )
-//         };
-//
-//         if received < 0 {
-//             let err = std::io::Error::last_os_error();
-//             if err.kind() == std::io::ErrorKind::WouldBlock {
-//                 return Ok(results);
-//             }
-//             return Err(err);
-//         }
-//
-//         // Process received packets
-//         for i in 0..received as usize {
-//             let len = self.recv_msgs[i].msg_len as usize;
-//             if len > 0 {
-//                 let mut data = vec![0u8; len];
-//                 // Use SIMD copy
-//                 SimdDispatch::memcpy_fast(&mut data, &self.recv_buffers[i][..len]);
-//
-//                 // Parse address
-//                 let addr = unsafe {
-//                     let sa = self.recv_msgs[i].msg_hdr.msg_name as *const libc::sockaddr_storage;
-//                     match (*sa).ss_family as i32 {
-//                         libc::AF_INET => {
-//                             let sa4 = sa as *const libc::sockaddr_in;
-//                             SocketAddr::V4(std::net::SocketAddrV4::new(
-//                                 std::net::Ipv4Addr::from((*sa4).sin_addr.s_addr.to_ne_bytes()),
-//                                 (*sa4).sin_port.to_be(),
-//                             ))
-//                         }
-//                         libc::AF_INET6 => {
-//                             let sa6 = sa as *const libc::sockaddr_in6;
-//                             SocketAddr::V6(std::net::SocketAddrV6::new(
-//                                 std::net::Ipv6Addr::from((*sa6).sin6_addr.s6_addr),
-//                                 (*sa6).sin6_port.to_be(),
-//                                 (*sa6).sin6_flowinfo,
-//                                 (*sa6).sin6_scope_id,
-//                             ))
-//                         }
-//                         _ => continue,
-//                     }
-//                 };
-//
-//                 results.push((data, addr));
-//             }
-//         }
-//
-//         BATCH_RECVS.fetch_add(1, Ordering::Relaxed);
-//         PACKETS_BATCHED.fetch_add(received as usize, Ordering::Relaxed);
-//         crate::optimize::telemetry::ZERO_COPY_RECVS.inc_by(received as u64);
-//
-//         Ok(results)
-//     }
-//
-//     /// Fallback for non-Linux systems
-//     #[cfg(not(target_os = "linux"))]
-//     pub fn batch_send(&mut self, _socket: i32, packets: &[(&[u8], SocketAddr)]) -> std::io::Result<usize> {
-//         // Fallback to individual sends
-//         log::debug!("Batch send not available on this platform");
-//         Ok(packets.len())
-//     }
-//
-//     #[cfg(not(target_os = "linux"))]
-//     pub fn batch_recv(&mut self, _socket: i32, _timeout: Option<Duration>) -> std::io::Result<Vec<(Vec<u8>, SocketAddr)>> {
-//         // Fallback to individual receives
-//         log::debug!("Batch recv not available on this platform");
-//         Ok(Vec::new())
-//     }
-// }
-//
 // Packet type bits are defined within the `packet` module to avoid duplication
 
 /// Congestion control choices supported by the in-tree QUIC transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CongestionControlAlgorithm {
+    /// TCP New Reno (RFC 6582) - conservative AIMD baseline.
     Reno,
-    Cubic,
-    BBR,
-    Ledbat,
+    /// BBR v2 (IETF draft-ietf-ccwg-bbr) - loss-aware model-based CC.
     BBR2,
+    /// BBR v3 with stealth browser-profile shaping (default, recommended).
     BBR3,
 }
 
-// Duplicate struct definition removed - using the one above
-
 impl AsRef<[u8]> for ConnectionId {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        &self.buf[..self.len as usize]
     }
 }
 
@@ -560,6 +356,7 @@ mod core_extra_tests {
         let new_peer = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 44444);
         let new_id = conn.migrate(new_local, new_peer).expect("migrate");
         assert!(new_id > 0);
+        assert_eq!(conn.path_stats().next().expect("path").peer_addr, peer);
     }
 
     #[test]
@@ -576,54 +373,117 @@ mod core_extra_tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct ConnectionId(Vec<u8>);
+/// QUIC connection ID with inline storage (max 20 bytes per RFC 9000).
+///
+/// Avoids heap allocation by storing the ID in a fixed-size buffer on the stack.
+#[derive(Clone, Copy)]
+pub struct ConnectionId {
+    buf: [u8; MAX_CONN_ID_LEN],
+    len: u8,
+}
+
+impl Default for ConnectionId {
+    #[inline]
+    fn default() -> Self {
+        Self { buf: [0u8; MAX_CONN_ID_LEN], len: 0 }
+    }
+}
+
+impl std::fmt::Debug for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConnectionId({:02x?})", self.as_ref())
+    }
+}
+
+impl PartialEq for ConnectionId {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for ConnectionId {}
+
+impl std::hash::Hash for ConnectionId {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
 
 /// Information about a received datagram (source / destination / timestamp)
 #[derive(Debug, Clone, Copy)]
 pub struct RecvInfo {
+    /// Source address of the received datagram.
     pub from: SocketAddr,
+    /// Destination address of the received datagram.
     pub to: SocketAddr,
     // Keep extensible; add ECN / timestamp if needed
+    /// ECN marking from the IP layer, if available.
     pub ecn: Option<EcnMark>,
 }
 
 /// Information about a sent datagram
 #[derive(Debug, Clone, Copy)]
 pub struct SendInfo {
+    /// Local address to send from.
     pub from: SocketAddr,
+    /// Peer address to send to.
     pub to: SocketAddr,
+    /// Pacing-aware send timestamp.
     pub at: Instant,
 }
 
 impl ConnectionId {
-    /// Creates a ConnectionId from a borrowed slice (owned internally).
+    /// Creates a ConnectionId from a borrowed slice.
+    ///
+    /// # Panics
+    /// Panics if `data.len() > MAX_CONN_ID_LEN` (20).
+    #[inline]
     pub fn from_ref(data: &[u8]) -> Self {
-        ConnectionId(data.to_vec())
+        assert!(
+            data.len() <= MAX_CONN_ID_LEN,
+            "ConnectionId too long: {} > {}",
+            data.len(),
+            MAX_CONN_ID_LEN
+        );
+        let mut buf = [0u8; MAX_CONN_ID_LEN];
+        buf[..data.len()].copy_from_slice(data);
+        Self { buf, len: data.len() as u8 }
     }
 
-    /// Creates a ConnectionId from a Vec.
+    /// Creates a ConnectionId from a Vec (convenience wrapper).
+    #[inline]
     pub fn from_vec(data: Vec<u8>) -> Self {
-        ConnectionId(data)
+        Self::from_ref(&data)
     }
 
     /// Returns true if the ID is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
     }
 
-    /// Converts into owned Vec<u8>.
+    /// Returns the length in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Converts into an owned Vec<u8>.
+    #[inline]
     pub fn to_vec(&self) -> Vec<u8> {
-        self.0.clone()
+        self.as_ref().to_vec()
     }
 }
 
-/// Minimal ConnectionIdSet to track active IDs.
+/// Minimum size of a client Initial packet per RFC 9000 Section 14.1 (1200 bytes).
 pub const MIN_CLIENT_INITIAL_LEN: usize = 1200;
 
-/// Initial window size
+/// Initial congestion window size in bytes.
 pub const INITIAL_WINDOW: usize = 14720;
 
+/// QUIC stream state including send/receive buffers, offsets, and flow control limits.
 #[derive(Debug)]
 pub struct Stream {
     id: u64,
@@ -647,6 +507,7 @@ pub struct Stream {
     /// Out-of-order fragments keyed by starting offset.
     recv_frags: BTreeMap<u64, Vec<u8>>,
     priority_urgency: u8,
+    #[cfg(any(test, feature = "rust-tests"))]
     priority_incremental: bool,
     // Receive-side flow control (what we allow peer to send to us)
     max_stream_data_rx: u64,
@@ -654,10 +515,13 @@ pub struct Stream {
     max_stream_data_tx: u64,
 }
 
-/// Frame overhead constants
+/// Maximum wire overhead for a CRYPTO frame header (type + offset + length varints).
 pub const MAX_CRYPTO_OVERHEAD: usize = 8;
+/// Maximum wire overhead for a DATAGRAM frame header.
 pub const MAX_DGRAM_OVERHEAD: usize = 2;
+/// Maximum wire overhead for a STREAM frame header (type + stream_id + offset + length varints).
 pub const MAX_STREAM_OVERHEAD: usize = 12;
+/// Maximum stream data offset/size per RFC 9000 (2^62).
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 
 // ============================================================================
@@ -667,18 +531,23 @@ pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 /// QUIC packet epoch
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Epoch {
+    /// Initial encryption level (connection establishment).
     Initial = 0,
+    /// Handshake encryption level (TLS handshake completion).
     Handshake = 1,
+    /// Application data encryption level (1-RTT).
     Application = 2,
 }
 
 static EPOCHS: [Epoch; 3] = [Epoch::Initial, Epoch::Handshake, Epoch::Application];
 
 impl Epoch {
+    /// Returns a slice of epochs within the given inclusive range.
     pub fn epochs(range: std::ops::RangeInclusive<Epoch>) -> &'static [Epoch] {
         &EPOCHS[*range.start() as usize..=*range.end() as usize]
     }
 
+    /// Total number of QUIC packet epochs (Initial, Handshake, Application).
     pub const fn count() -> usize {
         3
     }
@@ -706,23 +575,33 @@ impl<T> IndexMut<Epoch> for [T] {
 /// QUIC packet type
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketType {
+    /// Initial packet (long header, unencrypted).
     Initial,
+    /// Retry packet sent by server to provide a token.
     Retry,
+    /// Handshake packet (long header, handshake keys).
     Handshake,
+    /// 0-RTT early data packet (long header, early data keys).
     ZeroRTT,
+    /// Version Negotiation packet (no encryption).
     VersionNegotiation,
+    /// Short header packet (1-RTT application data).
     Short,
 }
 
 /// ECN marking of received UDP datagrams
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EcnMark {
+    /// ECT(0) - ECN-Capable Transport codepoint 0.
     Ect0,
+    /// ECT(1) - ECN-Capable Transport codepoint 1.
     Ect1,
+    /// CE - Congestion Experienced signal.
     Ce,
 }
 
 impl PacketType {
+    /// Converts an epoch to the corresponding packet type.
     pub fn from_epoch(e: Epoch) -> PacketType {
         match e {
             Epoch::Initial => PacketType::Initial,
@@ -731,6 +610,7 @@ impl PacketType {
         }
     }
 
+    /// Converts this packet type to the corresponding epoch, if applicable.
     pub fn to_epoch(self) -> Result<Epoch, Error> {
         match self {
             PacketType::Initial => Ok(Epoch::Initial),
@@ -745,17 +625,27 @@ impl PacketType {
 /// QUIC packet header
 #[derive(Clone, PartialEq, Eq)]
 pub struct Header {
+    /// Packet type (Initial, Handshake, Short, etc.).
     pub ty: PacketType,
+    /// QUIC version field (0 for short header packets).
     pub version: u32,
+    /// Destination Connection ID.
     pub dcid: ConnectionId,
+    /// Source Connection ID (empty for short header packets).
     pub scid: ConnectionId,
+    /// Decoded packet number.
     pub pkt_num: u64,
+    /// On-wire packet number encoding length in bytes (1-4).
     pub pkt_num_len: usize,
+    /// Token from Initial or Retry packets.
     pub token: Option<Vec<u8>>,
+    /// Supported versions from Version Negotiation packets.
     pub versions: Option<Vec<u32>>,
+    /// Key phase bit for short header packets (1-RTT key rotation).
     pub key_phase: bool,
 }
 
+/// Transport-layer error codes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// Operation would block
@@ -840,102 +730,74 @@ impl std::error::Error for Error {}
 
 /// QUIC frame types
 #[derive(Clone, Debug, PartialEq)]
-pub enum Frame {
-    Padding {
-        len: usize,
-    },
-    Ping {
-        mtu_probe: Option<usize>,
-    },
+pub enum Frame<'a> {
+    /// PADDING frame (RFC 9000 Section 19.1).
+    Padding { len: usize },
+    /// PING frame, optionally used as an MTU probe (RFC 9000 Section 19.2).
+    Ping { mtu_probe: Option<usize> },
+    /// ACK frame acknowledging received packets (RFC 9000 Section 19.3).
     Ack {
         ack_delay: u64,
         ranges: Vec<(u64, u64)>, // Simplified range set
         ecn_counts: Option<EcnCounts>,
     },
-    ResetStream {
-        stream_id: u64,
-        error_code: u64,
-        final_size: u64,
-    },
-    StopSending {
-        stream_id: u64,
-        error_code: u64,
-    },
-    Crypto {
-        offset: u64,
-        data: Vec<u8>,
-    },
-    NewToken {
-        token: Vec<u8>,
-    },
-    Stream {
-        stream_id: u64,
-        offset: u64,
-        data: Vec<u8>,
-        fin: bool,
-    },
-    MaxData {
-        max: u64,
-    },
-    MaxStreamData {
-        stream_id: u64,
-        max: u64,
-    },
-    MaxStreamsBidi {
-        max: u64,
-    },
-    MaxStreamsUni {
-        max: u64,
-    },
-    DataBlocked {
-        limit: u64,
-    },
-    StreamDataBlocked {
-        stream_id: u64,
-        limit: u64,
-    },
-    StreamsBlockedBidi {
-        limit: u64,
-    },
-    StreamsBlockedUni {
-        limit: u64,
-    },
+    /// RESET_STREAM frame abruptly terminating send-side of a stream.
+    ResetStream { stream_id: u64, error_code: u64, final_size: u64 },
+    /// STOP_SENDING frame requesting the peer stop sending on a stream.
+    StopSending { stream_id: u64, error_code: u64 },
+    /// CRYPTO frame carrying TLS handshake data.
+    Crypto { offset: u64, data: Cow<'a, [u8]> },
+    /// NEW_TOKEN frame providing address validation tokens.
+    NewToken { token: Cow<'a, [u8]> },
+    /// STREAM frame carrying application data on a stream.
+    Stream { stream_id: u64, offset: u64, data: Cow<'a, [u8]>, fin: bool },
+    /// MAX_DATA frame advertising increased connection-level flow control limit.
+    MaxData { max: u64 },
+    /// MAX_STREAM_DATA frame advertising increased per-stream flow control limit.
+    MaxStreamData { stream_id: u64, max: u64 },
+    /// MAX_STREAMS frame for bidirectional streams.
+    MaxStreamsBidi { max: u64 },
+    /// MAX_STREAMS frame for unidirectional streams.
+    MaxStreamsUni { max: u64 },
+    /// DATA_BLOCKED frame signaling connection-level flow control blocking.
+    DataBlocked { limit: u64 },
+    /// STREAM_DATA_BLOCKED frame signaling per-stream flow control blocking.
+    StreamDataBlocked { stream_id: u64, limit: u64 },
+    /// STREAMS_BLOCKED frame for bidirectional streams.
+    StreamsBlockedBidi { limit: u64 },
+    /// STREAMS_BLOCKED frame for unidirectional streams.
+    StreamsBlockedUni { limit: u64 },
+    /// NEW_CONNECTION_ID frame issuing a new CID with stateless reset token.
     NewConnectionId {
         seq_num: u64,
         retire_prior_to: u64,
-        conn_id: Vec<u8>,
+        conn_id: Cow<'a, [u8]>,
         reset_token: [u8; 16],
     },
-    RetireConnectionId {
-        seq_num: u64,
-    },
-    PathChallenge {
-        data: [u8; 8],
-    },
-    PathResponse {
-        data: [u8; 8],
-    },
-    ConnectionClose {
-        error_code: u64,
-        frame_type: u64,
-        reason: Vec<u8>,
-    },
-    ApplicationClose {
-        error_code: u64,
-        reason: Vec<u8>,
-    },
-    Datagram {
-        data: Vec<u8>,
-    },
-    DatagramHeader {
-        length: usize,
-    },
+    /// RETIRE_CONNECTION_ID frame retiring a previously issued CID.
+    RetireConnectionId { seq_num: u64 },
+    /// PATH_CHALLENGE frame for path validation.
+    PathChallenge { data: [u8; 8] },
+    /// PATH_RESPONSE frame echoing a PATH_CHALLENGE.
+    PathResponse { data: [u8; 8] },
+    /// CONNECTION_CLOSE frame at the QUIC transport level.
+    ConnectionClose { error_code: u64, frame_type: u64, reason: Cow<'a, [u8]> },
+    /// APPLICATION_CLOSE frame carrying an application-level error.
+    ApplicationClose { error_code: u64, reason: Cow<'a, [u8]> },
+    /// DATAGRAM frame carrying unreliable application data (RFC 9221).
+    Datagram { data: Cow<'a, [u8]> },
+    /// Parsed datagram header only (length known, data not yet read).
+    DatagramHeader { length: usize },
 }
 
+/// ECN counter values carried in ACK frames (RFC 9000 Section 19.3.2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EcnCounts {
+    /// Count of packets received with ECT(0) codepoint.
     pub ect0: u64,
+    /// Count of packets received with ECT(1) codepoint.
     pub ect1: u64,
+    /// Count of packets received with CE (Congestion Experienced) codepoint.
     pub ce: u64,
 }
 
@@ -943,6 +805,7 @@ pub struct EcnCounts {
 // Random Number Generation
 // ============================================================================
 
+/// Cumulative QUIC connection statistics (packets, bytes, RTT, CC state).
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     /// Number of QUIC packets received
@@ -1010,13 +873,21 @@ pub struct Stats {
 /// Path statistics
 #[derive(Debug, Clone)]
 pub struct PathStats {
+    /// Bytes received on this path.
     pub recv: u64,
+    /// Bytes sent on this path.
     pub sent: u64,
+    /// Packets lost on this path.
     pub lost: u64,
+    /// Smoothed round-trip time for this path.
     pub rtt: std::time::Duration,
+    /// Congestion window size for this path in bytes.
     pub cwnd: usize,
+    /// Estimated delivery rate for this path in bytes/sec.
     pub delivery_rate: u64,
+    /// Local socket address for this path.
     pub local_addr: SocketAddr,
+    /// Peer socket address for this path.
     pub peer_addr: SocketAddr,
 }
 

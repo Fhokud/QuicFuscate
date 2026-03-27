@@ -1,5 +1,4 @@
 #![cfg(feature = "rust-tests")]
-// use quicfuscate::brain::accel::compute_statistics; // Module not found
 use quicfuscate::crypto::aead::{AeadOpen, AeadSeal};
 use quicfuscate::crypto::{Aegis128LAead, AesGcm128, MorusAead};
 use quicfuscate::fec::matrix_multiply_scalar;
@@ -126,22 +125,3 @@ fn matrix_identity_roundtrip() {
     matrix_multiply_scalar(&a, &vec![vec![0u8; 3]; 3], &mut zero);
     assert!(zero.iter().all(|row| row.iter().all(|&v| v == 0)));
 }
-
-// #[test]
-// fn brain_statistics_matches_scalar() {
-//     let data = [0.5f32, 1.5, -2.0, 4.5, 3.0, -1.0];
-//     let (mean, var) = compute_statistics(&data);
-//
-//     let scalar_mean: f32 = data.iter().copied().sum::<f32>() / data.len() as f32;
-//     let scalar_var: f32 = data
-//         .iter()
-//         .map(|&x| {
-//             let diff = x - scalar_mean;
-//             diff * diff
-//         })
-//         .sum::<f32>()
-//         / data.len() as f32;
-//
-//     assert!((mean - scalar_mean).abs() < 1e-6);
-//     assert!((var - scalar_var).abs() < 1e-5);
-// }

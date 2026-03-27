@@ -67,4 +67,4 @@ stop_one() {
 }
 
 stop_one "desktop-ui"
-stop_one "web-admin-ui"
+stop_one "admin-ui"

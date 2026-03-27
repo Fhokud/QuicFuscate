@@ -18,7 +18,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
   cat <<'EOF'
 Usage: util-dev-uis-start.sh
 
-Starts web-admin-ui and desktop-ui Vite dev servers as detached background
+Starts the Svelte admin UI and Svelte desktop UI dev servers as detached background
 processes. PID and logs are written to scripts/out/run/dev-uis/.
 Does not start the Rust server.
 EOF
@@ -81,16 +81,16 @@ start_one() {
 
 # Web Admin UI
 start_one \
-  "web-admin-ui" \
-  "$ROOT/apps/web-admin-ui" \
+  "admin-ui" \
+  "$ROOT/apps/svelte-admin" \
   "bun run dev"
 
 # Desktop UI (browser dev mode, not Tauri)
 start_one \
   "desktop-ui" \
-  "$ROOT/apps/desktop" \
-  "bun run dev -- --port 4173 --strictPort"
+  "$ROOT/apps/svelte-desktop" \
+  "bun run dev"
 
 echo "[dev-uis] urls:"
-echo "[dev-uis]   web-admin-ui: http://localhost:1430"
+echo "[dev-uis]   admin-ui:   http://localhost:1430"
 echo "[dev-uis]   desktop-ui:   http://localhost:4173"

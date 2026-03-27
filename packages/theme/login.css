@@ -1,0 +1,107 @@
+/* Login Dialog Animations (Web Admin only) */
+
+.qf-login-dialog-shell {
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.qf-login-dialog-shell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    linear-gradient(102deg, transparent 0%, rgba(255, 255, 255, 0.08) 28%, rgba(255, 255, 255, 0.56) 47%, rgba(255, 255, 255, 0.12) 64%, transparent 100%);
+  transform: translate3d(-16%, 0, 0);
+}
+
+.qf-login-motion-shell {
+  will-change: transform, opacity;
+}
+
+.qf-login-field {
+  position: relative;
+}
+
+.qf-login-dialog-shell[data-auth-feedback="reject"]::after {
+  animation: qf-login-sheen 360ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.qf-login-dialog-shell[data-auth-feedback="reject"] .qf-login-field input[aria-invalid="true"] {
+  border-color: rgba(148, 163, 184, 0.96);
+  box-shadow:
+    inset 0 1px 0.5px rgba(255, 255, 255, 0.82),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.52),
+    0 0 0 1px rgba(15, 23, 42, 0.16),
+    0 8px 18px rgba(15, 23, 42, 0.08),
+    0 1px 2px rgba(0, 0, 0, 0.04);
+  animation: qf-login-field-reject 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.qf-login-dialog-shell[data-auth-feedback="reject"] .qf-login-submit {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 10px 20px rgba(79, 70, 229, 0.16);
+  animation: qf-login-button-reject 300ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes qf-login-sheen {
+  0% { opacity: 0; transform: translate3d(-16%, 0, 0); }
+  35% { opacity: 0.8; }
+  100% { opacity: 0; transform: translate3d(18%, 0, 0); }
+}
+
+@keyframes qf-login-field-reject {
+  0% {
+    box-shadow:
+      inset 0 1px 0.5px rgba(255, 255, 255, 0.72),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.44),
+      0 3px 10px rgba(0, 0, 0, 0.06),
+      0 1px 2px rgba(0, 0, 0, 0.03);
+  }
+  42% {
+    box-shadow:
+      inset 0 1px 0.5px rgba(255, 255, 255, 0.86),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.56),
+      0 0 0 1px rgba(15, 23, 42, 0.18),
+      0 10px 24px rgba(15, 23, 42, 0.1),
+      0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+  100% {
+    box-shadow:
+      inset 0 1px 0.5px rgba(255, 255, 255, 0.82),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.52),
+      0 0 0 1px rgba(15, 23, 42, 0.16),
+      0 8px 18px rgba(15, 23, 42, 0.08),
+      0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+}
+
+@keyframes qf-login-button-reject {
+  0% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      0 1px 2px rgba(0, 0, 0, 0.03);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.34),
+      0 0 0 1px rgba(255, 255, 255, 0.18),
+      0 10px 20px rgba(79, 70, 229, 0.16);
+  }
+  100% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      0 1px 2px rgba(0, 0, 0, 0.03);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qf-login-dialog-shell[data-auth-feedback="reject"]::after,
+  .qf-login-dialog-shell[data-auth-feedback="reject"] .qf-login-field input[aria-invalid="true"],
+  .qf-login-dialog-shell[data-auth-feedback="reject"] .qf-login-submit {
+    animation-duration: 1ms;
+  }
+}

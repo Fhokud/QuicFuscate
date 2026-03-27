@@ -12,10 +12,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --fast) FAST=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [options]"; echo "Crypto Benchmarks"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
 
@@ -44,7 +43,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUTPUT_DIR"
 LOG_FILE="$OUTPUT_DIR/crypto-bench.log"
 JSON="$OUTPUT_DIR/results.json"; json_begin "$JSON" "bench_crypto_comprehensive"; JSON_FIRST_RUN=1
-export -f run_cargo
+export -f run run_cargo
 
 # Function to measure crypto throughput
 measure_throughput() {
@@ -76,41 +75,41 @@ elif [[ $(uname -m) == "aarch64" ]] || [[ $(uname -m) == "arm64" ]]; then
         sysctl -a 2>/dev/null | grep -i "hw.optional" | grep -E "aes|neon" || echo "  ARM crypto extensions"
 fi
 
-# AEGIS-128L Benchmarks
-echo -e "\n${YELLOW}=== AEGIS-128L Performance ===${NC}"
-measure_throughput "aegis128l_native" "aegis::test" ""
+# Full Crypto Suite Benchmarks (AEGIS, AES-HP, ChaCha, key derivation)
+echo -e "\n${YELLOW}=== Full Crypto Suite Performance ===${NC}"
+measure_throughput "crypto_all_native" "crypto::tests" ""
 
 if [[ $(uname -m) == "x86_64" ]]; then
-    measure_throughput "aegis128l_sse2" "aegis::test" "RUSTFLAGS='-C target-feature=+sse2'"
-    measure_throughput "aegis128l_avx2" "aegis::test" "RUSTFLAGS='-C target-feature=+avx2'"
+    measure_throughput "crypto_all_sse2" "crypto::tests" "RUSTFLAGS='-C target-feature=+sse2'"
+    measure_throughput "crypto_all_avx2" "crypto::tests" "RUSTFLAGS='-C target-feature=+avx2'"
 elif [[ $(uname -m) == "aarch64" ]] || [[ $(uname -m) == "arm64" ]]; then
-    measure_throughput "aegis128l_neon" "aegis::test" "RUSTFLAGS='-C target-feature=+neon'"
+    measure_throughput "crypto_all_neon" "crypto::tests" "RUSTFLAGS='-C target-feature=+neon'"
 fi
 
 # MORUS-1280-128 Benchmarks
 echo -e "\n${YELLOW}=== MORUS-1280-128 Performance ===${NC}"
-measure_throughput "morus_native" "morus::test" ""
+measure_throughput "morus_native" "crypto::morus::morus_tests" ""
 
 if [[ $(uname -m) == "x86_64" ]]; then
-    measure_throughput "morus_sse2" "morus::test" "RUSTFLAGS='-C target-feature=+sse2'"
+    measure_throughput "morus_sse2" "crypto::morus::morus_tests" "RUSTFLAGS='-C target-feature=+sse2'"
 elif [[ $(uname -m) == "aarch64" ]] || [[ $(uname -m) == "arm64" ]]; then
-    measure_throughput "morus_neon" "morus::test" "RUSTFLAGS='-C target-feature=+neon'"
+    measure_throughput "morus_neon" "crypto::morus::morus_tests" "RUSTFLAGS='-C target-feature=+neon'"
 fi
 
 # AES-GCM Benchmarks
 echo -e "\n${YELLOW}=== AES-GCM Performance ===${NC}"
-measure_throughput "aes_gcm_native" "aes_gcm::test" ""
+measure_throughput "aes_gcm_native" "crypto::gcm::tests" ""
 
 if [[ $(uname -m) == "x86_64" ]]; then
-    measure_throughput "aes_gcm_aesni" "aes_gcm::test" "RUSTFLAGS='-C target-feature=+aes,+sse2'"
-    measure_throughput "aes_gcm_vaes" "aes_gcm::test" "RUSTFLAGS='-C target-feature=+vaes,+avx512f'"
+    measure_throughput "aes_gcm_aesni" "crypto::gcm::tests" "RUSTFLAGS='-C target-feature=+aes,+sse2'"
+    measure_throughput "aes_gcm_vaes" "crypto::gcm::tests" "RUSTFLAGS='-C target-feature=+vaes,+avx512f'"
 elif [[ $(uname -m) == "aarch64" ]] || [[ $(uname -m) == "arm64" ]]; then
-    measure_throughput "aes_gcm_crypto" "aes_gcm::test" "RUSTFLAGS='-C target-feature=+aes,+neon'"
+    measure_throughput "aes_gcm_crypto" "crypto::gcm::tests" "RUSTFLAGS='-C target-feature=+aes,+neon'"
 fi
 
 # ChaCha20-Poly1305 Benchmarks (fallback)
 echo -e "\n${YELLOW}=== ChaCha20-Poly1305 Performance ===${NC}"
-measure_throughput "chacha20_poly1305" "chacha::test" ""
+measure_throughput "chacha20_poly1305_native" "crypto::tests::chacha20poly1305" ""
 
 # Comparative Analysis
 echo -e "\n${YELLOW}=== Comparative Analysis ===${NC}"
@@ -125,7 +124,7 @@ Algorithm         | Native | SSE2/NEON | AVX2/Crypto | AVX512/VAES
 EOF
 
 # Parse results and add to comparison
-for algo in aegis128l morus aes_gcm chacha20_poly1305; do
+for algo in crypto_all morus aes_gcm chacha20_poly1305; do
     native=$(grep "16384" "$OUTPUT_DIR/${algo}_native.txt" 2>/dev/null | awk '{print $NF}' || echo "N/A")
     sse2=$(grep "16384" "$OUTPUT_DIR/${algo}_sse2.txt" 2>/dev/null | awk '{print $NF}' || \
            grep "16384" "$OUTPUT_DIR/${algo}_neon.txt" 2>/dev/null | awk '{print $NF}' || echo "N/A")

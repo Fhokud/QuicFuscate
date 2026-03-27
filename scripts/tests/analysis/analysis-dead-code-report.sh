@@ -8,12 +8,10 @@ cd "$PROJECT_ROOT"
 [[ -f "$SCRIPT_DIR/../lib/lib-common.sh" ]] && source "$SCRIPT_DIR/../lib/lib-common.sh"
 
 # Flags
-OUTPUT_DIR=""; RUSTFLAGS_EXTRA=""; DRY_RUN=""; QUICFUSCATE_DEBUG_SCRIPTS=""
+OUTPUT_DIR=""; QUICFUSCATE_DEBUG_SCRIPTS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
-    --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--dry-run] [--verbose]"; exit 0;;
     *) break;;
@@ -60,9 +58,8 @@ total_dead_code=0
 
 echo -e "\n${YELLOW}=== Dead Code Markers by Module ===${NC}"
 
-for file in src/*.rs; do
-    [[ -f "$file" ]] || continue
-    basename=$(basename "$file")
+while IFS= read -r -d '' file; do
+    basename="${file#src/}"
     count=$(count_lines_in_file '#\[allow\(dead_code\)\]' "$file")
     total_dead_code=$((total_dead_code + count))
 
@@ -79,14 +76,13 @@ for file in src/*.rs; do
     else
         echo -e "  ${basename}: ${GREEN}0${NC} dead code markers"
     fi
-done
+done < <(find src -name '*.rs' -type f -print0 | sort -z)
 
 echo -e "\n${YELLOW}=== Unused Functions Analysis ===${NC}"
 echo "Searching for potentially unused private functions..."
 
-for file in src/*.rs; do
-    [[ -f "$file" ]] || continue
-    basename=$(basename "$file")
+while IFS= read -r -d '' file; do
+    basename="${file#src/}"
     echo -e "\n  ${BLUE}${basename}:${NC}"
 
     private_fns=$( (rg --no-messages '^[[:space:]]*fn [a-z_][a-z0-9_]*\(' "$file" || true) |
@@ -112,13 +108,12 @@ for file in src/*.rs; do
             echo -e "    ${YELLOW}?${NC} $fn_name: used only once"
         fi
     done <<< "$private_fns"
-done
+done < <(find src -name '*.rs' -type f -print0 | sort -z)
 
 echo -e "\n${YELLOW}=== Unused Structs/Enums Analysis ===${NC}"
 
-for file in src/*.rs; do
-    [[ -f "$file" ]] || continue
-    basename=$(basename "$file")
+while IFS= read -r -d '' file; do
+    basename="${file#src/}"
     echo -e "\n  ${BLUE}${basename}:${NC}"
 
     private_types=$( (rg --no-messages '^[[:space:]]*(struct|enum) [A-Z][A-Za-z0-9_]*' "$file" || true) |
@@ -153,7 +148,7 @@ for file in src/*.rs; do
             echo -e "    ${YELLOW}?${NC} $type_name: minimal usage ($usage_count references)"
         fi
     done <<< "$private_types"
-done
+done < <(find src -name '*.rs' -type f -print0 | sort -z)
 
 echo -e "\n${YELLOW}=== Feature-Gated Code Analysis ===${NC}"
 echo "Checking feature-gated code blocks..."
@@ -189,7 +184,7 @@ done
 echo -e "\n${YELLOW}=== Unused Dependencies Check ===${NC}"
 echo "Analyzing Cargo.toml dependencies..."
 
-deps=$(grep -E "^[a-z-]+ =" Cargo.toml | sed 's/ =.*//' | sort -u)
+deps=$(sed -n '/^\[.*dependencies/,/^\[/{ /^[a-z][a-z0-9_-]* *=/s/ *=.*//p }' Cargo.toml | sort -u)
 
 for dep in $deps; do
     usage=$(count_lines "use $dep|extern crate $dep|$dep::" src/ --glob '*.rs')
@@ -208,13 +203,12 @@ echo -e "\n${YELLOW}=== Summary ===${NC}"
 echo -e "  Total dead code markers: ${RED}$total_dead_code${NC}"
 echo -e "  Modules with most dead code:"
 
-for file in src/*.rs; do
-    [[ -f "$file" ]] || continue
+while IFS= read -r -d '' file; do
     count=$(count_lines_in_file '#\[allow\(dead_code\)\]' "$file")
     if (( count > 0 )); then
-        echo "$count $(basename "$file")"
+        echo "$count ${file#src/}"
     fi
-done | sort -rn | head -5 | while read -r count file; do
+done < <(find src -name '*.rs' -type f -print0 | sort -z) | sort -rn | head -5 | while read -r count file; do
     [[ -n "${count:-}" && -n "${file:-}" ]] || continue
     echo -e "    ${RED}$count${NC} in $file"
 done

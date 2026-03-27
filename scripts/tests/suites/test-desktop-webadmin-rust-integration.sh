@@ -12,10 +12,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h)
-      echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--dry-run] [--verbose]"
+      echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--verbose]"
       exit 0
       ;;
     *) break;;
@@ -34,15 +33,19 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "==============================================================="
 echo "  Targeted Validation Suite"
+echo "  - Desktop Check"
 echo "  - Desktop Unit"
+echo "  - Web-Admin Check"
 echo "  - Web-Admin Unit"
 echo "  - Rust Integration (6 targeted tests)"
 echo "==============================================================="
 echo "Output: $OUTPUT_DIR"
 
-run bash -lc "cd \"$PROJECT_ROOT/apps/desktop\" && bun run test:unit"
-run bash -lc "cd \"$PROJECT_ROOT/apps/web-admin-ui\" && bun run test:unit"
-run cargo test \
+run bash -lc "cd \"$PROJECT_ROOT/apps/svelte-desktop\" && bun run check"
+run bash -lc "cd \"$PROJECT_ROOT/apps/svelte-desktop\" && bun run test:unit"
+run bash -lc "cd \"$PROJECT_ROOT/apps/svelte-admin\" && bun run check"
+run bash -lc "cd \"$PROJECT_ROOT/apps/svelte-admin\" && bun run test:unit"
+run cargo test --features rust-tests \
   --test it-engine-control-plane \
   --test it-interface-capabilities \
   --test it-masque-runtime-integration \

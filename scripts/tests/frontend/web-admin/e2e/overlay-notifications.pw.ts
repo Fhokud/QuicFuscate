@@ -13,7 +13,6 @@ const CONFIG_TOML = [
   "mode = \"manual\"",
   "enable_domain_fronting = true",
   "enable_http3_masquerading = true",
-  "enable_xor_obfuscation = true",
   "use_tls_cover = true",
   "use_qpack_headers = true",
   "enable_traffic_padding = false",
@@ -25,7 +24,7 @@ const CONFIG_TOML = [
   "initial_mode = \"normal\"",
   "",
   "[transport]",
-  "cc_algorithm = \"cubic\"",
+  "cc_algorithm = \"bbr3\"",
   "mtu = 1400",
   "",
 ].join("\n");

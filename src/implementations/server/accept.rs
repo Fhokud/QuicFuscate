@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 3;
+
 /// Accept loop configuration.
 #[derive(Clone, Debug)]
 pub struct AcceptConfig {
@@ -32,9 +34,9 @@ impl Default for AcceptConfig {
     fn default() -> Self {
         Self {
             backlog_size: 128,
-            accept_timeout: Duration::from_secs(5),
+            accept_timeout: Duration::from_millis(500),
             backpressure_delay: Duration::from_millis(100),
-            max_per_ip: 5,
+            max_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
             drain_timeout: Duration::from_secs(30),
         }
     }
@@ -205,6 +207,16 @@ impl AcceptLoop {
         self.ip_tracker.write().decrement(addr.ip());
     }
 
+    /// Record that a live connection migrated to a new peer address.
+    pub fn record_migration(&self, old_addr: SocketAddr, new_addr: SocketAddr) {
+        if old_addr.ip() == new_addr.ip() {
+            return;
+        }
+        let mut tracker = self.ip_tracker.write();
+        tracker.decrement(old_addr.ip());
+        tracker.increment(new_addr.ip());
+    }
+
     /// Get backpressure delay.
     pub fn backpressure_delay(&self) -> Duration {
         self.config.backpressure_delay
@@ -294,7 +306,7 @@ mod tests {
     #[test]
     fn test_accept_config_default() {
         let config = AcceptConfig::default();
-        assert_eq!(config.max_per_ip, 5);
+        assert_eq!(config.max_per_ip, DEFAULT_MAX_CONNECTIONS_PER_IP);
         assert_eq!(config.backlog_size, 128);
     }
 

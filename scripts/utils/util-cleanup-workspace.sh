@@ -20,13 +20,6 @@ run_cmd() {
   "$@"
 }
 
-clear_dir_contents() {
-  local dir="$1"
-  if [[ -d "$dir" ]]; then
-    run_cmd find "$dir" -mindepth 1 -depth -delete
-  fi
-}
-
 prune_releases() {
   local keep="$1"
   local rel="$ROOT/scripts/out/releases"
@@ -44,8 +37,8 @@ prune_releases() {
     for e in "${old[@]}"; do
       run_cmd rm -rf -- "$e"
     done
+    echo "[cleanup] scripts/out/releases pruned (kept latest ${keep})"
   )
-  echo "[cleanup] scripts/out/releases pruned (kept latest ${keep})"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -100,8 +93,13 @@ run_cmd find "$ROOT" -name ".DS_Store" -type f -delete 2>/dev/null || true
 echo "[cleanup] removing Thumbs.db"
 run_cmd find "$ROOT" -name "Thumbs.db" -type f -delete 2>/dev/null || true
 
-echo "[cleanup] clearing scripts/out contents"
-clear_dir_contents "$ROOT/scripts/out"
+echo "[cleanup] pruning releases (before clearing scripts/out)"
+prune_releases "$KEEP_RELEASES"
+
+echo "[cleanup] clearing scripts/out contents (preserving releases)"
+if [[ -d "$ROOT/scripts/out" ]]; then
+  run_cmd find "$ROOT/scripts/out" -mindepth 1 -not -name "releases" -not -path "*/releases/*" -depth -delete
+fi
 
 if [[ "$MODE" == "full" ]]; then
   echo "[cleanup] removing temp/backup/log files"
@@ -110,9 +108,6 @@ if [[ "$MODE" == "full" ]]; then
   run_cmd find "$ROOT" -name "*.swp" -type f -delete 2>/dev/null || true
   run_cmd find "$ROOT" -name "*.log" -type f -delete 2>/dev/null || true
 fi
-
-echo "[cleanup] pruning releases"
-prune_releases "$KEEP_RELEASES"
 
 if [[ "$CARGO_CLEAN" == "1" ]]; then
   echo "[cleanup] running cargo clean"

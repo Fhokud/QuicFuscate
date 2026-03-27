@@ -15,12 +15,13 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS="$2"; shift;;
     --features) CARGO_FEATURES="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1;;
     --help|-h) echo "Usage: $(basename "$0") [options]"; echo "Stealth+Brain Benchmarks"; usage_common_flags 2>/dev/null || true; exit 0;;
-    *) echo "Unknown flag: " >&2; exit 2;;
+    *) echo "Unknown flag: $1" >&2; exit 2;;
   esac; shift
 done
+
+export CARGO_FEATURES JOBS
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BASE_NAME="$(basename "$0" .sh)"
@@ -39,7 +40,7 @@ if (( FAST )); then ACK_MAX=(8); JITTER_US=(1000); fi
 RESULTS_JSON="$OUTPUT_DIR/bench_results.json"; json_begin "$RESULTS_JSON" "bench_stealth_brain"; FIRST=true
 TOTAL=0
 
-export -f run_cargo
+export -f run run_cargo
 run_cargo_logged() {
   local envs="$1"; shift
   if [[ -n "$envs" ]]; then
@@ -59,7 +60,9 @@ bench_one() {
   local start=$(date +%s)
   # Exercise brain + stealth module tests; measure runtime as proxy
   run_cargo_logged "${envs[*]} RUSTFLAGS=${RUSTFLAGS_EXTRA:-}" test --release --lib \
-      stealth:: brain:: -- --nocapture >>"$LOG_FILE" 2>&1 || true
+      'stealth::' -- --nocapture >>"$LOG_FILE" 2>&1 || true
+  run_cargo_logged "${envs[*]} RUSTFLAGS=${RUSTFLAGS_EXTRA:-}" test --release --lib \
+      'brain::' -- --nocapture >>"$LOG_FILE" 2>&1 || true
   local end=$(date +%s); local dur=$((end-start))
   TOTAL=$((TOTAL+1))
   if [[ "$FIRST" == "true" ]]; then FIRST=false; else echo "," >> "$RESULTS_JSON"; fi

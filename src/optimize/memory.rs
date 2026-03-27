@@ -9,85 +9,9 @@ use crate::optimize::FeatureDetector;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Non-temporal memcpy for large transfers - bypasses cache
-#[inline(always)]
-pub fn memcpy_non_temporal(dst: &mut [u8], src: &[u8]) {
-    #[cfg(target_arch = "x86_64")]
-    let profile = FeatureDetector::instance().profile();
-    let len = dst.len().min(src.len());
-
-    // Use non-temporal stores for large copies (>32KB)
-    if len > 32768 {
-        #[cfg(target_arch = "x86_64")]
-        match profile {
-            CpuProfile::X86_P0a
-            | CpuProfile::X86_P0b
-            | CpuProfile::X86_P1a
-            | CpuProfile::X86_P1b
-            | CpuProfile::X86_P1f
-            | CpuProfile::X86_P2a
-            | CpuProfile::X86_P2b
-            | CpuProfile::X86_P3a
-            | CpuProfile::X86_P3b
-            | CpuProfile::X86_P3c
-            | CpuProfile::X86_P3d
-            | CpuProfile::X86_P3e
-            | CpuProfile::X86_P4a
-            | CpuProfile::X86_P4b => unsafe {
-                memcpy_non_temporal_sse(dst, src, len);
-                return;
-            },
-            _ => {}
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            crate::accelerate::transport_io::memcpy_non_temporal_arm(dst, src, len);
-            return;
-        }
-    }
-
-    // Fallback to regular copy
-    dst[..len].copy_from_slice(&src[..len]);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn memcpy_non_temporal_sse(dst: &mut [u8], src: &[u8], len: usize) {
-    let mut i = 0;
-
-    // Non-temporal stores with SSE streaming stores
-    while i + 64 <= len {
-        // Prefetch next cache lines
-        crate::optimize::prefetch(src.as_ptr().add(i + 64), crate::optimize::PrefetchHint::Nta);
-        crate::optimize::prefetch(src.as_ptr().add(i + 128), crate::optimize::PrefetchHint::Nta);
-
-        // Load and stream store 64 bytes
-        let v0 = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-        let v1 = _mm_loadu_si128(src.as_ptr().add(i + 16) as *const __m128i);
-        let v2 = _mm_loadu_si128(src.as_ptr().add(i + 32) as *const __m128i);
-        let v3 = _mm_loadu_si128(src.as_ptr().add(i + 48) as *const __m128i);
-
-        _mm_stream_si128(dst.as_mut_ptr().add(i) as *mut __m128i, v0);
-        _mm_stream_si128(dst.as_mut_ptr().add(i + 16) as *mut __m128i, v1);
-        _mm_stream_si128(dst.as_mut_ptr().add(i + 32) as *mut __m128i, v2);
-        _mm_stream_si128(dst.as_mut_ptr().add(i + 48) as *mut __m128i, v3);
-
-        i += 64;
-    }
-
-    // Fence to ensure all stores complete
-    _mm_sfence();
-
-    // Handle remainder with regular copy
-    while i < len {
-        dst[i] = src[i];
-        i += 1;
-    }
-}
-
 /// Cache-aware matrix transpose - optimized for cache lines
 #[inline(always)]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 pub fn transpose_matrix<T: Copy>(matrix: &mut [T], rows: usize, cols: usize) {
     let profile = FeatureDetector::instance().profile();
 
@@ -144,6 +68,7 @@ pub fn transpose_matrix<T: Copy>(matrix: &mut [T], rows: usize, cols: usize) {
     transpose_matrix_blocked(matrix, rows, cols);
 }
 
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 fn transpose_matrix_blocked<T: Copy>(matrix: &mut [T], rows: usize, cols: usize) {
     const BLOCK_SIZE: usize = 64; // Cache line aware
     let mut result = vec![matrix[0]; rows * cols];
@@ -165,6 +90,7 @@ fn transpose_matrix_blocked<T: Copy>(matrix: &mut [T], rows: usize, cols: usize)
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_matrix_neon_f32(matrix: *mut f32, rows: usize, cols: usize) {
     let src = std::slice::from_raw_parts(matrix, rows * cols);
     let mut result = vec![0f32; rows * cols];
@@ -179,6 +105,7 @@ unsafe fn transpose_matrix_neon_f32(matrix: *mut f32, rows: usize, cols: usize) 
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_matrix_sve2_f32(matrix: *mut f32, rows: usize, cols: usize) {
     #[cfg(target_feature = "sve2")]
     {
@@ -194,6 +121,7 @@ unsafe fn transpose_matrix_sve2_f32(matrix: *mut f32, rows: usize, cols: usize) 
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
 #[target_feature(enable = "sve2")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_matrix_sve2_impl(matrix: *mut f32, rows: usize, cols: usize) {
     use std::arch::aarch64::*;
 
@@ -238,6 +166,7 @@ unsafe fn transpose_matrix_sve2_impl(matrix: *mut f32, rows: usize, cols: usize)
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_4x4_neon(
     src: *const f32,
     dst: *mut f32,
@@ -275,6 +204,7 @@ unsafe fn transpose_4x4_neon(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_matrix_avx2_f32(matrix: *mut f32, rows: usize, cols: usize) {
     let src = std::slice::from_raw_parts(matrix, rows * cols);
     let mut result = vec![0f32; rows * cols];
@@ -291,6 +221,7 @@ unsafe fn transpose_matrix_avx2_f32(matrix: *mut f32, rows: usize, cols: usize) 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 unsafe fn transpose_8x8_avx2(
     src: *const f32,
     dst: *mut f32,
@@ -339,157 +270,8 @@ unsafe fn transpose_8x8_avx2(
     }
 }
 
-/// Prefetch optimization for sequential access patterns
-#[inline(always)]
-pub fn prefetch_sequential(data: &[u8], stride: usize) {
-    let _profile = FeatureDetector::instance().profile();
-    // Silence unused on non-x86
-    let _ = (data.len(), stride);
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P1a
-        | CpuProfile::X86_P1b
-        | CpuProfile::X86_P1f
-        | CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            prefetch_sequential_x86(data, stride);
-        },
-        _ => {}
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn prefetch_sequential_x86(data: &[u8], stride: usize) {
-    const PREFETCH_DISTANCE: usize = 256; // Prefetch 256 bytes ahead
-
-    let mut i = 0;
-    while i + PREFETCH_DISTANCE < data.len() {
-        crate::optimize::prefetch(
-            data.as_ptr().add(i + PREFETCH_DISTANCE),
-            crate::optimize::PrefetchHint::T0,
-        );
-        i += stride;
-    }
-}
-
-/// Prefetch optimization for random access patterns
-#[inline(always)]
-pub fn prefetch_random(data: &[u8], indices: &[usize]) {
-    let _profile = FeatureDetector::instance().profile();
-    // Silence unused on non-x86
-    let _ = (data.len(), indices.len());
-
-    #[cfg(target_arch = "x86_64")]
-    match _profile {
-        CpuProfile::X86_P1a
-        | CpuProfile::X86_P1b
-        | CpuProfile::X86_P1f
-        | CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            prefetch_random_x86(data, indices);
-        },
-        _ => {}
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn prefetch_random_x86(data: &[u8], indices: &[usize]) {
-    // Prefetch next few random accesses
-    for &idx in indices.iter().take(4) {
-        if idx < data.len() {
-            crate::optimize::prefetch(data.as_ptr().add(idx), crate::optimize::PrefetchHint::T0);
-        }
-    }
-}
-
-/// Cache line aligned allocation
-pub fn alloc_cache_aligned(size: usize) -> Vec<u8> {
-    const CACHE_LINE_SIZE: usize = 64;
-    let aligned_size = (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-    let mut v = Vec::with_capacity(aligned_size + CACHE_LINE_SIZE);
-
-    // Align to cache line boundary
-    let ptr = v.as_ptr() as usize;
-    let aligned_ptr = (ptr + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-    let offset = aligned_ptr - ptr;
-
-    unsafe {
-        v.set_len(aligned_size + offset);
-    }
-
-    v[offset..].to_vec()
-}
-
-/// Clear cache lines with non-temporal stores
-#[inline(always)]
-pub fn clear_cache_lines(data: &mut [u8]) {
-    #[allow(unused_variables)]
-    let profile = FeatureDetector::instance().profile();
-
-    #[cfg(target_arch = "x86_64")]
-    match profile {
-        CpuProfile::X86_P1a
-        | CpuProfile::X86_P1b
-        | CpuProfile::X86_P1f
-        | CpuProfile::X86_P2a
-        | CpuProfile::X86_P2b
-        | CpuProfile::X86_P3a
-        | CpuProfile::X86_P3b
-        | CpuProfile::X86_P3c
-        | CpuProfile::X86_P3d
-        | CpuProfile::X86_P3e
-        | CpuProfile::X86_P4a
-        | CpuProfile::X86_P4b => unsafe {
-            clear_cache_lines_x86(data);
-            return;
-        },
-        _ => {}
-    }
-
-    // Fallback
-    data.fill(0);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.2")]
-unsafe fn clear_cache_lines_x86(data: &mut [u8]) {
-    let zero = _mm_setzero_si128();
-    let mut i = 0;
-
-    // Clear with streaming stores
-    while i + 64 <= data.len() {
-        _mm_stream_si128(data.as_mut_ptr().add(i) as *mut __m128i, zero);
-        _mm_stream_si128(data.as_mut_ptr().add(i + 16) as *mut __m128i, zero);
-        _mm_stream_si128(data.as_mut_ptr().add(i + 32) as *mut __m128i, zero);
-        _mm_stream_si128(data.as_mut_ptr().add(i + 48) as *mut __m128i, zero);
-        i += 64;
-    }
-
-    _mm_sfence();
-
-    // Handle remainder
-    while i < data.len() {
-        data[i] = 0;
-        i += 1;
-    }
-}
-
-/// Lock-free ring buffer with cache-aware design
+/// Rust parity/test-only lock-free ring buffer helper.
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 pub struct LockFreeRingBuffer {
     buffer: Vec<u8>,
     capacity: usize,
@@ -498,6 +280,7 @@ pub struct LockFreeRingBuffer {
     tail: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(any(test, feature = "rust-tests", feature = "benches"))]
 impl LockFreeRingBuffer {
     pub fn new(capacity: usize) -> Self {
         // Round up to power of 2 for fast modulo
@@ -528,7 +311,7 @@ impl LockFreeRingBuffer {
         unsafe {
             let dst_ptr = self.buffer.as_ptr().add(idx) as *mut u8;
             let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, first);
-            crate::optimize::simd::core::memcpy_fast(dst_slice, &data[..first]);
+            dst_slice.copy_from_slice(&data[..first]);
         }
 
         if data.len() > first {
@@ -536,7 +319,7 @@ impl LockFreeRingBuffer {
             unsafe {
                 let dst_ptr = self.buffer.as_ptr() as *mut u8;
                 let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, second);
-                crate::optimize::simd::core::memcpy_fast(dst_slice, &data[first..]);
+                dst_slice.copy_from_slice(&data[first..]);
             }
         }
 
@@ -560,7 +343,7 @@ impl LockFreeRingBuffer {
         if first > 0 {
             unsafe {
                 let src_slice = std::slice::from_raw_parts(self.buffer.as_ptr().add(idx), first);
-                crate::optimize::simd::core::memcpy_fast(&mut buf[..first], src_slice);
+                buf[..first].copy_from_slice(src_slice);
             }
         }
 
@@ -568,10 +351,7 @@ impl LockFreeRingBuffer {
             let second = to_read - first;
             unsafe {
                 let src_slice = std::slice::from_raw_parts(self.buffer.as_ptr(), second);
-                crate::optimize::simd::core::memcpy_fast(
-                    &mut buf[first..first + second],
-                    src_slice,
-                );
+                buf[first..first + second].copy_from_slice(src_slice);
             }
         }
 
@@ -580,17 +360,4 @@ impl LockFreeRingBuffer {
         self.tail.store(pos, std::sync::atomic::Ordering::Release);
         to_read
     }
-}
-
-/// NUMA-aware memory allocation
-#[cfg(target_os = "linux")]
-pub fn alloc_numa_local(size: usize, node: usize) -> Vec<u8> {
-    // Would use libnuma for real NUMA allocation
-    // For now, just regular allocation
-    vec![0; size]
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn alloc_numa_local(size: usize, _node: usize) -> Vec<u8> {
-    vec![0; size]
 }

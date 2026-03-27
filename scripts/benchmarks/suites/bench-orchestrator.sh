@@ -31,27 +31,10 @@ while [[ $# -gt 0 ]]; do
   shift
  done
 
-DEFAULT_SUITES=(
-  "crypto"
-  "fec"
-  "transport"
-  "compression"
-  "optimization"
-  "stealth"
-  "stealth-brain"
-  "qpack-encode"
-)
-FAST_SUITES=(
-  "micro-crypto-all"
-  "smoke-fec-quick"
-  "transport"
-  "stealth"
-)
-
 SUITE_CMDS=()
 if (( FAST )); then
   SUITE_CMDS+=("micro-crypto-all:$SCRIPT_DIR/../micro/micro-crypto-all.sh --fast")
-  SUITE_CMDS+=("smoke-fec-quick:$SCRIPT_DIR/../smoke/smoke-fec-quick.sh")
+  SUITE_CMDS+=("fec-simulation-fast:$SCRIPT_DIR/bench-fec-simulation.sh --fast")
   SUITE_CMDS+=("transport:$SCRIPT_DIR/bench-transport.sh --fast")
   SUITE_CMDS+=("stealth:$SCRIPT_DIR/bench-stealth.sh --fast")
 else

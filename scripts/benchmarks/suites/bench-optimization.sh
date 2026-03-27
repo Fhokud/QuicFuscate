@@ -13,7 +13,6 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --fast) FAST=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--fast]"; exit 0;;
     *) break;;
@@ -39,45 +38,16 @@ if ! cargo bench --no-run --features benches >/dev/null 2>&1; then
   exit 0
 fi
 
-# Build with native optimizations
-run_cargo build --release --features benches
+run_cargo build --release --features "${CARGO_FEATURES:-benches}"
 
-# Benchmark memory pool
-echo -e "\n> Benchmarking Memory Pool..."
-(( ! FAST )) && run cargo bench --features benches -- memory_pool
+echo -e "\n> Benchmarking SIMD Sort (u32)..."
+run cargo bench --features benches -- sort_simd
 
-# Benchmark NUMA configurations
-echo -e "\n> Benchmarking NUMA Policies..."
-for policy in local interleave "preferred:0"; do
-    echo "  - Policy: $policy"
-    (( ! FAST )) && run env QUICFUSCATE_NUMA_POLICY=$policy cargo bench --features benches -- numa
-done
+echo -e "\n> Benchmarking SIMD Shuffle..."
+run cargo bench --features benches -- shuffle_simd
 
-# Benchmark with/without HugePages
-echo -e "\n> Benchmarking HugePages Impact..."
-echo "  - Without HugePages"
-(( ! FAST )) && run env QUICFUSCATE_MADVISE_HUGEPAGE=0 cargo bench --features benches -- memory_access
-
-echo "  - With HugePages"
-(( ! FAST )) && run env QUICFUSCATE_MADVISE_HUGEPAGE=1 cargo bench --features benches -- memory_access
-
-# Benchmark SIMD paths
-echo -e "\n> Benchmarking SIMD Operations..."
-run env RUSTFLAGS="-C target-cpu=native" cargo bench --features benches -- simd
-
-# Benchmark prefetching
-echo -e "\n> Benchmarking Prefetch Impact..."
-(( ! FAST )) && run cargo bench --features benches -- prefetch
-
-# Benchmark zero-copy
-echo -e "\n> Benchmarking Zero-Copy Operations..."
-(( ! FAST )) && run cargo bench --features "benches zero_copy_dgram" -- zero_copy
-
-# Export results
-OUTPUT_FILE="$OUTPUT_DIR/optimization-bench.json"
-
-echo -e "\n> Exporting results to $OUTPUT_FILE..."
-run cargo bench --features benches --no-run --message-format=json > "$OUTPUT_FILE" 2>&1 || true
+echo -e "\n> Benchmarking Matrix Transpose..."
+run cargo bench --features benches -- memory_transpose
 
 echo -e "\n[OK] Optimization Benchmarks Complete"
 json_end "$JSON"

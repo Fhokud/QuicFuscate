@@ -1,0 +1,148 @@
+import type {
+  NavTab,
+  StatusData,
+  ClientInfo,
+  MetricsMap,
+  QKeyEntry,
+  ConfirmDialogRequest,
+} from "$lib/types";
+
+// Navigation
+let _activeTab = $state<NavTab>("dashboard");
+
+export function getActiveTab(): NavTab {
+  return _activeTab;
+}
+
+export function setActiveTab(tab: NavTab): void {
+  _activeTab = tab;
+}
+
+// Auth
+let _authRequired = $state(false);
+let _authError = $state<string | null>(null);
+let _adminUser = $state<string | null>(null);
+let _requiresPasswordChange = $state(false);
+
+export function getAuthRequired(): boolean {
+  return _authRequired;
+}
+export function setAuthRequired(v: boolean): void {
+  _authRequired = v;
+}
+
+export function getAuthError(): string | null {
+  return _authError;
+}
+export function setAuthError(v: string | null): void {
+  _authError = v;
+}
+
+export function setAdminUser(v: string | null): void {
+  _adminUser = v;
+}
+
+export function getRequiresPasswordChange(): boolean {
+  return _requiresPasswordChange;
+}
+export function setRequiresPasswordChange(v: boolean): void {
+  _requiresPasswordChange = v;
+}
+
+// Status
+let _status = $state<StatusData | null>(null);
+let _statusLoading = $state(false);
+
+export function getStatus(): StatusData | null {
+  return _status;
+}
+export function setStatus(v: StatusData | null): void {
+  _status = v;
+}
+export function setStatusLoading(v: boolean): void {
+  _statusLoading = v;
+}
+
+// Clients
+let _clients = $state<ClientInfo[]>([]);
+let _clientsLoading = $state(false);
+
+export function getClients(): ClientInfo[] {
+  return _clients;
+}
+export function setClients(v: ClientInfo[]): void {
+  _clients = v;
+}
+export function setClientsLoading(v: boolean): void {
+  _clientsLoading = v;
+}
+
+// Metrics
+let _metrics = $state<MetricsMap | null>(null);
+let _metricsLoading = $state(false);
+
+export function getMetrics(): MetricsMap | null {
+  return _metrics;
+}
+export function setMetrics(v: MetricsMap | null): void {
+  _metrics = v;
+}
+export function setMetricsLoading(v: boolean): void {
+  _metricsLoading = v;
+}
+
+// QKeys
+let _qkeyList = $state<QKeyEntry[]>([]);
+let _qkeyListLoading = $state(false);
+
+export function getQkeyList(): QKeyEntry[] {
+  return _qkeyList;
+}
+export function setQkeyList(v: QKeyEntry[]): void {
+  _qkeyList = v;
+}
+export function getQkeyListLoading(): boolean {
+  return _qkeyListLoading;
+}
+export function setQkeyListLoading(v: boolean): void {
+  _qkeyListLoading = v;
+}
+
+// Dirty flags
+let _configDirty = $state(false);
+let _logsDirty = $state(false);
+
+export function getConfigDirty(): boolean {
+  return _configDirty;
+}
+export function setConfigDirty(v: boolean): void {
+  _configDirty = v;
+}
+
+export function getLogsDirty(): boolean {
+  return _logsDirty;
+}
+export function setLogsDirty(v: boolean): void {
+  _logsDirty = v;
+}
+
+// Confirm dialog
+let _confirmDialogRequest = $state<ConfirmDialogRequest | null>(null);
+let _confirmDialogResolve = $state<((accepted: boolean) => void) | null>(null);
+
+export function getConfirmDialogRequest(): ConfirmDialogRequest | null {
+  return _confirmDialogRequest;
+}
+
+export function confirmDialog(request: ConfirmDialogRequest): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    _confirmDialogRequest = request;
+    _confirmDialogResolve = resolve;
+  });
+}
+
+export function resolveConfirmDialog(accepted: boolean): void {
+  _confirmDialogResolve?.(accepted);
+  _confirmDialogRequest = null;
+  _confirmDialogResolve = null;
+}

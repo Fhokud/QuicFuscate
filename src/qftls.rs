@@ -1,10 +1,10 @@
 #![allow(unexpected_cfgs)]
 // Unified TLS stack for QuicFuscate
 // Consolidates: tls_provider.rs, tls_combined.rs, RealTLS_rustls.rs
-// Provides a single public surface: Level, TlsProfile, QuicTlsProvider, ProviderStrategy, create_provider()
+// Provides a single public surface: Level, TlsProfile, QuicTlsProvider, create_provider()
 
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -14,11 +14,45 @@ use crate::transport::packet::CryptoContext;
 static TLS_CERT_PATH_OVERRIDE: OnceLock<String> = OnceLock::new();
 static TLS_KEY_PATH_OVERRIDE: OnceLock<String> = OnceLock::new();
 static TLS_OVERRIDE_REQUIRED: AtomicBool = AtomicBool::new(false);
+/// Configurable max early data size for server TLS config.
+/// RFC 9001 §4.6.1: QUIC requires this to be either 0 (no 0-RTT) or 0xFFFF_FFFF (0-RTT enabled).
+/// Default is u32::MAX (0-RTT offered). Set to 0 to disable 0-RTT.
+/// Set via `set_max_early_data_size()` before server connection creation.
+static MAX_EARLY_DATA_SIZE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Set the maximum early data size for new server TLS connections.
+pub fn set_max_early_data_size(size: u32) {
+    MAX_EARLY_DATA_SIZE.store(size, Ordering::Relaxed);
+}
 const DEFAULT_TLS_SNI_HOST: &str = "cdn.cloudflare.com";
 
+fn trace_key_change(is_server: bool, label: &str) {
+    log::trace!("[qftls] {:?} keychange={}", if is_server { "server" } else { "client" }, label);
+}
+
+fn trace_hp_error(message: &str) {
+    log::trace!("[qftls] {}", message);
+}
+
+fn trace_hp_mask(mask0: u8, pn: [u8; 4]) {
+    log::trace!(
+        "[qftls] hp mask0={:02x} pn={:02x}{:02x}{:02x}{:02x}",
+        mask0,
+        pn[0],
+        pn[1],
+        pn[2],
+        pn[3]
+    );
+}
+
+/// Override the TLS certificate and private key file paths for server mode.
 pub fn set_tls_cert_key_paths(cert_path: &str, key_path: &str) {
-    let _ = TLS_CERT_PATH_OVERRIDE.set(cert_path.to_string());
-    let _ = TLS_KEY_PATH_OVERRIDE.set(key_path.to_string());
+    if TLS_CERT_PATH_OVERRIDE.set(cert_path.to_string()).is_err() {
+        log::debug!("TLS cert path override already set, keeping existing value");
+    }
+    if TLS_KEY_PATH_OVERRIDE.set(key_path.to_string()).is_err() {
+        log::debug!("TLS key path override already set, keeping existing value");
+    }
     TLS_OVERRIDE_REQUIRED.store(true, Ordering::SeqCst);
 }
 
@@ -30,33 +64,50 @@ pub fn set_tls_cert_key_paths(cert_path: &str, key_path: &str) {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
+    /// Initial encryption level (connection establishment).
     Initial = 0,
+    /// 0-RTT early data encryption level.
     EarlyData = 1,
+    /// Handshake encryption level (during TLS negotiation).
     Handshake = 2,
+    /// Application data encryption level (post-handshake).
     Application = 3,
 }
 
 /// TLS Profile for stealth configuration
 #[derive(Debug, Clone)]
 pub struct TlsProfile {
+    /// Human-readable browser user-agent string (e.g., "Chrome/136.0.0.0").
     pub name: String,
+    /// TLS cipher suite IDs in preference order.
     pub cipher_suites: Vec<u16>,
+    /// Supported named groups (key exchange curves) in preference order.
     pub groups: Vec<u16>,
+    /// Supported signature algorithms in preference order.
     pub signature_algorithms: Vec<u16>,
+    /// ALPN protocol identifiers (e.g., ["h3", "h2"]).
     pub alpn_protocols: Vec<String>,
+    /// SNI hostname override (None uses connection default).
     pub sni: Option<String>,
+    /// Enable 0-RTT early data in this profile.
     pub enable_0rtt: bool,
+    /// Enable Encrypted Client Hello (ECH) extension.
     pub enable_ech: bool,
+    /// GREASE values to inject for fingerprint realism.
     pub grease_values: Vec<u16>,
+    /// ClientHello extension ordering to match browser fingerprint.
     pub extension_order: Vec<u16>,
+    /// Optional cosmetic timing jitter for fingerprint realism.
     pub timing_jitter: Option<std::time::Duration>,
+    /// If true, TLS Cover runs without artificial delays.
+    pub cover_performance_mode: bool,
 }
 
 impl TlsProfile {
-    /// Chrome 130 Profile - Most common browser
+    /// Chrome 136 Profile - Most common browser
     pub fn chrome_130() -> Self {
         Self {
-            name: "Chrome/130.0.0.0".into(),
+            name: "Chrome/136.0.0.0".into(),
             cipher_suites: vec![
                 0x1301, // TLS_AES_128_GCM_SHA256
                 0x1302, // TLS_AES_256_GCM_SHA384
@@ -106,14 +157,17 @@ impl TlsProfile {
                 0x0a0a, // GREASE
                 0x0029, // pre_shared_key (must be last)
             ],
+            // Non-security jitter: rand::random is fine here; this is cosmetic timing
+            // variation for TLS fingerprint realism, not a cryptographic secret.
             timing_jitter: Some(std::time::Duration::from_millis(rand::random::<u64>() % 50)),
+            cover_performance_mode: false,
         }
     }
 
-    /// Firefox 133 Profile
+    /// Firefox 138 Profile
     pub fn firefox_133() -> Self {
         Self {
-            name: "Firefox/133.0".into(),
+            name: "Firefox/138.0".into(),
             cipher_suites: vec![
                 0x1301, // TLS_AES_128_GCM_SHA256
                 0x1302, // TLS_AES_256_GCM_SHA384
@@ -157,14 +211,16 @@ impl TlsProfile {
                 0x001c, // record_size_limit
                 0x0039, // quic_transport_parameters
             ],
+            // Non-security jitter: cosmetic timing variation for fingerprint realism.
             timing_jitter: Some(std::time::Duration::from_millis(rand::random::<u64>() % 30)),
+            cover_performance_mode: false,
         }
     }
 
-    /// Safari 18 Profile  
+    /// Safari 18.3 Profile
     pub fn safari_18() -> Self {
         Self {
-            name: "Safari/18.0".into(),
+            name: "Safari/18.3".into(),
             cipher_suites: vec![
                 0x1301, // TLS_AES_128_GCM_SHA256
                 0x1302, // TLS_AES_256_GCM_SHA384
@@ -200,7 +256,9 @@ impl TlsProfile {
                 0x002d, // psk_key_exchange_modes
                 0x0039, // quic_transport_parameters
             ],
+            // Non-security jitter: cosmetic timing variation for fingerprint realism.
             timing_jitter: Some(std::time::Duration::from_millis(rand::random::<u64>() % 20)),
+            cover_performance_mode: false,
         }
     }
 
@@ -229,7 +287,10 @@ impl TlsProfile {
         profile
     }
 
-    /// Rotate between profiles randomly
+    /// Rotate between profiles randomly.
+    ///
+    /// Uses rand::random for non-security profile selection (stealth heuristic,
+    /// not a cryptographic decision).
     pub fn random() -> Self {
         match rand::random::<u8>() % 6 {
             0 => Self::chrome_130(),
@@ -375,9 +436,115 @@ mod tests {
         assert!(safari.name.contains("Safari"));
         assert!(edge.name.contains("Edge"));
     }
+
+    #[test]
+    fn tls_provider_defaults_to_rustls_owner() {
+        let crypto = Arc::new(RwLock::new(crate::transport::packet::CryptoContext::default()));
+        let provider = create_provider(false, crypto).unwrap();
+
+        assert!(provider.provider_name().starts_with("rustls"));
+    }
+
+    #[test]
+    fn tls_cover_support_matches_provider_name() {
+        let cover_enabled = std::env::var("QUICFUSCATE_TLS_COVER")
+            .map(|raw| raw != "0" && !raw.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
+        let crypto = Arc::new(RwLock::new(crate::transport::packet::CryptoContext::default()));
+        let provider = create_provider(false, crypto).unwrap();
+
+        assert_eq!(provider.supports_ch_override(), cover_enabled);
+        assert_eq!(provider.provider_name() == "rustls+tls-cover", cover_enabled);
+    }
+
+    #[test]
+    fn test_profile_chrome_has_h3_alpn() {
+        let p = TlsProfile::chrome_130();
+        assert!(
+            p.alpn_protocols.iter().any(|a| a == "h3"),
+            "Chrome profile must include h3 in ALPN"
+        );
+    }
+
+    #[test]
+    fn test_profile_firefox_has_h3_alpn() {
+        let p = TlsProfile::firefox_133();
+        assert!(
+            p.alpn_protocols.iter().any(|a| a == "h3"),
+            "Firefox profile must include h3 in ALPN"
+        );
+    }
+
+    #[test]
+    fn test_profile_safari_has_h3_alpn() {
+        let p = TlsProfile::safari_18();
+        assert!(
+            p.alpn_protocols.iter().any(|a| a == "h3"),
+            "Safari profile must include h3 in ALPN"
+        );
+    }
+
+    #[test]
+    fn test_profile_brave_disables_ech() {
+        let p = TlsProfile::brave_1_73();
+        assert!(!p.enable_ech, "Brave profile must have ECH disabled");
+    }
+
+    #[test]
+    fn test_profile_random_produces_valid_profile() {
+        // Call random() multiple times to cover different branches
+        for _ in 0..20 {
+            let p = TlsProfile::random();
+            assert!(!p.name.is_empty(), "random profile must have a name");
+            assert!(
+                !p.extension_order.is_empty(),
+                "random profile must have non-empty extensions for {}",
+                p.name
+            );
+            assert!(
+                !p.cipher_suites.is_empty(),
+                "random profile must have cipher suites for {}",
+                p.name
+            );
+            assert!(
+                !p.alpn_protocols.is_empty(),
+                "random profile must have ALPN protocols for {}",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_browser_profiles_have_cipher_suites() {
+        let profiles = [
+            TlsProfile::chrome_130(),
+            TlsProfile::firefox_133(),
+            TlsProfile::safari_18(),
+            TlsProfile::edge_130(),
+            TlsProfile::opera_115(),
+            TlsProfile::brave_1_73(),
+        ];
+        for p in &profiles {
+            assert!(
+                !p.cipher_suites.is_empty(),
+                "profile {} must have non-empty cipher_suites",
+                p.name
+            );
+            // All TLS 1.3 profiles should contain at least one TLS 1.3 cipher
+            assert!(
+                p.cipher_suites.iter().any(|cs| *cs == 0x1301 || *cs == 0x1302),
+                "profile {} must contain at least one TLS 1.3 AES-GCM cipher suite",
+                p.name
+            );
+        }
+    }
 }
 
-/// Unified TLS Provider trait
+/// TLS Provider abstraction used by transport.
+///
+/// The actual protocol TLS engine is always rustls.
+/// Optional TLS cover behavior is composed on top of it.
 pub trait QuicTlsProvider: Send + Sync {
     /// Configure with profile
     fn configure(&mut self, profile: &TlsProfile) -> Result<(), ConnectionError>;
@@ -434,7 +601,7 @@ pub trait QuicTlsProvider: Send + Sync {
     }
     /// Get provider name (for debugging)
     fn provider_name(&self) -> &str;
-    /// Check if provider supports real-time ClientHello override
+    /// Check if provider supports ClientHello override through cover/mimicry layer.
     fn supports_ch_override(&self) -> bool;
     /// Apply ClientHello override (if supported)
     fn apply_ch_override(&mut self, _template: &[u8]) -> Result<(), ConnectionError> {
@@ -444,55 +611,12 @@ pub trait QuicTlsProvider: Send + Sync {
         Ok(())
     }
 
-    // =========================================================================
-    // Post-Quantum Hybrid Key Exchange (PQ-Hybrid) Methods
-    // Default OFF. Enable via feature `pq` + env `QUICFUSCATE_PQ_HYBRID=1`
-    // =========================================================================
-
-    /// Check if PQ hybrid key exchange is supported and enabled
-    fn supports_pq_hybrid(&self) -> bool {
-        false // Default: not supported
-    }
-
-    /// Get our PQ hybrid public key (X25519 || ML-KEM768 pubkey)
-    /// Returns None if PQ hybrid is not enabled
-    fn pq_hybrid_public_key(&self) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Complete PQ hybrid key exchange with peer's data
-    /// Input: peer_x25519_pub (32 bytes) || mlkem_ciphertext
-    /// Returns: combined shared secret or None on failure
-    fn pq_hybrid_complete_exchange(&mut self, _peer_hybrid_data: &[u8]) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Initiate PQ hybrid key exchange (client side)
-    /// Returns: (our_hybrid_message, our_mlkem_pubkey) or None if not enabled
-    fn pq_hybrid_initiate(&mut self, _peer_mlkem_pubkey: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-        None
-    }
 }
 
-/// Provider selection strategy - single unified path
-pub enum ProviderStrategy {
-    /// Unified provider (rustls RealTLS + optional TLS Cover). Default.
-    /// TLS Cover can be disabled via ENV QUICFUSCATE_TLS_COVER=0
-    Unified,
-}
-
-/// Create a TLS provider based on strategy
+/// Create the canonical TLS provider.
+///
+/// This always returns the real rustls transport owner with optional cover-layer composition.
 pub fn create_provider(
-    strategy: ProviderStrategy,
-    is_server: bool,
-    crypto: Arc<RwLock<CryptoContext>>,
-) -> Result<Box<dyn QuicTlsProvider>, ConnectionError> {
-    match strategy {
-        ProviderStrategy::Unified => create_combined_provider(is_server, crypto),
-    }
-}
-
-fn create_combined_provider(
     is_server: bool,
     crypto: Arc<RwLock<CryptoContext>>,
 ) -> Result<Box<dyn QuicTlsProvider>, ConnectionError> {
@@ -501,32 +625,33 @@ fn create_combined_provider(
 
 // ===============================
 // Combined Provider (rustls + optional TLS Cover)
+// rustls remains the TLS protocol owner; cover is an overlay only.
 // ===============================
 
-#[allow(dead_code)]
+/// Combined TLS provider composing rustls (protocol owner) with an optional TLS cover overlay.
 pub struct CombinedProvider {
     rustls: RustlsProvider,
     cover: Option<crate::stealth::TlsCoverProvider>,
-    is_server: bool,
-    crypto: Arc<RwLock<CryptoContext>>,
 }
 
 impl CombinedProvider {
+    fn env_string(name: &str, default: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| default.to_string())
+    }
+
+    /// Create a new combined provider (rustls + optional TLS cover).
     pub fn new(
         is_server: bool,
         crypto: Arc<RwLock<CryptoContext>>,
     ) -> Result<Self, ConnectionError> {
         let rustls = RustlsProvider::new(is_server, crypto.clone())?;
-        // Cover is optional; enable by default, can be disabled via ENV
-        // In base/performance mode, TLS Cover is fully active without artificial delays/padding/jitter
-        let cover_enabled = std::env::var("QUICFUSCATE_TLS_COVER")
-            .or_else(|_| std::env::var("QUICFUSCATE_TLS_COVER"))
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        // Cover is optional and intentionally separated from TLS protocol semantics.
+        // It can be disabled via ENV QUICFUSCATE_TLS_COVER=0.
+        // In base/performance mode, cover keeps traffic shape with reduced timing overhead.
+        let cover_enabled = crate::env_utils::env_flag("QUICFUSCATE_TLS_COVER", true);
         let cover = if cover_enabled {
             // Check stealth mode to determine TLS Cover behavior
-            let stealth_mode =
-                std::env::var("QUICFUSCATE_STEALTH_MODE").unwrap_or_else(|_| "stealth".into());
+            let stealth_mode = Self::env_string("QUICFUSCATE_STEALTH_MODE", "stealth");
 
             let mut tls_cover = crate::stealth::TlsCoverProvider::new(is_server, crypto.clone())?;
 
@@ -541,20 +666,12 @@ impl CombinedProvider {
             }
 
             // Enable profile rotation if requested
-            if std::env::var("QUICFUSCATE_TLS_COVER_ROTATE")
-                .or_else(|_| std::env::var("QUICFUSCATE_TLS_COVER_ROTATE"))
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
+            if crate::env_utils::env_flag("QUICFUSCATE_TLS_COVER_ROTATE", false) {
                 log::info!("TLS Cover profile rotation enabled");
             }
 
             // Enable telemetry if requested
-            if std::env::var("QUICFUSCATE_TLS_COVER_TELEMETRY")
-                .or_else(|_| std::env::var("QUICFUSCATE_TLS_COVER_TELEMETRY"))
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
+            if crate::env_utils::env_flag("QUICFUSCATE_TLS_COVER_TELEMETRY", false) {
                 log::info!("TLS Cover telemetry enabled");
             }
 
@@ -565,18 +682,19 @@ impl CombinedProvider {
         // Telemetry: 0 = rustls-only, 1 = rustls+tls-cover
         let kind = if cover.is_some() { 1 } else { 0 };
         crate::optimize::telemetry::TLS_PROVIDER_KIND.set(kind);
-        Ok(Self { rustls, cover, is_server, crypto })
+        Ok(Self { rustls, cover })
     }
 }
 
 impl QuicTlsProvider for CombinedProvider {
     fn configure(&mut self, profile: &TlsProfile) -> Result<(), ConnectionError> {
-        // Apply to rustls (what's possible)
+        // Configure rustls first (protocol semantics).
         self.rustls.configure(profile)?;
-        // Apply session hint (ALPN/SNI bias) if available
+        // Apply session hint (ALPN/SNI bias) if available.
         self.rustls.apply_session_hint_to_profile();
-        // Apply to cover (full byte-level mimicry)
+        // Apply optional cover layer configuration.
         if let Some(ref mut c) = self.cover {
+            c.set_performance_mode(profile.cover_performance_mode);
             c.apply_ch_override(&[])?; /* no-op template seed */
         }
         Ok(())
@@ -589,17 +707,19 @@ impl QuicTlsProvider for CombinedProvider {
 
     fn provide_quic_data(&mut self, level: Level, data: &[u8]) -> Result<(), ConnectionError> {
         if let Some(ref mut c) = self.cover {
-            let _ = c.provide_quic_data(level, data);
+            if let Err(e) = c.provide_quic_data(level, data) {
+                log::debug!("TLS cover provider rejected QUIC data at level {:?}: {}", level, e);
+            }
         }
         self.rustls.provide_quic_data(level, data)
     }
 
     fn next_crypto_frame(&mut self, level: Level, max_len: usize) -> Option<(u64, Vec<u8>)> {
-        // Rustls-driven handshake frames take priority
+        // rustls-driven handshake frames always take priority.
         if let Some(frame) = self.rustls.next_crypto_frame(level, max_len) {
             return Some(frame);
         }
-        // Optionally emit cover frames (decoy) only if enabled and before handshake complete
+        // Emit optional cover decoy frames before real handshake completion.
         if let Some(ref mut c) = self.cover {
             if !self.rustls.handshake_complete() {
                 return c.next_crypto_frame(level, max_len);
@@ -613,7 +733,9 @@ impl QuicTlsProvider for CombinedProvider {
         crypto: &Arc<RwLock<CryptoContext>>,
     ) -> Result<(), ConnectionError> {
         if let Some(ref mut c) = self.cover {
-            let _ = c.poll_secrets_and_install(crypto);
+            if let Err(e) = c.poll_secrets_and_install(crypto) {
+                log::debug!("TLS cover provider secret poll/install failed: {}", e);
+            }
         }
         self.rustls.poll_secrets_and_install(crypto)
     }
@@ -664,9 +786,9 @@ impl QuicTlsProvider for CombinedProvider {
     }
     fn provider_name(&self) -> &str {
         if self.cover.is_some() {
-            "unified-rustls+tls-cover"
+            "rustls+tls-cover"
         } else {
-            "unified-rustls-only"
+            "rustls"
         }
     }
     fn supports_ch_override(&self) -> bool {
@@ -688,9 +810,13 @@ impl QuicTlsProvider for CombinedProvider {
 mod rustls_provider {
     use super::*;
     use parking_lot::RwLock;
+    #[cfg(debug_assertions)]
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
     use rustls::quic::{self};
+    #[cfg(debug_assertions)]
+    use rustls::pki_types::UnixTime;
+    #[cfg(debug_assertions)]
     use rustls::DigitallySignedStruct;
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
     use rustls_native_certs::load_native_certs;
@@ -698,42 +824,54 @@ mod rustls_provider {
     use std::sync::Arc;
     use webpki_roots;
 
-    /// Maximum sophistication rustls provider with all bells and whistles
-    #[allow(dead_code)]
+    /// Full-featured rustls QUIC TLS provider with session resumption, 0-RTT, and PQ support.
     pub struct RustlsProviderImpl {
+        /// Active rustls QUIC connection (client or server side).
         pub connection: rustls::quic::Connection,
+        /// Shared crypto context for installing packet protection keys.
         pub crypto: Arc<RwLock<CryptoContext>>,
+        /// True if this is a server-side provider.
         pub is_server: bool,
+        /// Whether the TLS handshake has completed.
         pub handshake_complete: bool,
+        /// Current write-side encryption level.
         pub write_level: super::Level,
+        /// Negotiated ALPN protocol string.
         pub alpn: Option<String>,
+        /// DER-encoded peer certificate (if verified).
         pub peer_cert: Option<Vec<u8>>,
+        /// Whether 0-RTT early data is enabled.
         pub zero_rtt_enabled: bool,
+        /// QUIC transport parameters to send to the peer.
         pub transport_params: Vec<u8>,
+        /// Peer's QUIC transport parameters (received during handshake).
         pub peer_transport_params: Option<Vec<u8>>,
+        /// Active TLS profile configuration.
         pub profile: Option<TlsProfile>,
+        /// Next 1-RTT secrets for key update.
         pub next_1rtt_secrets: Option<rustls::quic::Secrets>,
+        /// Pending local 1-RTT packet keys queued during key update.
         pub pending_local_1rtt: VecDeque<std::sync::Arc<dyn rustls::quic::PacketKey>>,
+        /// Pending remote 1-RTT packet keys queued during key update.
         pub pending_remote_1rtt: VecDeque<std::sync::Arc<dyn rustls::quic::PacketKey>>,
 
-        // Performance optimizations
+        /// Reusable buffer for CRYPTO frame serialization.
         pub crypto_buffer: Vec<u8>,
+        /// Queued CRYPTO frames awaiting transmission.
         pub frame_buffer: Vec<(Level, Vec<u8>)>,
 
-        // Session resumption
+        /// TLS session cache for 0-RTT resumption.
         pub session_cache: Option<Arc<RwLock<SessionCache>>>,
 
-        // Metrics
+        /// Timestamp when the handshake started (for latency measurement).
         pub handshake_start: std::time::Instant,
+        /// Total CRYPTO bytes sent.
         pub bytes_sent: usize,
+        /// Total CRYPTO bytes received.
         pub bytes_received: usize,
-
-        // PQC Hybrid Key Exchange (enabled via feature `pq` + env)
-        #[cfg(feature = "pq")]
-        pub hybrid_ke: Option<crate::crypto::hybrid::HybridKeyExchange>,
     }
 
-    /// Session cache for 0-RTT and resumption
+    /// LRU session cache for TLS 0-RTT resumption tickets.
     pub struct SessionCache {
         sessions: std::collections::HashMap<String, SessionData>,
         max_size: usize,
@@ -766,19 +904,13 @@ mod rustls_provider {
         }
     }
 
-    fn env_flag_enabled(name: &str) -> bool {
-        match std::env::var(name) {
-            Ok(raw) => {
-                matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            }
-            Err(_) => false,
-        }
-    }
-
     /// Insecure verifier used only when explicitly requested via env.
+    /// Only available in debug builds to prevent accidental production use.
+    #[cfg(debug_assertions)]
     #[derive(Debug)]
     struct InsecureAcceptAllVerifier;
 
+    #[cfg(debug_assertions)]
     impl ServerCertVerifier for InsecureAcceptAllVerifier {
         fn verify_server_cert(
             &self,
@@ -825,6 +957,7 @@ mod rustls_provider {
     }
 
     impl RustlsProviderImpl {
+        /// Create a new rustls QUIC provider for client or server mode.
         pub fn new(
             is_server: bool,
             crypto: Arc<RwLock<CryptoContext>>,
@@ -855,12 +988,6 @@ mod rustls_provider {
                 handshake_start: std::time::Instant::now(),
                 bytes_sent: 0,
                 bytes_received: 0,
-                #[cfg(feature = "pq")]
-                hybrid_ke: if crate::crypto::hybrid::is_hybrid_enabled() {
-                    Some(crate::crypto::hybrid::HybridKeyExchange::new())
-                } else {
-                    None
-                },
             };
 
             Ok(this)
@@ -885,22 +1012,12 @@ mod rustls_provider {
         ) -> Result<(), ConnectionError> {
             match kc {
                 rustls::quic::KeyChange::Handshake { keys } => {
-                    if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                        eprintln!(
-                            "[qftls] {:?} keychange=Handshake",
-                            if self.is_server { "server" } else { "client" }
-                        );
-                    }
+                    super::trace_key_change(self.is_server, "Handshake");
                     self.install_handshake_keys(keys)?;
                     self.write_level = super::Level::Handshake;
                 }
                 rustls::quic::KeyChange::OneRtt { keys, next } => {
-                    if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                        eprintln!(
-                            "[qftls] {:?} keychange=OneRtt",
-                            if self.is_server { "server" } else { "client" }
-                        );
-                    }
+                    super::trace_key_change(self.is_server, "OneRtt");
                     self.install_1rtt_keys(keys)?;
                     self.next_1rtt_secrets = Some(next);
                     self.write_level = super::Level::Application;
@@ -992,20 +1109,31 @@ mod rustls_provider {
                 }
             }
 
-            let allow_invalid = env_flag_enabled("QUICFUSCATE_ALLOW_INVALID_CERTS");
             let builder = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?;
+            #[cfg(debug_assertions)]
+            let allow_invalid =
+                crate::env_utils::env_flag("QUICFUSCATE_ALLOW_INVALID_CERTS", false);
+            #[cfg(not(debug_assertions))]
+            let allow_invalid = false;
             let config = if allow_invalid {
                 log::warn!(
-                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled"
+                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled (debug build only)"
                 );
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
-                    .with_no_client_auth()
+                #[cfg(debug_assertions)]
+                {
+                    builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
+                        .with_no_client_auth()
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    unreachable!("allow_invalid is always false in release builds")
+                }
             } else {
                 builder.with_root_certificates(Arc::new(roots)).with_no_client_auth()
             };
@@ -1070,7 +1198,7 @@ mod rustls_provider {
 
             let mut config = config;
             config.alpn_protocols = vec![b"h3".to_vec(), b"h3-29".to_vec()];
-            config.max_early_data_size = 0xffffffff;
+            config.max_early_data_size = MAX_EARLY_DATA_SIZE.load(Ordering::Relaxed);
 
             Ok(rustls::quic::Connection::Server(
                 rustls::quic::ServerConnection::new(
@@ -1186,10 +1314,14 @@ mod rustls_provider {
         }
 
         fn apply_profile_to_config(&mut self, profile: &TlsProfile) -> Result<(), ConnectionError> {
-            // Store profile and apply minor timing knobs
+            // Store profile and apply minor timing knobs.
+            // Intentional sync sleep for TLS timing-channel mitigation.
+            // This runs during sync handshake setup, NOT inside an async task.
             self.profile = Some(profile.clone());
-            if let Some(jitter) = profile.timing_jitter {
-                std::thread::sleep(jitter);
+            if !profile.cover_performance_mode {
+                if let Some(jitter) = profile.timing_jitter {
+                    std::thread::sleep(jitter);
+                }
             }
             // Best-effort reconfigure only for client side before handshake
             if let rustls::quic::Connection::Client(_) = &self.connection {
@@ -1214,20 +1346,31 @@ mod rustls_provider {
                     })?;
                 }
             }
-            let allow_invalid = env_flag_enabled("QUICFUSCATE_ALLOW_INVALID_CERTS");
             let builder = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| ConnectionError::TlsError(format!("Protocol version error: {}", e)))?;
+            #[cfg(debug_assertions)]
+            let allow_invalid =
+                crate::env_utils::env_flag("QUICFUSCATE_ALLOW_INVALID_CERTS", false);
+            #[cfg(not(debug_assertions))]
+            let allow_invalid = false;
             let cfg = if allow_invalid {
                 log::warn!(
-                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled"
+                    "QUICFUSCATE_ALLOW_INVALID_CERTS is enabled; TLS certificate verification is disabled (debug build only)"
                 );
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
-                    .with_no_client_auth()
+                #[cfg(debug_assertions)]
+                {
+                    builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(InsecureAcceptAllVerifier))
+                        .with_no_client_auth()
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    unreachable!("allow_invalid is always false in release builds")
+                }
             } else {
                 builder.with_root_certificates(Arc::new(roots)).with_no_client_auth()
             };
@@ -1391,13 +1534,11 @@ mod rustls_provider {
         fn new_mask(&self, sample: &[u8]) -> [u8; 5] {
             let sample_len = self.key.sample_len();
             if sample.len() < sample_len {
-                if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                    eprintln!(
-                        "[qftls] hp sample too short have={} need={}",
-                        sample.len(),
-                        sample_len
-                    );
-                }
+                super::trace_hp_error(&format!(
+                    "hp sample too short have={} need={}",
+                    sample.len(),
+                    sample_len
+                ));
                 return [0u8; 5];
             }
             let sample = &sample[..sample_len];
@@ -1410,18 +1551,11 @@ mod rustls_provider {
             let mut first: u8 = first_orig;
             let mut pn = [0u8; 4];
             if self.key.encrypt_in_place(sample, &mut first, &mut pn).is_err() {
-                if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                    eprintln!("[qftls] hp encrypt_in_place error");
-                }
+                super::trace_hp_error("hp encrypt_in_place error");
                 return [0u8; 5];
             }
             let mask0 = first ^ first_orig;
-            if std::env::var("QUICFUSCATE_TRACE_TLS").is_ok() {
-                eprintln!(
-                    "[qftls] hp mask0={:02x} pn={:02x}{:02x}{:02x}{:02x}",
-                    mask0, pn[0], pn[1], pn[2], pn[3]
-                );
-            }
+            super::trace_hp_mask(mask0, pn);
             [mask0, pn[0], pn[1], pn[2], pn[3]]
         }
     }
@@ -1445,7 +1579,9 @@ mod rustls_provider {
             Ok(())
         }
         fn next_crypto_frame(&mut self, level: Level, max_len: usize) -> Option<(u64, Vec<u8>)> {
-            let _ = self.flush_handshake_io();
+            if let Err(e) = self.flush_handshake_io() {
+                log::debug!("flush_handshake_io before next_crypto_frame failed: {}", e);
+            }
             let mut crypto = self.crypto.write();
             let stream = match level {
                 Level::Initial => &mut crypto.crypto_initial,
@@ -1631,31 +1767,10 @@ mod rustls_provider {
             self.update_write_from_rustls_chain()
         }
         fn provider_name(&self) -> &str {
-            "rustls-0.23-alien"
+            "rustls"
         }
         fn supports_ch_override(&self) -> bool {
-            true
-        }
-
-        // PQC Hybrid Key Exchange implementations
-        #[cfg(feature = "pq")]
-        fn supports_pq_hybrid(&self) -> bool {
-            self.hybrid_ke.is_some()
-        }
-
-        #[cfg(feature = "pq")]
-        fn pq_hybrid_public_key(&self) -> Option<Vec<u8>> {
-            self.hybrid_ke.as_ref().map(|hke| hke.public_key())
-        }
-
-        #[cfg(feature = "pq")]
-        fn pq_hybrid_complete_exchange(&mut self, peer_hybrid_data: &[u8]) -> Option<Vec<u8>> {
-            self.hybrid_ke.as_mut().and_then(|hke| hke.complete_exchange(peer_hybrid_data))
-        }
-
-        #[cfg(feature = "pq")]
-        fn pq_hybrid_initiate(&mut self, peer_mlkem_pubkey: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-            self.hybrid_ke.as_mut().and_then(|hke| hke.initiate_exchange(peer_mlkem_pubkey))
+            false
         }
     }
 
@@ -1667,9 +1782,11 @@ mod rustls_provider {
     }
 }
 
+/// Thin wrapper around the rustls QUIC provider implementing `QuicTlsProvider`.
 pub struct RustlsProvider(rustls_provider::RustlsProviderImpl);
 
 impl RustlsProvider {
+    /// Create a new rustls-backed TLS provider for client or server mode.
     pub fn new(
         is_server: bool,
         crypto: Arc<RwLock<CryptoContext>>,
@@ -1750,6 +1867,7 @@ impl QuicTlsProvider for RustlsProvider {
 }
 
 impl RustlsProvider {
+    /// Bias ALPN ordering based on cached session data (prefers h3 for resumption).
     pub fn apply_session_hint_to_profile(&mut self) {
         // If we have session cache entries, bias SNI/ALPN selection next time
         if self.0.session_cache.is_some() {

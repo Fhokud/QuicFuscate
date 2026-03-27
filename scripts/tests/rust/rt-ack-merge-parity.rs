@@ -28,12 +28,12 @@ fn avx2_matches_scalar_random() {
         for _ in 0..64 {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                let a = rng.gen_range(0u64..10_000);
-                let b = rng.gen_range(a..a + 64);
+                let a = rng.random_range(0u64..10_000);
+                let b = rng.random_range(a..a + 64);
                 v.push((a, b));
             }
             let scalar = scalar_merge(v.clone());
-            let avx = unsafe { quicfuscate::simd::x86_ack::canonical_ack_blocks_avx2(&v) };
+            let avx = quicfuscate::simd::canonical_ack_blocks_avx2_for_rust_tests(&v);
             assert_eq!(scalar, avx);
         }
     }
@@ -49,12 +49,12 @@ fn avx512_matches_scalar_random() {
         for _ in 0..64 {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                let a = rng.gen_range(0u64..50_000);
-                let b = rng.gen_range(a..a + 128);
+                let a = rng.random_range(0u64..50_000);
+                let b = rng.random_range(a..a + 128);
                 v.push((a, b));
             }
             let scalar = scalar_merge(v.clone());
-            let wide = unsafe { quicfuscate::simd::x86_ack::canonical_ack_blocks_avx512(&v) };
+            let wide = quicfuscate::simd::canonical_ack_blocks_avx512_for_rust_tests(&v);
             assert_eq!(scalar, wide);
         }
     }

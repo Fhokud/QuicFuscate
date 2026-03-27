@@ -389,7 +389,9 @@ pub mod health {
                             None => (400, "{\"error\":\"bad_request\"}"),
                         };
                         let response = http_response(status, body);
-                        let _ = socket.write_all(response.as_bytes()).await;
+                        if let Err(e) = socket.write_all(response.as_bytes()).await {
+                            log::debug!("Health server response write failed: {}", e);
+                        }
                     }
                     Ok(Err(e)) => {
                         log::warn!("Health server accept error: {}", e);

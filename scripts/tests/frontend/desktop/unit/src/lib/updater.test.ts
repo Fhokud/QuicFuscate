@@ -1,14 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+
 import {
   checkForUpdates,
   downloadAndInstallUpdate,
-  runUpdaterFlow,
   toTerminalUpdaterErrorState,
   updaterEnabledByPolicy,
   type UpdaterDriver,
   type UpdaterHandle,
-  type UpdateUiState,
-} from "@/lib/updater";
+} from "../../../../../../../apps/svelte-desktop/src/lib/updater";
 
 function fakeUpdate(overrides?: Partial<UpdaterHandle>): UpdaterHandle {
   return {
@@ -16,7 +15,7 @@ function fakeUpdate(overrides?: Partial<UpdaterHandle>): UpdaterHandle {
     version: "1.1.0",
     date: "2026-02-12",
     body: "update body",
-    downloadAndInstall: vi.fn(async (onEvent?: (progress: any) => void) => {
+    downloadAndInstall: vi.fn(async (onEvent) => {
       onEvent?.({ event: "Started", data: { contentLength: 100 } });
       onEvent?.({ event: "Progress", data: { chunkLength: 60 } });
       onEvent?.({ event: "Progress", data: { chunkLength: 40 } });
@@ -47,7 +46,7 @@ describe("updater policy", () => {
 
   it("enables updater only when all gates pass", () => {
     const result = updaterEnabledByPolicy(true, true, true);
-    expect(result.enabled).toBe(true);
+    expect(result).toEqual({ enabled: true });
   });
 });
 
@@ -74,24 +73,9 @@ describe("updater flow", () => {
     }
   });
 
-  it("maps signature failures to hard-block UI state", async () => {
-    const states: UpdateUiState[] = [];
-    const driver: UpdaterDriver = {
-      check: vi.fn(async () => {
-        throw new Error("invalid updater signature");
-      }),
-    };
-
-    const result = await runUpdaterFlow(driver, (state) => states.push(state));
-    expect(result.status).toBe("signature-failure");
-    expect(states[0]).toEqual({ status: "checking" });
-  });
-
   it("streams download progress cumulatively", async () => {
     const progress: string[] = [];
-    const update = fakeUpdate();
-
-    await downloadAndInstallUpdate(update, (event) => {
+    await downloadAndInstallUpdate(fakeUpdate(), (event) => {
       if (event.event === "started") {
         progress.push(`start:${event.contentLength ?? 0}`);
       } else if (event.event === "progress") {
@@ -102,6 +86,11 @@ describe("updater flow", () => {
     });
 
     expect(progress).toEqual(["start:100", "progress:60", "progress:100", "finished"]);
+  });
+
+  it("maps signature failures to signature-failure state", () => {
+    const state = toTerminalUpdaterErrorState(new Error("invalid updater signature"));
+    expect(state).toEqual({ status: "signature-failure", message: "invalid updater signature" });
   });
 
   it("maps generic errors to error state", () => {

@@ -88,7 +88,7 @@ run_profile "tokio" "$BASELINE_FEATURES"
 # io_uring run (Linux only)
 if [[ "$(detect_os)" == linux ]]; then
   URING_FEATURES="${CARGO_FEATURES}"; [[ -n "$URING_FEATURES" ]] && URING_FEATURES+=" "
-  URING_FEATURES+="uring_sys"
+  URING_FEATURES+="io_uring"
   if [[ -n "$DRY_RUN" ]]; then
     echo "io_uring features resolved to: $URING_FEATURES"
   fi

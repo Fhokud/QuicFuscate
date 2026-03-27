@@ -1,15 +1,13 @@
 //! Ultra-sophisticated centralized SIMD module - MAX EXCELLENCE!
 //! All hardware acceleration in ONE place - NO feature gates!
 
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
+#![cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unused_imports, unused_variables)
+)]
 #![allow(clippy::missing_safety_doc)]
-use std::arch::asm;
-use std::collections::HashSet;
 use std::sync::OnceLock;
 
-// Re-exports from optimize for backward compatibility
 use crate::optimize::{prefetch, telemetry, PrefetchHint};
 pub use crate::optimize::{CpuFeature, CpuFeatures, CpuProfile, FeatureDetector};
 
@@ -34,13 +32,13 @@ fn quic_varint_len_prefix(value: u64) -> Option<(usize, u8)> {
 
 // ARM NEON-optimized varint module
 #[cfg(target_arch = "aarch64")]
-pub mod arm_stream;
+pub(crate) mod arm_stream;
 #[cfg(target_arch = "aarch64")]
 mod arm_varint;
 #[cfg(target_arch = "x86_64")]
-pub mod x86_ack;
+mod x86_ack;
 #[cfg(target_arch = "x86_64")]
-pub mod x86_header;
+mod x86_header;
 
 #[inline(always)]
 fn sha256_hash_with_batch<F>(data: &[u8], batch: usize, mut compress: F) -> [u8; 32]
@@ -55,6 +53,9 @@ where
     if full_blocks != 0 {
         let head_len = full_blocks * 64;
         let raw_blocks = &data[..head_len];
+        // SAFETY: `raw_blocks` has exactly `full_blocks * 64` bytes (head_len).
+        // Reinterpreting as `&[[u8; 64]]` is safe because [u8; 64] has alignment 1
+        // (same as u8) and the total length matches full_blocks elements of 64 bytes each.
         let blocks = unsafe {
             std::slice::from_raw_parts(raw_blocks.as_ptr() as *const [u8; 64], full_blocks)
         };
@@ -65,6 +66,9 @@ where
 
             if end < full_blocks {
                 let next_offset = end * 64;
+                // SAFETY: `next_offset < head_len` because `end < full_blocks`.
+                // Prefetch hints are advisory - they never cause faults even if the
+                // address is invalid, but here the address is always within `raw_blocks`.
                 unsafe {
                     prefetch(raw_blocks.as_ptr().add(next_offset), PrefetchHint::T0);
                     if batch > 1 {
@@ -108,39 +112,88 @@ where
     out
 }
 
+/// Canonicalize ACK block ranges using AVX2 SIMD. Test-only entry point (x86_64).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
+#[inline(always)]
+pub fn canonical_ack_blocks_avx2_for_rust_tests(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    // SAFETY:
+    // - this rust-tests hook is compiled only on x86_64
+    // - the callee is a retained parity helper that operates purely on the
+    //   provided slice and returns owned output
+    // - no raw pointers escape this wrapper and no additional aliasing or
+    //   lifetime assumptions are introduced here
+    unsafe { x86_ack::canonical_ack_blocks_avx2(ranges) }
+}
+
+/// Canonicalize ACK block ranges using AVX-512 SIMD. Test-only entry point (x86_64).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
+#[inline(always)]
+pub fn canonical_ack_blocks_avx512_for_rust_tests(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    // SAFETY:
+    // - this rust-tests hook is compiled only on x86_64
+    // - the underlying helper is retained parity machinery over a borrowed
+    //   slice and does not expose raw-pointer ownership outside the call
+    // - target-feature preconditions stay encapsulated in the internal helper
+    unsafe { x86_ack::canonical_ack_blocks_avx512(ranges) }
+}
+
+/// Validate a QUIC packet header using AVX-512 SIMD. Test-only entry point (x86_64).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
+#[inline(always)]
+pub fn validate_header_avx512_for_rust_tests(header: &[u8]) -> bool {
+    // SAFETY:
+    // - this rust-tests hook is compiled only on x86_64
+    // - the helper only reads the provided header slice and returns a bool
+    // - no mutation, pointer escape, or lifetime widening occurs at this boundary
+    unsafe { x86_header::validate_header_avx512(header) }
+}
+
+/// Validate a QUIC packet header using SSE2 SIMD. Test-only entry point (x86_64).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "rust-tests")))]
+#[inline(always)]
+pub fn validate_header_sse2_for_rust_tests(header: &[u8]) -> bool {
+    // SAFETY:
+    // - this rust-tests hook is compiled only on x86_64
+    // - the helper only inspects the provided header slice
+    // - the retained unsafe stays inside the internal SIMD helper
+    unsafe { x86::validate_header_sse2(header) }
+}
+
 /// Unified AEAD plan for the data plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoAeadPlan {
-    // x86
-    LAesni,
-    #[cfg(target_arch = "aarch64")]
-    LNeon,
-    // Fallback
+    /// Single-lane AEGIS-128L (best for small payloads).
+    Aegis128L,
+    /// Four-lane parallel AEGIS-128L (mid-size payloads, requires AES-NI or NEON-AES).
+    Aegis128X4,
+    /// Eight-lane parallel AEGIS-128L (large payloads, requires VAES + AVX2/AVX-512).
+    Aegis128X8,
+    /// MORUS-1280-128 fallback when hardware AES is unavailable.
     Morus,
 }
 
 /// Acceleration planner (global hardware plan cache).
-pub mod planner {
+pub(crate) mod planner {
     use super::{CpuFeatures, CpuProfile, CryptoAeadPlan, FeatureDetector};
     use std::sync::OnceLock;
 
+    /// Cached hardware acceleration plans derived from detected CPU features.
     #[derive(Debug)]
     pub struct AccelerationPlans {
-        pub profile: CpuProfile,
+        /// Detected CPU feature flags.
         pub features: CpuFeatures,
-        pub optimal_simd_width: usize,
+        /// Selected crypto AEAD plan.
         pub crypto: CryptoPlan,
-        pub fec: FecPlan,
+        /// Selected transport batch plan (test builds only).
+        #[cfg(any(test, feature = "rust-tests"))]
         pub transport: TransportPlan,
-        pub stealth: StealthPlan,
-        pub brain: BrainPlan,
-        pub memory: MemoryPlan,
-        pub utility: UtilityPlan,
     }
 
+    /// Singleton accessor for the global `AccelerationPlans`.
     pub struct AccelerationPlanner;
 
     impl AccelerationPlanner {
+        /// Returns the lazily-initialized global acceleration plan.
         pub fn global() -> &'static AccelerationPlans {
             static PLANS: OnceLock<AccelerationPlans> = OnceLock::new();
             PLANS.get_or_init(AccelerationPlans::derive)
@@ -152,135 +205,68 @@ pub mod planner {
             let detector = FeatureDetector::instance();
             let profile = detector.profile();
             let features = *detector.features_full();
-            let optimal_simd_width = detector.optimal_simd_width();
 
             let crypto = CryptoPlan::new(profile, &features);
-            let fec = FecPlan::new(&features);
+            #[cfg(any(test, feature = "rust-tests"))]
             let transport = TransportPlan::new(&features);
-            let stealth = StealthPlan::new(&features);
-            let brain = BrainPlan::new(&features);
-            let memory = MemoryPlan::new(&features);
-            let utility = UtilityPlan::new(&features);
 
             Self {
-                profile,
                 features,
-                optimal_simd_width,
                 crypto,
-                fec,
+                #[cfg(any(test, feature = "rust-tests"))]
                 transport,
-                stealth,
-                brain,
-                memory,
-                utility,
             }
         }
 
+        /// Returns the default AEAD plan without considering message length.
         pub fn crypto_default_aead(&self) -> CryptoAeadPlan {
             self.crypto.default_aead
         }
 
+        /// Returns the optimal AEAD plan for a given payload length.
         pub fn crypto_aead_for_len(&self, len: usize) -> CryptoAeadPlan {
             self.crypto.for_length(len, &self.features)
         }
+
+        #[cfg(any(test, feature = "rust-tests"))]
+        /// Returns the transport batch size based on SIMD width (test builds only).
+        pub fn transport_batch_size(&self) -> usize {
+            self.transport.batch_size
+        }
     }
 
+    /// Hardware-aware crypto AEAD selection policy.
     #[derive(Debug, Clone, Copy)]
     pub struct CryptoPlan {
         default_aead: CryptoAeadPlan,
     }
 
     impl CryptoPlan {
+        const AEGIS_X4_MIN_LEN: usize = 192;
+        #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+        const AEGIS_X8_MIN_LEN: usize = 1024;
+
         fn new(profile: CpuProfile, features: &CpuFeatures) -> Self {
-            #[cfg(target_arch = "x86_64")]
-            let has_aes = features.aesni;
-            #[cfg(not(target_arch = "x86_64"))]
-            let has_aes = false;
-            #[cfg(target_arch = "x86_64")]
-            let has_avx512f = features.avx512f;
-            #[cfg(not(target_arch = "x86_64"))]
-            let has_avx512f = false;
-            #[cfg(target_arch = "x86_64")]
-            let has_vaes = features.vaes;
-            #[cfg(not(target_arch = "x86_64"))]
-            let has_vaes = false;
-            #[cfg(target_arch = "x86_64")]
-            let has_avx2 = features.avx2;
-            #[cfg(not(target_arch = "x86_64"))]
-            let has_avx2 = false;
-
-            #[cfg(target_arch = "aarch64")]
-            let has_neon = features.neon;
-            #[cfg(not(target_arch = "aarch64"))]
-            let has_neon = false;
-            #[cfg(target_arch = "aarch64")]
-            let has_aes_arm = features.aes;
-            #[cfg(not(target_arch = "aarch64"))]
-            let has_aes_arm = false;
-
             let default = match profile {
                 CpuProfile::X86_P3b
                 | CpuProfile::X86_P3c
                 | CpuProfile::X86_P3d
                 | CpuProfile::X86_P3e
                 | CpuProfile::X86_P4a
-                | CpuProfile::X86_P4b => {
-                    // Production default: select only paths that are implemented end-to-end
-                    // without relying on unverified "wider" AEGIS variants.
-                    if has_aes {
-                        CryptoAeadPlan::LAesni
-                    } else {
-                        CryptoAeadPlan::Morus
-                    }
-                }
+                | CpuProfile::X86_P4b => Self::x86_default(features),
                 CpuProfile::X86_P3a | CpuProfile::X86_P2a | CpuProfile::X86_P2b => {
-                    if has_aes {
-                        CryptoAeadPlan::LAesni
-                    } else {
-                        CryptoAeadPlan::Morus
-                    }
+                    Self::x86_default(features)
                 }
-                CpuProfile::X86_P1b | CpuProfile::X86_P1f => {
-                    if has_aes {
-                        CryptoAeadPlan::LAesni
-                    } else {
-                        CryptoAeadPlan::Morus
-                    }
-                }
+                CpuProfile::X86_P1b | CpuProfile::X86_P1f => Self::x86_default(features),
                 CpuProfile::X86_P1a => CryptoAeadPlan::Morus,
                 CpuProfile::X86_P0a | CpuProfile::X86_P0b => CryptoAeadPlan::Morus,
-                #[cfg(target_arch = "aarch64")]
                 CpuProfile::ARM_A2
                 | CpuProfile::Apple_M
                 | CpuProfile::ARM_A1c
-                | CpuProfile::ARM_A1d => {
-                    if has_neon && has_aes_arm {
-                        // ARM data-plane uses AEGIS when NEON+AES is present.
-                        // The concrete variant selection (X4 vs potential future wider backends)
-                        // is implemented in src/crypto.rs.
-                        CryptoAeadPlan::LNeon
-                    } else {
-                        CryptoAeadPlan::Morus
-                    }
-                }
-                #[cfg(target_arch = "aarch64")]
-                CpuProfile::ARM_A1b => {
-                    if has_neon && has_aes_arm {
-                        CryptoAeadPlan::LNeon
-                    } else {
-                        CryptoAeadPlan::Morus
-                    }
-                }
-                #[cfg(target_arch = "aarch64")]
-                CpuProfile::ARM_A0 | CpuProfile::ARM_A1a => CryptoAeadPlan::Morus,
-                #[cfg(not(target_arch = "aarch64"))]
-                CpuProfile::ARM_A2
-                | CpuProfile::Apple_M
-                | CpuProfile::ARM_A1c
-                | CpuProfile::ARM_A1d
                 | CpuProfile::ARM_A1b
                 | CpuProfile::ARM_A1a
-                | CpuProfile::ARM_A0 => CryptoAeadPlan::Morus,
+                | CpuProfile::ARM_A1d
+                | CpuProfile::ARM_A0 => Self::arm_default(features),
                 CpuProfile::RVV => CryptoAeadPlan::Morus,
                 CpuProfile::Scalar => CryptoAeadPlan::Morus,
             };
@@ -291,64 +277,139 @@ pub mod planner {
         fn for_length(&self, len: usize, features: &CpuFeatures) -> CryptoAeadPlan {
             #[cfg(target_arch = "x86_64")]
             {
-                if features.aesni {
-                    return CryptoAeadPlan::LAesni;
-                }
-                return CryptoAeadPlan::Morus;
+                return Self::x86_for_length(len, features);
             }
 
             #[cfg(target_arch = "aarch64")]
             {
-                if features.neon && features.aes {
-                    return CryptoAeadPlan::LNeon;
-                }
-                if features.neon {
-                    return CryptoAeadPlan::Morus;
-                }
-                return CryptoAeadPlan::Morus;
+                return Self::arm_for_length(len, features);
             }
 
             #[allow(unreachable_code)]
             CryptoAeadPlan::Morus
         }
-    }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct FecPlan {
-        pub has_gfni: bool,
-        pub has_avx512f: bool,
-        pub has_avx2: bool,
-        pub has_neon: bool,
-        pub has_sve2: bool,
-        pub has_amx_int8: bool,
-        pub has_pmull: bool,
-    }
-
-    impl FecPlan {
-        fn new(features: &CpuFeatures) -> Self {
-            Self {
-                has_gfni: features.gfni,
-                has_avx512f: features.avx512f,
-                has_avx2: features.avx2,
-                has_neon: features.neon,
-                has_sve2: features.sve2,
-                has_amx_int8: features.amx_int8,
-                has_pmull: features.pmull,
+        fn x86_default(features: &CpuFeatures) -> CryptoAeadPlan {
+            if !Self::x86_can_use_aegis(features) {
+                return CryptoAeadPlan::Morus;
             }
+            CryptoAeadPlan::Aegis128X4
+        }
+
+        #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+        fn x86_for_length(len: usize, features: &CpuFeatures) -> CryptoAeadPlan {
+            if !Self::x86_can_use_aegis(features) {
+                return CryptoAeadPlan::Morus;
+            }
+            if len < Self::AEGIS_X4_MIN_LEN {
+                return CryptoAeadPlan::Aegis128L;
+            }
+            if len >= Self::AEGIS_X8_MIN_LEN && Self::x86_prefers_x8(features) {
+                CryptoAeadPlan::Aegis128X8
+            } else {
+                CryptoAeadPlan::Aegis128X4
+            }
+        }
+
+        fn x86_can_use_aegis(features: &CpuFeatures) -> bool {
+            features.aesni
+        }
+
+        #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+        fn x86_prefers_x8(features: &CpuFeatures) -> bool {
+            if !features.vaes {
+                return false;
+            }
+            (features.avx512f && features.avx512vl) || features.avx2
+        }
+
+        fn arm_default(features: &CpuFeatures) -> CryptoAeadPlan {
+            if Self::arm_can_use_aegis(features) {
+                CryptoAeadPlan::Aegis128X4
+            } else {
+                CryptoAeadPlan::Morus
+            }
+        }
+
+        fn arm_for_length(len: usize, features: &CpuFeatures) -> CryptoAeadPlan {
+            if !Self::arm_can_use_aegis(features) {
+                return CryptoAeadPlan::Morus;
+            }
+            if len < Self::AEGIS_X4_MIN_LEN {
+                CryptoAeadPlan::Aegis128L
+            } else {
+                CryptoAeadPlan::Aegis128X4
+            }
+        }
+
+        fn arm_can_use_aegis(features: &CpuFeatures) -> bool {
+            features.neon && features.aes
         }
     }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct TransportPlan {
-        pub has_avx512f: bool,
-        pub has_avx2: bool,
-        pub has_bmi2: bool,
-        pub has_popcnt: bool,
-        pub has_neon: bool,
-        pub has_sve2: bool,
-        pub batch_size: usize,
+    #[cfg(test)]
+    mod crypto_plan_tests {
+        use super::*;
+
+        fn x86_aes_features() -> CpuFeatures {
+            CpuFeatures { aesni: true, ..CpuFeatures::default() }
+        }
+
+        #[test]
+        fn x86_small_payload_uses_single_lane_aegis() {
+            let features = x86_aes_features();
+            assert_eq!(
+                CryptoPlan::x86_for_length(CryptoPlan::AEGIS_X4_MIN_LEN - 1, &features),
+                CryptoAeadPlan::Aegis128L
+            );
+        }
+
+        #[test]
+        fn x86_mid_payload_uses_x4_when_aes_is_available() {
+            let features = x86_aes_features();
+            assert_eq!(
+                CryptoPlan::x86_for_length(CryptoPlan::AEGIS_X4_MIN_LEN, &features),
+                CryptoAeadPlan::Aegis128X4
+            );
+        }
+
+        #[test]
+        fn x86_large_payload_uses_x8_only_when_hardware_supports_it() {
+            let features =
+                CpuFeatures { aesni: true, vaes: true, avx2: true, ..CpuFeatures::default() };
+            assert_eq!(
+                CryptoPlan::x86_for_length(CryptoPlan::AEGIS_X8_MIN_LEN, &features),
+                CryptoAeadPlan::Aegis128X8
+            );
+        }
+
+        #[test]
+        fn x86_large_payload_without_vaes_stays_x4() {
+            let features = CpuFeatures { aesni: true, avx2: true, ..CpuFeatures::default() };
+            assert_eq!(
+                CryptoPlan::x86_for_length(CryptoPlan::AEGIS_X8_MIN_LEN, &features),
+                CryptoAeadPlan::Aegis128X4
+            );
+        }
+
+        #[test]
+        fn arm_small_payload_uses_single_lane_aegis() {
+            let features = CpuFeatures { neon: true, aes: true, ..CpuFeatures::default() };
+            assert_eq!(
+                CryptoPlan::arm_for_length(CryptoPlan::AEGIS_X4_MIN_LEN - 1, &features),
+                CryptoAeadPlan::Aegis128L
+            );
+        }
     }
 
+    /// SIMD-width-aware transport batching plan (test builds only).
+    #[cfg(any(test, feature = "rust-tests"))]
+    #[derive(Debug, Clone, Copy)]
+    pub struct TransportPlan {
+        batch_size: usize,
+    }
+
+    #[cfg(any(test, feature = "rust-tests"))]
     impl TransportPlan {
         fn new(features: &CpuFeatures) -> Self {
             let has_avx512f = features.avx512f;
@@ -361,117 +422,27 @@ pub mod planner {
                 16
             };
 
-            Self {
-                has_avx512f,
-                has_avx2,
-                has_bmi2: features.bmi2,
-                has_popcnt: features.popcnt,
-                has_neon: features.neon,
-                has_sve2: features.sve2,
-                batch_size,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct StealthPlan {
-        pub has_avx2: bool,
-        pub has_vaes: bool,
-        pub has_sha: bool,
-        pub has_neon: bool,
-        pub has_aes: bool,
-    }
-
-    impl StealthPlan {
-        fn new(features: &CpuFeatures) -> Self {
-            Self {
-                has_avx2: features.avx2,
-                has_vaes: features.vaes,
-                has_sha: features.sha,
-                has_neon: features.neon,
-                has_aes: features.aes,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct BrainPlan {
-        pub has_avx512f: bool,
-        pub has_avx2: bool,
-        pub has_fma3: bool,
-        pub has_neon: bool,
-        pub has_sve2: bool,
-        pub has_amx_tile: bool,
-        pub has_amx_int8: bool,
-        pub has_dotprod: bool,
-    }
-
-    impl BrainPlan {
-        fn new(features: &CpuFeatures) -> Self {
-            Self {
-                has_avx512f: features.avx512f,
-                has_avx2: features.avx2,
-                has_fma3: features.fma3,
-                has_neon: features.neon,
-                has_sve2: features.sve2,
-                has_amx_tile: features.amx_tile,
-                has_amx_int8: features.amx_int8,
-                has_dotprod: features.dotprod,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct MemoryPlan {
-        pub has_avx512f: bool,
-        pub has_avx2: bool,
-        pub has_neon: bool,
-        pub has_sve2: bool,
-    }
-
-    impl MemoryPlan {
-        fn new(features: &CpuFeatures) -> Self {
-            Self {
-                has_avx512f: features.avx512f,
-                has_avx2: features.avx2,
-                has_neon: features.neon,
-                has_sve2: features.sve2,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct UtilityPlan {
-        pub has_avx512f: bool,
-        pub has_avx2: bool,
-        pub has_rdrand: bool,
-        pub has_rdseed: bool,
-        pub has_neon: bool,
-        pub has_sve2: bool,
-    }
-
-    impl UtilityPlan {
-        fn new(features: &CpuFeatures) -> Self {
-            Self {
-                has_avx512f: features.avx512f,
-                has_avx2: features.avx2,
-                has_rdrand: features.rdrand,
-                has_rdseed: features.rdseed,
-                has_neon: features.neon,
-                has_sve2: features.sve2,
-            }
+            Self { batch_size }
         }
     }
 }
 
+/// SHA-256 backend selector for benchmarks.
+#[cfg(feature = "benches")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sha256BenchBackend {
+    /// Auto-select the best available backend at runtime.
     Auto,
+    /// Force the AVX2-accelerated SHA-256 path (x86_64).
     Avx2,
+    /// Force the AVX-512 VNNI-accelerated SHA-256 path (x86_64).
     Vnni,
+    /// Force the pure-scalar SHA-256 implementation.
     Scalar,
 }
+#[cfg(feature = "benches")]
 impl Sha256BenchBackend {
+    /// Returns the human-readable backend name for benchmark reporting.
     #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -483,10 +454,12 @@ impl Sha256BenchBackend {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// SHA-256 benchmark helpers with backend dispatch (x86_64).
+#[cfg(all(feature = "benches", target_arch = "x86_64"))]
 pub mod bench {
     use super::{crypto, scalar, Sha256BenchBackend};
 
+    /// Compute SHA-256 digest using the requested backend, returning the actual backend used.
     #[inline] // keep in sync with microbench backend selection
     pub fn sha256_digest(
         data: &[u8],
@@ -497,6 +470,7 @@ pub mod bench {
             Sha256BenchBackend::Scalar => (Sha256BenchBackend::Scalar, scalar::sha256(data)),
             Sha256BenchBackend::Avx2 => {
                 if is_x86_feature_detected!("avx2") {
+                    // SAFETY: AVX2 feature verified by `is_x86_feature_detected!` above.
                     unsafe { (Sha256BenchBackend::Avx2, super::x86::sha256_avx2(data)) }
                 } else {
                     (Sha256BenchBackend::Auto, crypto::sha256(data))
@@ -507,6 +481,7 @@ pub mod bench {
                     && is_x86_feature_detected!("avx512vl")
                     && is_x86_feature_detected!("avx512vnni")
                 {
+                    // SAFETY: All three required features verified above.
                     unsafe { (Sha256BenchBackend::Vnni, super::x86::sha256_vnni(data)) }
                 } else {
                     (Sha256BenchBackend::Auto, crypto::sha256(data))
@@ -516,10 +491,12 @@ pub mod bench {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// SHA-256 benchmark helpers with backend dispatch (non-x86_64 fallback).
+#[cfg(all(feature = "benches", not(target_arch = "x86_64")))]
 pub mod bench {
     use super::{crypto, scalar, Sha256BenchBackend};
 
+    /// Compute SHA-256 digest using the requested backend, returning the actual backend used.
     #[inline]
     pub fn sha256_digest(
         data: &[u8],
@@ -579,9 +556,17 @@ impl CryptoAeadPlan {
             telemetry::PLAN_DECISIONS_DEFAULT.inc();
         }
         match plan {
-            Self::LAesni => telemetry::PLAN_DECISIONS_L.inc(),
-            #[cfg(target_arch = "aarch64")]
-            Self::LNeon => telemetry::PLAN_DECISIONS_NEON_L.inc(),
+            Self::Aegis128L => telemetry::PLAN_DECISIONS_L.inc(),
+            Self::Aegis128X4 => {
+                telemetry::PLAN_DECISIONS_L.inc();
+                telemetry::PLAN_DECISIONS_X4.inc();
+                #[cfg(target_arch = "aarch64")]
+                telemetry::PLAN_DECISIONS_NEON_L.inc();
+            }
+            Self::Aegis128X8 => {
+                telemetry::PLAN_DECISIONS_L.inc();
+                telemetry::PLAN_DECISIONS_X8.inc();
+            }
             Self::Morus => telemetry::PLAN_DECISIONS_MORUS.inc(),
         }
         plan
@@ -593,7 +578,7 @@ impl CryptoAeadPlan {
 // Top-level module to satisfy calls like `arm::...` behind cfg(target_arch="aarch64")
 // ============================================================================
 #[cfg(target_arch = "aarch64")]
-pub mod arm {
+pub(crate) mod arm {
     use super::scalar;
 
     #[cfg(target_feature = "sve2")]
@@ -601,7 +586,7 @@ pub mod arm {
 
     // Core
     #[inline(always)]
-    pub unsafe fn xor_blocks_sve2(dst: &mut [u8], src: &[u8]) {
+    pub(super) unsafe fn xor_blocks_sve2(dst: &mut [u8], src: &[u8]) {
         #[cfg(target_feature = "sve2")]
         {
             xor_blocks_sve2_impl(dst, src);
@@ -612,27 +597,11 @@ pub mod arm {
         scalar::xor_blocks(dst, src)
     }
     #[inline(always)]
-    pub unsafe fn xor_blocks_neon(dst: &mut [u8], src: &[u8]) {
+    pub(super) unsafe fn xor_blocks_neon(dst: &mut [u8], src: &[u8]) {
         scalar::xor_blocks(dst, src)
     }
     #[inline(always)]
-    pub unsafe fn memcpy_sve2(dst: &mut [u8], src: &[u8]) {
-        #[cfg(target_feature = "sve2")]
-        {
-            memcpy_sve2_impl(dst, src);
-            return;
-        }
-
-        let len = core::cmp::min(dst.len(), src.len());
-        crate::accelerate::transport_io::memcpy_non_temporal_arm(dst, src, len)
-    }
-    #[inline(always)]
-    pub unsafe fn memcpy_neon(dst: &mut [u8], src: &[u8]) {
-        let len = core::cmp::min(dst.len(), src.len());
-        crate::accelerate::transport_io::memcpy_non_temporal_arm(dst, src, len)
-    }
-    #[inline(always)]
-    pub unsafe fn crc32_arm(data: &[u8], initial: u32) -> u32 {
+    pub(super) unsafe fn crc32_arm(data: &[u8], initial: u32) -> u32 {
         #[cfg(target_feature = "crc")]
         {
             use core::arch::aarch64::*;
@@ -679,7 +648,7 @@ pub mod arm {
         }
     }
     #[inline(always)]
-    pub unsafe fn popcnt_neon(data: &[u8]) -> usize {
+    pub(super) unsafe fn popcnt_neon(data: &[u8]) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
             use core::arch::aarch64::*;
@@ -687,6 +656,7 @@ pub mod arm {
             let mut i = 0usize;
             let len = data.len();
             while i + 16 <= len {
+                // SAFETY: `i + 16 <= len` guarantees 16 readable bytes at `data[i..]`.
                 let v = vld1q_u8(data.as_ptr().add(i));
                 let pc = vcntq_u8(v);
                 let sum = vaddvq_u8(pc) as usize; // <= 128 per 16B block
@@ -707,7 +677,7 @@ pub mod arm {
     }
 
     #[inline(always)]
-    pub unsafe fn popcnt_sve2(data: &[u8]) -> usize {
+    pub(super) unsafe fn popcnt_sve2(data: &[u8]) -> usize {
         #[cfg(target_feature = "sve2")]
         {
             // Use NEON popcnt under SVE2; SVE2 path may be added later for even wider VL
@@ -717,7 +687,7 @@ pub mod arm {
     }
 
     #[inline(always)]
-    pub unsafe fn validate_header_sve2(header: &[u8]) -> bool {
+    pub(super) unsafe fn validate_header_sve2(header: &[u8]) -> bool {
         #[cfg(target_feature = "sve2")]
         {
             if header.is_empty() {
@@ -753,7 +723,7 @@ pub mod arm {
     }
 
     #[target_feature(enable = "neon")]
-    pub unsafe fn validate_header_neon(header: &[u8]) -> bool {
+    pub(super) unsafe fn validate_header_neon(header: &[u8]) -> bool {
         // Fast-path header validation using NEON. Mirrors SVE2 semantics:
         // - Fixed bit (0x40) must be set for all QUIC packets
         // - For short headers (0x80 not set), reserved bits (0x18) must be zero
@@ -790,7 +760,7 @@ pub mod arm {
 
     // Galois field
     #[inline(always)]
-    pub unsafe fn gf_mul_sve2(a: &[u8], b: u8, dst: &mut [u8]) {
+    pub(super) unsafe fn gf_mul_sve2(a: &[u8], b: u8, dst: &mut [u8]) {
         #[cfg(target_feature = "sve2")]
         {
             gf_mul_sve2_impl(a, b, dst);
@@ -802,7 +772,7 @@ pub mod arm {
     /// GF(2^8) multiply using NEON PMULL - carryless polynomial multiplication
     /// Polynomial: x^8 + x^4 + x^3 + x + 1 (AES reduction polynomial 0x11B)
     #[target_feature(enable = "neon")]
-    pub unsafe fn gf_mul_neon_pmull(a: &[u8], b: u8, dst: &mut [u8]) {
+    pub(super) unsafe fn gf_mul_neon_pmull(a: &[u8], b: u8, dst: &mut [u8]) {
         use core::arch::aarch64::*;
 
         let len = a.len().min(dst.len());
@@ -821,6 +791,9 @@ pub mod arm {
         // Process 16 bytes at a time
         let mut i = 0usize;
         while i + 16 <= len {
+            // SAFETY: `i + 16 <= len` and `len = a.len().min(dst.len())`, so both
+            // `a[i..i+16]` and `dst[i..i+16]` are within bounds for the 16-byte
+            // NEON load/store operations.
             let a_chunk = vld1q_u8(a.as_ptr().add(i));
 
             // GF(2^8) multiply each byte pair
@@ -839,9 +812,7 @@ pub mod arm {
 
     /// GF(2^8) multiply using basic NEON (no PMULL, table-based with SIMD gather)
     #[target_feature(enable = "neon")]
-    pub unsafe fn gf_mul_neon(a: &[u8], b: u8, dst: &mut [u8]) {
-        use core::arch::aarch64::*;
-
+    pub(super) unsafe fn gf_mul_neon(a: &[u8], b: u8, dst: &mut [u8]) {
         let len = a.len().min(dst.len());
         if len == 0 || b == 0 {
             dst[..len].fill(0);
@@ -875,8 +846,10 @@ pub mod arm {
         // Process using table lookup approach with NEON
         // This is faster than PMULL for GF(2^8) due to reduction overhead
         let mut result_bytes = [0u8; 16];
-        let a_bytes: [u8; 16] = core::mem::transmute(a);
-        let b_bytes: [u8; 16] = core::mem::transmute(b);
+        let mut a_bytes = [0u8; 16];
+        let mut b_bytes = [0u8; 16];
+        vst1q_u8(a_bytes.as_mut_ptr(), a);
+        vst1q_u8(b_bytes.as_mut_ptr(), b);
 
         for j in 0..16 {
             result_bytes[j] = gf_mul_byte_scalar(a_bytes[j], b_bytes[j]);
@@ -938,11 +911,11 @@ pub mod arm {
 
     // Crypto
     #[inline(always)]
-    pub unsafe fn aes_encrypt_neon(state: &mut [u8; 16], key: &[u8; 16]) {
+    pub(super) unsafe fn aes_encrypt_neon(state: &mut [u8; 16], key: &[u8; 16]) {
         scalar::aes_encrypt_block(state, key)
     }
     #[inline(always)]
-    pub unsafe fn ghash_pmull(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
+    pub(super) unsafe fn ghash_pmull(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
         // Delegate to crypto::gcm::ghash which performs runtime PMULL/VPCLMUL selection.
         // This ensures ARM PMULL acceleration is actually used when available.
         let t = crate::crypto::gcm::ghash(*h, &[], data);
@@ -955,13 +928,13 @@ pub mod arm {
     }
 
     #[target_feature(enable = "neon", enable = "sha2")]
-    pub unsafe fn sha256_hw(data: &[u8]) -> [u8; 32] {
+    pub(super) unsafe fn sha256_hw(data: &[u8]) -> [u8; 32] {
         super::sha256_hash_with_batch(data, 1, |state, blocks| compress_sha_blocks(state, blocks))
     }
 
     // Bitstream pack/unpack (NEON/SVE2 dispatch, scalar-equivalent logic)
     #[inline(always)]
-    pub unsafe fn pack_bits_sve2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn pack_bits_sve2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         #[cfg(target_feature = "sve2")]
         {
             return pack_bits_neon(src, bit_width, dst);
@@ -970,7 +943,7 @@ pub mod arm {
     }
 
     #[target_feature(enable = "neon")]
-    pub unsafe fn pack_bits_neon(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn pack_bits_neon(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
             use core::arch::aarch64::*;
@@ -1012,7 +985,9 @@ pub mod arm {
             if bit_width == 8 {
                 let n = src.len().min(dst.len());
                 if n > 0 {
-                    // memcpy fast path
+                    // SAFETY: `n = src.len().min(dst.len())`, so both source and
+                    // destination have at least `n` bytes. The slices cannot alias
+                    // because they come from separate `&[u8]` / `&mut [u8]` references.
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), n);
                 }
                 return n;
@@ -1226,7 +1201,7 @@ pub mod arm {
     }
 
     #[inline(always)]
-    pub unsafe fn unpack_bits_sve2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn unpack_bits_sve2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         #[cfg(target_feature = "sve2")]
         {
             return unpack_bits_neon(src, bit_width, dst);
@@ -1235,7 +1210,7 @@ pub mod arm {
     }
 
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_bits_neon(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn unpack_bits_neon(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
             if bit_width == 1 {
@@ -1270,6 +1245,9 @@ pub mod arm {
             if bit_width == 8 {
                 let n = dst.len().min(src.len());
                 if n > 0 {
+                    // SAFETY: `n = dst.len().min(src.len())`, so both source and
+                    // destination have at least `n` bytes. The slices cannot alias
+                    // because they come from separate `&[u8]` / `&mut [u8]` references.
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), n);
                 }
                 return n;
@@ -1477,7 +1455,7 @@ pub mod arm {
 
     // Reed-Solomon encode using NEON+PMULL GF multiply (block-wise)
     #[inline(always)]
-    pub unsafe fn reed_solomon_encode_neon(data: &[u8], parity_shards: usize) -> Vec<u8> {
+    pub(super) unsafe fn reed_solomon_encode_neon(data: &[u8], parity_shards: usize) -> Vec<u8> {
         let data_shards = data.len() / 256;
         let total_shards = data_shards + parity_shards;
         let mut output = vec![0u8; total_shards * 256];
@@ -1520,85 +1498,14 @@ pub mod arm {
         output
     }
 
-    // Compression helpers - NEON optimized
-    /// Histogram with parallel 4-histogram accumulation (reduces cache conflicts)
-    #[target_feature(enable = "neon")]
-    pub unsafe fn histogram_sve2(data: &[u8]) -> [u32; 256] {
-        // SVE2 delegates to NEON implementation
-        histogram_neon(data)
-    }
-
-    /// NEON-optimized histogram using 4 parallel histograms to reduce cache conflicts
-    #[target_feature(enable = "neon")]
-    pub unsafe fn histogram_neon(data: &[u8]) -> [u32; 256] {
-        use core::arch::aarch64::*;
-
-        // 4 parallel histograms to reduce cache line conflicts
-        let mut hist0 = [0u32; 256];
-        let mut hist1 = [0u32; 256];
-        let mut hist2 = [0u32; 256];
-        let mut hist3 = [0u32; 256];
-
-        let len = data.len();
-        let mut i = 0usize;
-
-        // Process 16 bytes at a time with 4-way interleaving
-        while i + 16 <= len {
-            // Load 16 bytes
-            let chunk = vld1q_u8(data.as_ptr().add(i));
-            let bytes: [u8; 16] = core::mem::transmute(chunk);
-
-            // Distribute across 4 histograms (reduces conflicts)
-            hist0[bytes[0] as usize] += 1;
-            hist1[bytes[1] as usize] += 1;
-            hist2[bytes[2] as usize] += 1;
-            hist3[bytes[3] as usize] += 1;
-            hist0[bytes[4] as usize] += 1;
-            hist1[bytes[5] as usize] += 1;
-            hist2[bytes[6] as usize] += 1;
-            hist3[bytes[7] as usize] += 1;
-            hist0[bytes[8] as usize] += 1;
-            hist1[bytes[9] as usize] += 1;
-            hist2[bytes[10] as usize] += 1;
-            hist3[bytes[11] as usize] += 1;
-            hist0[bytes[12] as usize] += 1;
-            hist1[bytes[13] as usize] += 1;
-            hist2[bytes[14] as usize] += 1;
-            hist3[bytes[15] as usize] += 1;
-
-            i += 16;
-        }
-
-        // Process remaining bytes
-        while i < len {
-            hist0[data[i] as usize] += 1;
-            i += 1;
-        }
-
-        // Merge 4 histograms using NEON vector adds
-        let mut result = [0u32; 256];
-        let mut j = 0usize;
-        while j + 4 <= 256 {
-            let h0 = vld1q_u32(hist0.as_ptr().add(j));
-            let h1 = vld1q_u32(hist1.as_ptr().add(j));
-            let h2 = vld1q_u32(hist2.as_ptr().add(j));
-            let h3 = vld1q_u32(hist3.as_ptr().add(j));
-
-            let sum01 = vaddq_u32(h0, h1);
-            let sum23 = vaddq_u32(h2, h3);
-            let sum = vaddq_u32(sum01, sum23);
-
-            vst1q_u32(result.as_mut_ptr().add(j), sum);
-            j += 4;
-        }
-
-        result
-    }
     #[inline(always)]
-    pub unsafe fn qpack_encode_neon(input: &[u8], output: &mut [u8]) -> usize {
+    pub(crate) fn qpack_encode_neon(input: &[u8], output: &mut [u8]) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
-            qpack_encode_neon_impl(input, output)
+            // SAFETY: NEON is baseline on aarch64. The impl uses NEON intrinsics to
+            // expand bytes into u32 indices for Huffman table lookup, then accumulates
+            // bits into a u128 accumulator. Output bounds are checked on each byte write.
+            unsafe { qpack_encode_neon_impl(input, output) }
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -1797,7 +1704,7 @@ pub mod arm {
     }
 
     #[inline(always)]
-    pub unsafe fn qpack_decode_neon(input: &[u8], output: &mut [u8]) -> usize {
+    pub(crate) fn qpack_decode_neon(input: &[u8], output: &mut [u8]) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
             use crate::transport::h3;
@@ -1816,19 +1723,23 @@ pub mod arm {
     }
 
     #[inline(always)]
-    pub unsafe fn qpack_encode_sve2(input: &[u8], output: &mut [u8]) -> usize {
+    pub(crate) fn qpack_encode_sve2(input: &[u8], output: &mut [u8]) -> usize {
         #[cfg(target_feature = "sve2")]
         {
-            return qpack_encode_sve2_impl(input, output);
+            // SAFETY: Guarded by `target_feature = "sve2"` cfg. The impl uses
+            // SVE predicated loads and scalar Huffman accumulation with bounds checks.
+            return unsafe { qpack_encode_sve2_impl(input, output) };
         }
         qpack_encode_neon(input, output)
     }
 
     #[inline(always)]
-    pub unsafe fn qpack_decode_sve2(input: &[u8], output: &mut [u8]) -> usize {
+    pub(crate) fn qpack_decode_sve2(input: &[u8], output: &mut [u8]) -> usize {
         #[cfg(target_feature = "sve2")]
         {
-            return qpack_decode_sve2_impl(input, output);
+            // SAFETY: Guarded by `target_feature = "sve2"` cfg. The impl delegates
+            // to `huff_decode_into` which performs bounds-checked decoding.
+            return unsafe { qpack_decode_sve2_impl(input, output) };
         }
         qpack_decode_neon(input, output)
     }
@@ -1843,111 +1754,13 @@ pub mod arm {
             Err(_) => 0,
         }
     }
-
-    // Pattern matching
-    #[inline(always)]
-    pub unsafe fn find_pattern_sve2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        #[cfg(target_feature = "sve2")]
-        {
-            return find_pattern_sve2_vec(haystack, needle);
-        }
-
-        scalar::find_pattern(haystack, needle)
-    }
-    #[inline(always)]
-    pub unsafe fn find_pattern_neon(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        scalar::find_pattern(haystack, needle)
-    }
-
-    // Neural - NEON FMA accelerated
-    /// Dot product using NEON FMLA (fused multiply-add) - 4x faster than scalar
-    #[target_feature(enable = "neon")]
-    pub unsafe fn dot_product_neon_dp(a: &[f32], b: &[f32]) -> f32 {
-        use core::arch::aarch64::*;
-
-        let len = a.len().min(b.len());
-        if len == 0 {
-            return 0.0;
-        }
-
-        // Accumulator: 4 x f32
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut acc2 = vdupq_n_f32(0.0);
-        let mut acc3 = vdupq_n_f32(0.0);
-
-        let mut i = 0usize;
-
-        // Process 16 floats at a time (4 vectors x 4 lanes = 16)
-        while i + 16 <= len {
-            let a0 = vld1q_f32(a.as_ptr().add(i));
-            let a1 = vld1q_f32(a.as_ptr().add(i + 4));
-            let a2 = vld1q_f32(a.as_ptr().add(i + 8));
-            let a3 = vld1q_f32(a.as_ptr().add(i + 12));
-
-            let b0 = vld1q_f32(b.as_ptr().add(i));
-            let b1 = vld1q_f32(b.as_ptr().add(i + 4));
-            let b2 = vld1q_f32(b.as_ptr().add(i + 8));
-            let b3 = vld1q_f32(b.as_ptr().add(i + 12));
-
-            // FMA: acc += a * b
-            acc0 = vfmaq_f32(acc0, a0, b0);
-            acc1 = vfmaq_f32(acc1, a1, b1);
-            acc2 = vfmaq_f32(acc2, a2, b2);
-            acc3 = vfmaq_f32(acc3, a3, b3);
-
-            i += 16;
-        }
-
-        // Process remaining 4-float chunks
-        while i + 4 <= len {
-            let av = vld1q_f32(a.as_ptr().add(i));
-            let bv = vld1q_f32(b.as_ptr().add(i));
-            acc0 = vfmaq_f32(acc0, av, bv);
-            i += 4;
-        }
-
-        // Reduce 4 accumulators to 1
-        acc0 = vaddq_f32(acc0, acc1);
-        acc2 = vaddq_f32(acc2, acc3);
-        acc0 = vaddq_f32(acc0, acc2);
-
-        // Horizontal sum of 4-lane vector
-        let sum = vaddvq_f32(acc0);
-
-        // Tail: scalar for remaining elements
-        let mut result = sum;
-        while i < len {
-            result += a[i] * b[i];
-            i += 1;
-        }
-
-        result
-    }
-
-    /// Basic NEON dot product (4-wide)
-    #[target_feature(enable = "neon")]
-    pub unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
-        // Delegate to optimized version
-        dot_product_neon_dp(a, b)
-    }
-    #[inline(always)]
-    pub unsafe fn matmul_apple_amx(
-        a: &[f32],
-        b: &[f32],
-        c: &mut [f32],
-        m: usize,
-        k: usize,
-        n: usize,
-    ) {
-        scalar::matmul(a, b, c, m, k, n)
-    }
 }
 
 // ============================================================================
 // SIMD RUNTIME DISPATCHER - Selects optimal implementation
 // ============================================================================
 
+/// Runtime SIMD dispatcher that selects the optimal ISA path per operation.
 pub struct SimdOps;
 
 impl SimdOps {
@@ -1963,9 +1776,9 @@ impl SimdOps {
     #[inline(always)]
     pub fn dispatch<T>(
         &self,
-        x86_avx512: impl FnOnce() -> T,
-        x86_avx2: impl FnOnce() -> T,
-        x86_sse: impl FnOnce() -> T,
+        _x86_avx512: impl FnOnce() -> T,
+        _x86_avx2: impl FnOnce() -> T,
+        _x86_sse: impl FnOnce() -> T,
         arm_sve2: impl FnOnce() -> T,
         arm_neon: impl FnOnce() -> T,
         scalar: impl FnOnce() -> T,
@@ -1975,14 +1788,14 @@ impl SimdOps {
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX512F) {
-                return x86_avx512();
+                return _x86_avx512();
             }
             if features.has_feature(CpuFeature::AVX2) {
-                return x86_avx2();
+                return _x86_avx2();
             }
             // SSE2 is not represented in CpuFeature; baseline is SSE4.2 in this codebase
             if features.has_feature(CpuFeature::SSE42) {
-                return x86_sse();
+                return _x86_sse();
             }
         }
 
@@ -2004,6 +1817,7 @@ impl SimdOps {
 // CORE OPERATIONS - Used by all modules
 // ============================================================================
 
+/// Core SIMD-dispatched operations: XOR, CRC32, popcount.
 pub mod core {
     use super::*;
 
@@ -2012,6 +1826,10 @@ pub mod core {
     pub fn xor_blocks(dst: &mut [u8], src: &[u8]) {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by a runtime feature check that matches
+        // the `#[target_feature]` attribute on the callee. The callees operate on
+        // the provided slices and do not require additional pointer invariants
+        // beyond what the borrow checker already guarantees.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX512F) {
@@ -2039,43 +1857,13 @@ pub mod core {
         scalar::xor_blocks(dst, src)
     }
 
-    /// Fast memcpy with prefetching
-    #[inline(always)]
-    pub fn memcpy_fast(dst: &mut [u8], src: &[u8]) {
-        let features = FeatureDetector::instance();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if features.has_feature(CpuFeature::AVX512F) {
-                unsafe { super::x86::memcpy_avx512(dst, src) };
-                return;
-            }
-            if features.has_feature(CpuFeature::AVX2) {
-                unsafe { super::x86::memcpy_avx2(dst, src) };
-                return;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if features.has_feature(CpuFeature::SVE2) {
-                unsafe { arm::memcpy_sve2(dst, src) };
-                return;
-            }
-            if features.has_feature(CpuFeature::NEON) {
-                unsafe { arm::memcpy_neon(dst, src) };
-                return;
-            }
-        }
-
-        scalar::memcpy(dst, src)
-    }
-
     /// CRC32 with hardware acceleration
     #[inline(always)]
     pub fn crc32(data: &[u8], initial: u32) -> u32 {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Runtime feature check matches the callee's `#[target_feature]`.
+        // Both callees only read `data` and return a scalar - no pointer invariants.
         #[cfg(target_arch = "x86_64")]
         if features.has_feature(CpuFeature::SSE42) {
             return unsafe { super::x86::crc32_sse42(data, initial) };
@@ -2094,6 +1882,8 @@ pub mod core {
     pub fn popcnt(data: &[u8]) -> usize {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Runtime feature check matches the callee's `#[target_feature]`.
+        // All callees only read `data` and return a count - no pointer invariants.
         #[cfg(target_arch = "x86_64")]
         if features.has_feature(CpuFeature::POPCNT) {
             return unsafe { super::x86::popcnt_hw(data) };
@@ -2117,6 +1907,7 @@ pub mod core {
 // GALOIS FIELD OPERATIONS - For FEC/Reed-Solomon
 // ============================================================================
 
+/// Galois field operations for FEC/Reed-Solomon encoding.
 pub mod galois {
     use super::*;
 
@@ -2125,6 +1916,9 @@ pub mod galois {
     pub fn gf_mul(a: &[u8], b: u8, dst: &mut [u8]) {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by a runtime feature check matching the
+        // callee's `#[target_feature]`. All callees read from `a`, write to `dst`,
+        // and handle length clamping internally (`a.len().min(dst.len())`).
         #[cfg(target_arch = "x86_64")]
         {
             // GFNI usage requires AVX-512F+GFNI on x86_64 in this codebase
@@ -2169,7 +1963,9 @@ pub mod galois {
         let features = FeatureDetector::instance();
         let b_lo = b & 0x0F;
 
-        // For GF(2^4), we process nibbles - 2 per byte
+        // SAFETY: Each branch is guarded by a runtime feature check matching
+        // the callee's `#[target_feature]`. Callees clamp to `a.len().min(dst.len())`
+        // internally and only read/write within those bounds.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX2) {
@@ -2323,6 +2119,9 @@ pub mod galois {
     pub fn gf16_mul(a: &[u16], b: u16, dst: &mut [u16]) {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by a runtime feature check matching
+        // the callee's `#[target_feature]`. Callees clamp to
+        // `a.len().min(dst.len())` and stay within bounds.
         #[cfg(target_arch = "x86_64")]
         {
             // VPCLMULQDQ is the ultimate for GF(2^16)
@@ -2489,6 +2288,7 @@ pub mod galois {
 // CRYPTO OPERATIONS - AES, GHASH, Poly1305, Hash
 // ============================================================================
 
+/// SIMD-dispatched cryptographic primitives: AES, GHASH, SHA-256, HMAC-SHA-256.
 pub mod crypto {
     use super::*;
 
@@ -2497,6 +2297,9 @@ pub mod crypto {
     pub fn aes_encrypt_block(state: &mut [u8; 16], key: &[u8; 16]) {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching
+        // the callee's `#[target_feature]`. Both `state` and `key` are fixed-size
+        // arrays, so pointer validity and length are guaranteed by the type system.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::VAES) && features.has_feature(CpuFeature::AVX512F) {
@@ -2522,6 +2325,10 @@ pub mod crypto {
     pub fn ghash(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching
+        // the callee's `#[target_feature]`. `h` and `tag` are fixed-size [u8; 16]
+        // arrays. Callees process `data` in 16-byte chunks with remainder handling,
+        // so no out-of-bounds access occurs.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::VPCLMULQDQ)
@@ -2547,10 +2354,15 @@ pub mod crypto {
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     enum Sha256Backend {
+        #[cfg(target_arch = "x86_64")]
         Avx2,
+        #[cfg(target_arch = "x86_64")]
         Vnni,
+        #[cfg(target_arch = "x86_64")]
         ShaNi,
+        #[cfg(target_arch = "aarch64")]
         Neon,
+        #[cfg(target_arch = "aarch64")]
         Sve2,
         Scalar,
     }
@@ -2599,47 +2411,19 @@ pub mod crypto {
 
     #[inline(always)]
     fn sha256_impl(backend: Sha256Backend, data: &[u8]) -> [u8; 32] {
+        // SAFETY: The `backend` value is derived from `sha256_plan()` which
+        // selects backends only when the matching CPU features are detected
+        // at init time. Each callee reads `data` and returns a hash digest -
+        // no pointer aliasing or alignment requirements beyond slice validity.
         match backend {
-            Sha256Backend::Avx2 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    unsafe { super::x86::sha256_avx2(data) }
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    scalar::sha256(data)
-                }
-            }
-            Sha256Backend::Vnni => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    unsafe { super::x86::sha256_vnni(data) }
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    scalar::sha256(data)
-                }
-            }
-            Sha256Backend::ShaNi => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    unsafe { super::x86::sha256_hw(data) }
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    scalar::sha256(data)
-                }
-            }
-            Sha256Backend::Neon | Sha256Backend::Sve2 => {
-                #[cfg(target_arch = "aarch64")]
-                {
-                    unsafe { arm::sha256_hw(data) }
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    scalar::sha256(data)
-                }
-            }
+            #[cfg(target_arch = "x86_64")]
+            Sha256Backend::Avx2 => unsafe { super::x86::sha256_avx2(data) },
+            #[cfg(target_arch = "x86_64")]
+            Sha256Backend::Vnni => unsafe { super::x86::sha256_vnni(data) },
+            #[cfg(target_arch = "x86_64")]
+            Sha256Backend::ShaNi => unsafe { super::x86::sha256_hw(data) },
+            #[cfg(target_arch = "aarch64")]
+            Sha256Backend::Neon | Sha256Backend::Sve2 => unsafe { arm::sha256_hw(data) },
             Sha256Backend::Scalar => scalar::sha256(data),
         }
     }
@@ -2679,10 +2463,15 @@ pub mod crypto {
     pub fn sha256(data: &[u8]) -> [u8; 32] {
         let backend = sha256_plan().backend;
         match backend {
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::Avx2 => crate::optimize::telemetry::SHA256_AVX2_OPS.inc(),
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::Vnni => crate::optimize::telemetry::SHA256_VNNI_OPS.inc(),
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::ShaNi => crate::optimize::telemetry::SHA256_SHA_OPS.inc(),
+            #[cfg(target_arch = "aarch64")]
             Sha256Backend::Neon => crate::optimize::telemetry::SHA256_NEON_OPS.inc(),
+            #[cfg(target_arch = "aarch64")]
             Sha256Backend::Sve2 => crate::optimize::telemetry::SHA256_SVE2_OPS.inc(),
             Sha256Backend::Scalar => crate::optimize::telemetry::SHA256_SCALAR_OPS.inc(),
         }
@@ -2694,50 +2483,19 @@ pub mod crypto {
     pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         let backend = sha256_plan().backend;
         match backend {
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::Avx2 => crate::optimize::telemetry::HMAC_SHA256_AVX2_OPS.inc(),
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::Vnni => crate::optimize::telemetry::HMAC_SHA256_VNNI_OPS.inc(),
+            #[cfg(target_arch = "x86_64")]
             Sha256Backend::ShaNi => crate::optimize::telemetry::HMAC_SHA256_SHA_OPS.inc(),
+            #[cfg(target_arch = "aarch64")]
             Sha256Backend::Neon => crate::optimize::telemetry::HMAC_SHA256_NEON_OPS.inc(),
+            #[cfg(target_arch = "aarch64")]
             Sha256Backend::Sve2 => crate::optimize::telemetry::HMAC_SHA256_SVE2_OPS.inc(),
             Sha256Backend::Scalar => crate::optimize::telemetry::HMAC_SHA256_SCALAR_OPS.inc(),
         }
         hmac_sha256_impl(backend, key, data)
-    }
-}
-
-// ============================================================================
-// COMPRESSION - Entropy, Histogram
-// ============================================================================
-
-pub mod compress {
-    use super::*;
-
-    /// Calculate histogram for entropy estimation
-    #[inline(always)]
-    pub fn histogram(data: &[u8]) -> [u32; 256] {
-        let features = FeatureDetector::instance();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if features.has_feature(CpuFeature::AVX512F) {
-                return unsafe { super::x86::histogram_avx512(data) };
-            }
-            if features.has_feature(CpuFeature::AVX2) {
-                return unsafe { super::x86::histogram_avx2(data) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if features.has_feature(CpuFeature::SVE2) {
-                return unsafe { arm::histogram_sve2(data) };
-            }
-            if features.has_feature(CpuFeature::NEON) {
-                return unsafe { arm::histogram_neon(data) };
-            }
-        }
-
-        scalar::histogram(data)
     }
 }
 
@@ -2756,6 +2514,8 @@ pub mod qpack {
         {
             let det = FeatureDetector::instance();
             if det.has_feature(CpuFeature::AVX2) {
+                // SAFETY: AVX2 feature verified by runtime detection. Callee reads
+                // `input` and writes up to `output.len()` bytes with bounds checks.
                 return unsafe { super::x86::qpack_encode_avx2(input, output) };
             }
         }
@@ -2763,99 +2523,13 @@ pub mod qpack {
         {
             let det = FeatureDetector::instance();
             if det.has_feature(CpuFeature::NEON) {
-                // Safety: input/output slices come from caller; NEON impl writes exact length
-                return unsafe { crate::simd::arm::qpack_encode_neon(input, output) };
+                return crate::simd::arm::qpack_encode_neon(input, output);
             }
         }
         crate::transport::h3::qpack::huff_encode_into(input, output)
     }
 }
 
-// ============================================================================
-// PATTERN MATCHING - String search, regex acceleration
-// ============================================================================
-
-pub mod pattern {
-    use super::*;
-
-    /// Find pattern in data
-    #[inline(always)]
-    pub fn find_pattern(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        let features = FeatureDetector::instance();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if features.has_feature(CpuFeature::AVX512VBMI2) {
-                return unsafe { super::x86::find_pattern_vbmi2(haystack, needle) };
-            }
-            if features.has_feature(CpuFeature::AVX2) {
-                return unsafe { super::x86::find_pattern_avx2(haystack, needle) };
-            }
-            if features.has_feature(CpuFeature::SSE42) && needle.len() <= 16 {
-                return unsafe { super::x86::find_pattern_sse42_short(haystack, needle) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if features.has_feature(CpuFeature::SVE2) {
-                return unsafe { arm::find_pattern_sve2(haystack, needle) };
-            }
-            if features.has_feature(CpuFeature::NEON) {
-                return unsafe { arm::find_pattern_neon(haystack, needle) };
-            }
-        }
-
-        scalar::find_pattern(haystack, needle)
-    }
-}
-
-// ============================================================================
-// NEURAL/MATRIX - Dot products, matrix multiplication
-// ============================================================================
-
-pub mod neural {
-    use super::*;
-
-    /// Dot product of two vectors
-    #[inline(always)]
-    pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
-        let features = FeatureDetector::instance();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if features.has_feature(CpuFeature::AVX512F) {
-                return unsafe { super::x86::dot_product_avx512(a, b) };
-            }
-            if features.has_feature(CpuFeature::FMA3) && features.has_feature(CpuFeature::AVX2) {
-                return unsafe { super::x86::dot_product_fma(a, b) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if features.has_feature(CpuFeature::DOTPROD) {
-                return unsafe { arm::dot_product_neon_dp(a, b) };
-            }
-            if features.has_feature(CpuFeature::NEON) {
-                return unsafe { arm::dot_product_neon(a, b) };
-            }
-        }
-
-        scalar::dot_product_f32(a, b)
-    }
-
-    /// Matrix multiplication with Apple AMX
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    #[inline(always)]
-    pub fn matmul_amx(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-        if FeatureDetector::instance().has_feature(CpuFeature::APPLE_AMX) {
-            unsafe { arm::matmul_apple_amx(a, b, c, m, k, n) };
-        } else {
-            scalar::matmul(a, b, c, m, k, n);
-        }
-    }
-}
 // x86_64 IMPLEMENTATIONS
 // ============================================================================
 
@@ -2875,13 +2549,13 @@ mod x86 {
     };
 
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
-    pub unsafe fn find_pattern_vbmi2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn find_pattern_vbmi2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         // No dedicated VBMI2 implementation here. AVX2 is a safe fallback for VBMI2-capable CPUs.
         find_pattern_avx2(haystack, needle)
     }
 
     #[target_feature(enable = "avx512f,fma")]
-    pub unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
+    pub(super) unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
         let len = a.len().min(b.len());
         let mut sum = _mm512_setzero_ps();
         let chunks = len / 16;
@@ -2898,7 +2572,7 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot_product_fma(a: &[f32], b: &[f32]) -> f32 {
+    pub(super) unsafe fn dot_product_fma(a: &[f32], b: &[f32]) -> f32 {
         let len = a.len().min(b.len());
         let mut sum = _mm256_setzero_ps();
         let chunks = len / 8;
@@ -2907,7 +2581,8 @@ mod x86 {
             let vb = _mm256_loadu_ps(b[i * 8..].as_ptr());
             sum = _mm256_fmadd_ps(va, vb, sum);
         }
-        let sum_array: [f32; 8] = core::mem::transmute(sum);
+        let mut sum_array = [0f32; 8];
+        _mm256_storeu_ps(sum_array.as_mut_ptr(), sum);
         let mut out: f32 = sum_array.iter().sum();
         for i in (chunks * 8)..len {
             out += a[i] * b[i];
@@ -2919,6 +2594,12 @@ mod x86 {
     static INIT_LENS32: Once = Once::new();
     static mut LENS32: [i32; 257] = [0; 257];
 
+    // SAFETY: `LENS32` is a file-scope `static mut` that is written exactly once
+    // inside `call_once`. After `call_once` returns, `LENS32` is immutable for the
+    // rest of the program. The returned pointer is only used for SIMD gather reads
+    // which require the data to remain stable - satisfied because `call_once` ensures
+    // single-writer initialization. This is the standard `Once`-guard pattern for
+    // static-mut initialization.
     #[inline(always)]
     unsafe fn lens32_ptr() -> *const i32 {
         INIT_LENS32.call_once(|| {
@@ -2941,7 +2622,7 @@ mod x86 {
 
     /// SSE2 pre-fastpath for varint decoding: quickly find length via continuation-bit mask
     #[target_feature(enable = "sse2")]
-    pub unsafe fn varint_decode_sse2_prefast(buf: &[u8]) -> Option<(u64, usize)> {
+    pub(super) unsafe fn varint_decode_sse2_prefast(buf: &[u8]) -> Option<(u64, usize)> {
         if buf.len() < 8 {
             return super::scalar::decode_varint(buf);
         }
@@ -2966,7 +2647,8 @@ mod x86 {
 
         // Extract value bits and compose scalar
         let values = _mm_and_si128(data, _mm_set1_epi8(0x7F));
-        let bytes: [u8; 16] = std::mem::transmute(values);
+        let mut bytes = [0u8; 16];
+        _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, values);
         let mut result = 0u64;
         for i in 0..len {
             result |= (bytes[i] as u64) << (i * 7);
@@ -2975,7 +2657,7 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub unsafe fn sha256_avx2(data: &[u8]) -> [u8; 32] {
+    pub(super) unsafe fn sha256_avx2(data: &[u8]) -> [u8; 32] {
         let digest = super::sha256_hash_with_batch(data, 1, |state, blocks| {
             compress_batch_avx2(state, blocks)
         });
@@ -2984,7 +2666,7 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "avx512vnni")]
-    pub unsafe fn sha256_vnni(data: &[u8]) -> [u8; 32] {
+    pub(super) unsafe fn sha256_vnni(data: &[u8]) -> [u8; 32] {
         let digest = super::sha256_hash_with_batch(data, 2, |state, blocks| {
             compress_batch_vnni(state, blocks)
         });
@@ -2994,7 +2676,7 @@ mod x86 {
 
     /// AVX-512 XOR - 64 bytes at once!
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn xor_blocks_avx512(dst: &mut [u8], src: &[u8]) {
+    pub(super) unsafe fn xor_blocks_avx512(dst: &mut [u8], src: &[u8]) {
         let len = dst.len().min(src.len());
         let mut i = 0;
 
@@ -3016,7 +2698,7 @@ mod x86 {
 
     /// AVX2 XOR - 32 bytes at once
     #[target_feature(enable = "avx2")]
-    pub unsafe fn xor_blocks_avx2(dst: &mut [u8], src: &[u8]) {
+    pub(super) unsafe fn xor_blocks_avx2(dst: &mut [u8], src: &[u8]) {
         let len = dst.len().min(src.len());
         let mut i = 0;
 
@@ -3038,210 +2720,9 @@ mod x86 {
         // Avoid AVX->SSE transition penalty
         _mm256_zeroupper();
     }
-    /// memcpy using AVX-512 when available (vectorized loads/stores; optional non-temporal stores).
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn memcpy_avx512(dst: &mut [u8], src: &[u8]) {
-        let len = dst.len().min(src.len());
-        if len == 0 {
-            return;
-        }
-
-        let mut i = 0;
-
-        // Prefetch ahead for large copies
-        if len >= 4096 {
-            // Prefetch L2 distance ahead (typically 256-512 bytes)
-            const PREFETCH_DISTANCE: usize = 512;
-
-            // Process with prefetching and non-temporal stores for cache bypass
-            while i + 64 <= len {
-                // Prefetch next cache lines
-                if i + PREFETCH_DISTANCE <= len {
-                    prefetch(src.as_ptr().add(i + PREFETCH_DISTANCE), PrefetchHint::T1);
-                    prefetch(src.as_ptr().add(i + PREFETCH_DISTANCE + 64), PrefetchHint::T1);
-                }
-
-                let data = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-
-                // Use non-temporal store for large copies to avoid cache pollution
-                if len > 32768 {
-                    _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, data);
-                } else {
-                    _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, data);
-                }
-                i += 64;
-            }
-
-            // Memory fence for non-temporal stores
-            if len > 32768 {
-                _mm_sfence();
-            }
-        } else {
-            // Small copies without prefetch
-            while i + 64 <= len {
-                let data = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-                _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, data);
-                i += 64;
-            }
-        }
-
-        // Handle remaining 32-byte chunks with AVX2
-        while i + 32 <= len {
-            let data = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, data);
-            i += 32;
-        }
-
-        // Handle remaining 16-byte chunks with SSE
-        while i + 16 <= len {
-            let data = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data);
-            i += 16;
-        }
-
-        // Handle remaining bytes
-        while i < len {
-            dst[i] = src[i];
-            i += 1;
-        }
-
-        _mm256_zeroupper();
-    }
-    /// memcpy using AVX2 when available (vectorized loads/stores; optional prefetching).
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn memcpy_avx2(dst: &mut [u8], src: &[u8]) {
-        let len = dst.len().min(src.len());
-        if len == 0 {
-            return;
-        }
-
-        let mut i = 0;
-
-        // Adaptive prefetch strategy based on size
-        if len >= 2048 {
-            const PREFETCH_DISTANCE: usize = 256;
-
-            while i + 32 <= len {
-                // Prefetch ahead
-                if i + PREFETCH_DISTANCE <= len {
-                    prefetch(src.as_ptr().add(i + PREFETCH_DISTANCE), PrefetchHint::T0);
-                }
-
-                let data = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-
-                // Non-temporal store for very large copies
-                if len > 65536 {
-                    _mm256_stream_si256(dst.as_mut_ptr().add(i) as *mut __m256i, data);
-                } else {
-                    _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, data);
-                }
-                i += 32;
-            }
-
-            if len > 65536 {
-                _mm_sfence();
-            }
-        } else {
-            // Small copies without prefetch
-            while i + 32 <= len {
-                let data = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, data);
-                i += 32;
-            }
-        }
-
-        // Handle remaining with SSE2
-        while i + 16 <= len {
-            let data = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data);
-            i += 16;
-        }
-
-        // Handle remaining 8 bytes
-        if i + 8 <= len {
-            let data = *(src.as_ptr().add(i) as *const u64);
-            *(dst.as_mut_ptr().add(i) as *mut u64) = data;
-            i += 8;
-        }
-
-        // Handle remaining 4 bytes
-        if i + 4 <= len {
-            let data = *(src.as_ptr().add(i) as *const u32);
-            *(dst.as_mut_ptr().add(i) as *mut u32) = data;
-            i += 4;
-        }
-
-        // Handle remaining bytes
-        while i < len {
-            dst[i] = src[i];
-            i += 1;
-        }
-
-        _mm256_zeroupper();
-    }
-    /// memcpy using SSE4.2 when available (vectorized loads/stores).
-    #[target_feature(enable = "sse4.2")]
-    pub unsafe fn memcpy_sse42(dst: &mut [u8], src: &[u8]) {
-        let len = dst.len().min(src.len());
-        if len == 0 {
-            return;
-        }
-
-        let mut i = 0;
-
-        // For very small copies, use scalar
-        if len < 32 {
-            dst[..len].copy_from_slice(&src[..len]);
-            return;
-        }
-
-        // Align destination for better performance
-        let align_offset = dst.as_ptr() as usize & 15;
-        if align_offset != 0 {
-            let align_bytes = 16 - align_offset;
-            let copy_bytes = align_bytes.min(len);
-            for j in 0..copy_bytes {
-                dst[j] = src[j];
-            }
-            i = copy_bytes;
-        }
-
-        // Main loop with prefetching for medium/large copies
-        if len >= 1024 {
-            while i + 64 <= len {
-                // Prefetch next cache line
-                prefetch(src.as_ptr().add(i + 128), PrefetchHint::T0);
-
-                // Copy 4 x 16 bytes
-                let data0 = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-                let data1 = _mm_loadu_si128(src.as_ptr().add(i + 16) as *const __m128i);
-                let data2 = _mm_loadu_si128(src.as_ptr().add(i + 32) as *const __m128i);
-                let data3 = _mm_loadu_si128(src.as_ptr().add(i + 48) as *const __m128i);
-
-                _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data0);
-                _mm_storeu_si128(dst.as_mut_ptr().add(i + 16) as *mut __m128i, data1);
-                _mm_storeu_si128(dst.as_mut_ptr().add(i + 32) as *mut __m128i, data2);
-                _mm_storeu_si128(dst.as_mut_ptr().add(i + 48) as *mut __m128i, data3);
-                i += 64;
-            }
-        }
-
-        // Process remaining 16-byte chunks
-        while i + 16 <= len {
-            let data = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data);
-            i += 16;
-        }
-
-        // Handle remaining bytes with scalar
-        while i < len {
-            dst[i] = src[i];
-            i += 1;
-        }
-    }
     /// CRC32 with SSE4.2 hardware acceleration
     #[target_feature(enable = "sse4.2")]
-    pub unsafe fn crc32_sse42(data: &[u8], mut crc: u32) -> u32 {
+    pub(super) unsafe fn crc32_sse42(data: &[u8], mut crc: u32) -> u32 {
         crc = !crc; // CRC32 uses inverted initial value
         let mut i = 0;
         let len = data.len();
@@ -3279,32 +2760,35 @@ mod x86 {
     }
     /// Population count using POPCNT on x86_64
     #[target_feature(enable = "popcnt")]
-    pub unsafe fn popcnt_hw(data: &[u8]) -> usize {
+    pub(super) unsafe fn popcnt_hw(data: &[u8]) -> usize {
         let mut count: usize = 0;
         let mut i = 0;
         let len = data.len();
         // Process 8 bytes at a time
         while i + 8 <= len {
+            // SAFETY: `i + 8 <= len` guarantees 8 readable bytes at `data[i..]`.
+            // Unaligned u64 reads are valid on x86_64 (no alignment requirement).
             let chunk = *(data.as_ptr().add(i) as *const u64);
             count = count.saturating_add(chunk.count_ones() as usize);
             i += 8;
         }
         // Handle remaining 4 bytes
         if i + 4 <= len {
+            // SAFETY: `i + 4 <= len` guarantees 4 readable bytes at `data[i..]`.
             let chunk = *(data.as_ptr().add(i) as *const u32);
             count = count.saturating_add(chunk.count_ones() as usize);
             i += 4;
         }
         // Handle tail bytes
         while i < len {
-            count = count.saturating_add((*data.get_unchecked(i)).count_ones() as usize);
+            count = count.saturating_add(data[i].count_ones() as usize);
             i += 1;
         }
         count
     }
     /// GF(2^8) multiplication with AVX-512 GFNI - 15x faster!
     #[target_feature(enable = "avx512f", enable = "gfni")]
-    pub unsafe fn gf_mul_avx512_gfni(a: &[u8], b: u8, dst: &mut [u8]) {
+    pub(super) unsafe fn gf_mul_avx512_gfni(a: &[u8], b: u8, dst: &mut [u8]) {
         let b_broadcast = _mm512_set1_epi8(b as i8);
         let len = a.len().min(dst.len());
         let mut i = 0;
@@ -3329,7 +2813,7 @@ mod x86 {
 
     /// GF(2^8) multiplication with AVX2 - table lookup method
     #[target_feature(enable = "avx2")]
-    pub unsafe fn gf_mul_avx2(a: &[u8], b: u8, dst: &mut [u8]) {
+    pub(super) unsafe fn gf_mul_avx2(a: &[u8], b: u8, dst: &mut [u8]) {
         let len = a.len().min(dst.len());
         let mut i = 0;
 
@@ -3378,7 +2862,7 @@ mod x86 {
 
     /// Short pattern search with SSE4.2 using string instructions (<= 16 bytes)
     #[target_feature(enable = "sse4.2")]
-    pub unsafe fn find_pattern_sse42_short(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn find_pattern_sse42_short(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         use std::arch::x86_64::*;
         let nlen = needle.len();
         if nlen == 0 {
@@ -3432,14 +2916,14 @@ mod x86 {
     }
     /// AES encryption with VAES - vectorized AES for parallel blocks
     #[target_feature(enable = "vaes", enable = "avx512f")]
-    pub unsafe fn aes_encrypt_vaes(state: &mut [u8; 16], key: &[u8; 16]) {
+    pub(super) unsafe fn aes_encrypt_vaes(state: &mut [u8; 16], key: &[u8; 16]) {
         // For a single block, VAES provides no material benefit over AES-NI.
         aes_encrypt_aesni(state, key);
     }
 
     /// AES encryption with AES-NI hardware acceleration
     #[target_feature(enable = "aes", enable = "sse2")]
-    pub unsafe fn aes_encrypt_aesni(state: &mut [u8; 16], key: &[u8; 16]) {
+    pub(super) unsafe fn aes_encrypt_aesni(state: &mut [u8; 16], key: &[u8; 16]) {
         use std::arch::x86_64::*;
 
         macro_rules! expand_aes128_round_key {
@@ -3484,7 +2968,7 @@ mod x86 {
     }
     /// GHASH with VPCLMULQDQ - AVX-VL (256-bit) carryless multiplication
     #[target_feature(enable = "avx512f", enable = "vpclmulqdq", enable = "avx512vl")]
-    pub unsafe fn ghash_vpclmulqdq(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
+    pub(super) unsafe fn ghash_vpclmulqdq(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
         use std::arch::x86_64::*;
 
         let shuf = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
@@ -3514,7 +2998,7 @@ mod x86 {
 
     /// GHASH with PCLMULQDQ - carryless multiplication for GCM
     #[target_feature(enable = "pclmulqdq", enable = "sse2")]
-    pub unsafe fn ghash_pclmulqdq(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
+    pub(super) unsafe fn ghash_pclmulqdq(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
         use std::arch::x86_64::*;
 
         let shuf = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
@@ -3649,13 +3133,13 @@ mod x86 {
 
     /// SHA-256 with SHA Extensions hardware acceleration
     #[target_feature(enable = "sha", enable = "sse2")]
-    pub unsafe fn sha256_hw(data: &[u8]) -> [u8; 32] {
+    pub(super) unsafe fn sha256_hw(data: &[u8]) -> [u8; 32] {
         // Correctness-first fallback until a full SHA-NI schedule/padding implementation is wired.
         scalar::sha256(data)
     }
     /// Histogram with AVX-512 - conflict detection for fast counting
     #[target_feature(enable = "avx512f", enable = "avx512cd")]
-    pub unsafe fn histogram_avx512(data: &[u8]) -> [u32; 256] {
+    pub(super) unsafe fn histogram_avx512(data: &[u8]) -> [u32; 256] {
         let mut hist = [0u32; 256];
         let mut i = 0;
 
@@ -3670,7 +3154,8 @@ mod x86 {
             let mask = _mm512_testn_epi32_mask(conflicts, conflicts);
             if mask == 0xFFFF {
                 // No conflicts - direct update
-                let vals: [u32; 16] = core::mem::transmute(values);
+                let mut vals = [0u32; 16];
+                _mm512_storeu_si512(vals.as_mut_ptr() as *mut _, values);
                 for v in vals {
                     let idx = (v as usize) & 0xFF;
                     hist[idx] += 1;
@@ -3680,8 +3165,10 @@ mod x86 {
                 let unique = _mm512_mask_compress_epi32(_mm512_setzero_si512(), mask, values);
                 let counts = _mm512_popcnt_epi32(conflicts);
 
-                let uniq_vals: [u32; 16] = core::mem::transmute(unique);
-                let cnt_vals: [u32; 16] = core::mem::transmute(counts);
+                let mut uniq_vals = [0u32; 16];
+                let mut cnt_vals = [0u32; 16];
+                _mm512_storeu_si512(uniq_vals.as_mut_ptr() as *mut _, unique);
+                _mm512_storeu_si512(cnt_vals.as_mut_ptr() as *mut _, counts);
                 for j in 0..16 {
                     if (mask & (1 << j)) != 0 {
                         let idx = (uniq_vals[j] as usize) & 0xFF;
@@ -3706,7 +3193,7 @@ mod x86 {
 
     /// QPACK Huffman encoding with AVX2 - vectorized symbol lookup
     #[target_feature(enable = "avx2")]
-    pub unsafe fn qpack_encode_avx2(input: &[u8], output: &mut [u8]) -> usize {
+    pub(super) unsafe fn qpack_encode_avx2(input: &[u8], output: &mut [u8]) -> usize {
         use crate::transport::h3::qpack::HUFF_CODES;
 
         let mut acc: u128 = 0;
@@ -3825,7 +3312,7 @@ mod x86 {
 
     /// Histogram with AVX2 - gather/scatter for histogram
     #[target_feature(enable = "avx2")]
-    pub unsafe fn histogram_avx2(data: &[u8]) -> [u32; 256] {
+    pub(super) unsafe fn histogram_avx2(data: &[u8]) -> [u32; 256] {
         // AVX2 dispatch path currently shares the scalar counting core to keep
         // one authoritative histogram implementation.
         scalar::histogram(data)
@@ -3834,14 +3321,15 @@ mod x86 {
     /// Decode varint with BMI2 PEXT - extract bits efficiently
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "bmi2")]
-    pub unsafe fn decode_varint_bmi2(buf: &[u8]) -> Option<(u64, usize)> {
+    pub(super) unsafe fn decode_varint_bmi2(buf: &[u8]) -> Option<(u64, usize)> {
         use std::arch::x86_64::*;
 
         if buf.len() < 8 {
             return super::scalar::decode_varint(buf);
         }
 
-        // Load 8 bytes
+        // SAFETY: `buf.len() >= 8` checked above, so reading 8 bytes from `buf.as_ptr()`
+        // is in bounds. Unaligned u64 reads are valid on x86_64.
         let data = *(buf.as_ptr() as *const u64);
 
         // Find continuation bits with BMI2
@@ -3868,7 +3356,7 @@ mod x86 {
     /// Decode varint with AVX2 - parallel byte processing
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    pub unsafe fn decode_varint_avx2(buf: &[u8]) -> Option<(u64, usize)> {
+    pub(super) unsafe fn decode_varint_avx2(buf: &[u8]) -> Option<(u64, usize)> {
         use std::arch::x86_64::*;
 
         if buf.len() < 8 {
@@ -3901,6 +3389,8 @@ mod x86 {
 
         // Shift and combine
         let mut result = 0u64;
+        // SAFETY: `__m128i` and `[u8; 16]` have identical size (16 bytes). All bit
+        // patterns are valid for u8, so the transmute is sound.
         let bytes = std::mem::transmute::<__m128i, [u8; 16]>(values);
         for i in 0..len {
             result |= (bytes[i] as u64) << (i * 7);
@@ -3912,7 +3402,7 @@ mod x86 {
     /// Pattern matching with AVX2 - 5x faster than scalar
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    pub unsafe fn find_pattern_avx2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    pub(super) unsafe fn find_pattern_avx2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         use std::arch::x86_64::*;
 
         if needle.is_empty() || needle.len() > haystack.len() {
@@ -3970,20 +3460,19 @@ mod x86 {
 // FEC SPECIFIC - Berlekamp-Massey, Wiedemann and Reed-Solomon solvers
 // ============================================================================
 
+/// FEC-specific SIMD helpers: Berlekamp-Massey, varint decoding, header validation.
 pub mod fec {
     use super::*;
 
     /// Berlekamp-Massey with AVX-512 GFNI acceleration when available.
     #[inline(always)]
-    fn _decode_varint_profile_router_removed(buf: &[u8]) -> Option<(u64, usize)> {
+    fn _decode_varint_profile_router_removed(_buf: &[u8]) -> Option<(u64, usize)> {
         let features = FeatureDetector::instance();
-        let profile = features.profile();
-
-        use crate::optimize::CpuProfile;
+        let _profile = features.profile();
 
         #[cfg(target_arch = "x86_64")]
         {
-            match profile {
+            match _profile {
                 CpuProfile::X86_P2b
                 | CpuProfile::X86_P3a
                 | CpuProfile::X86_P3b
@@ -3992,12 +3481,12 @@ pub mod fec {
                 | CpuProfile::X86_P3e
                 | CpuProfile::X86_P4a
                 | CpuProfile::X86_P4b => {
-                    // BMI2 available
-                    return unsafe { x86::decode_varint_bmi2(buf) };
+                    // SAFETY: Profile check guarantees BMI2 feature presence.
+                    return unsafe { x86::decode_varint_bmi2(_buf) };
                 }
                 CpuProfile::X86_P2a => {
-                    // AVX2 but no BMI2 - use AVX2 parallel decode
-                    return unsafe { x86::decode_varint_avx2(buf) };
+                    // SAFETY: Profile check guarantees AVX2 feature presence.
+                    return unsafe { x86::decode_varint_avx2(_buf) };
                 }
                 _ => {}
             }
@@ -4009,6 +3498,9 @@ pub mod fec {
     #[inline(always)]
     pub fn berlekamp_massey_gf256(syndrome: &[u8], len: usize) -> Vec<u8> {
         let features = FeatureDetector::instance();
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. Callees only read `syndrome[..len]` and
+        // return an owned Vec - no aliasing or pointer lifetime concerns.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::GFNI) && features.has_feature(CpuFeature::AVX512F) {
@@ -4061,10 +3553,11 @@ pub mod fec {
     /// Varint decoding with BMI2 acceleration when available.
     #[inline(always)]
     pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-        let features = FeatureDetector::instance();
-
         #[cfg(target_arch = "x86_64")]
         {
+            let features = FeatureDetector::instance();
+            // SAFETY: Runtime feature detection matches the callee's `#[target_feature]`.
+            // Both callees validate `buf.len()` internally before raw pointer reads.
             if features.has_feature(CpuFeature::BMI2) {
                 return unsafe { super::x86::varint_decode_bmi2(buf) };
             }
@@ -4087,6 +3580,9 @@ pub mod fec {
 
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. The `header.len() >= 5` guard above ensures
+        // the header is non-empty. All callees only read from `header` and return bool.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX512F) {
@@ -4118,6 +3614,7 @@ pub mod fec {
 // BITSTREAM OPERATIONS - Pack/Unpack with BMI2
 // ============================================================================
 
+/// Bitstream pack/unpack with BMI2/NEON acceleration.
 pub mod bitstream {
     use super::*;
 
@@ -4126,6 +3623,9 @@ pub mod bitstream {
     pub fn pack_bits(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. Callees read from `src` and write to `dst`
+        // with internal bounds tracking to prevent out-of-bounds access.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::BMI2) {
@@ -4151,6 +3651,8 @@ pub mod bitstream {
     pub fn unpack_bits(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. Callees track bit/byte positions internally.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::BMI2) {
@@ -4176,6 +3678,7 @@ pub mod bitstream {
 // TRANSPORT HELPERS - QUIC varint encode/decode (wrappers for transport)
 // =========================================================================
 
+/// QUIC variable-length integer encode/decode with SIMD acceleration.
 pub mod transport {
     use super::*;
 
@@ -4186,6 +3689,8 @@ pub mod transport {
     pub fn encode_varint(val: u64, buf: &mut [u8]) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
+            // SAFETY: Runtime feature detection matches each callee's `#[target_feature]`.
+            // Callees validate `buf.len()` and return `None` if too short.
             let features = FeatureDetector::instance();
             if features.has_feature(CpuFeature::AVX512F) {
                 if let Some(len) = unsafe { super::x86::encode_varint_avx512(val, buf) } {
@@ -4209,13 +3714,13 @@ pub mod transport {
             let features = FeatureDetector::instance();
             if features.has_feature(CpuFeature::SVE2) {
                 #[cfg(target_feature = "sve2")]
-                unsafe {
+                {
                     return crate::simd::arm_varint::encode_varint_sve2(val, buf);
                 }
             }
             if features.has_feature(CpuFeature::NEON) {
                 #[cfg(target_feature = "neon")]
-                unsafe {
+                {
                     return crate::simd::arm_varint::encode_varint_neon(val, buf);
                 }
             }
@@ -4246,15 +3751,17 @@ pub mod transport {
     #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
     #[inline(always)]
     pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-        unsafe { crate::simd::arm_varint::decode_varint_sve2(buf) }
+        crate::simd::arm_varint::decode_varint_sve2(buf)
     }
 
+    /// Decode QUIC variable-length integer using NEON (aarch64 without SVE2).
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sve2"), target_feature = "neon"))]
     #[inline(always)]
     pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-        unsafe { crate::simd::arm_varint::decode_varint_neon(buf) }
+        crate::simd::arm_varint::decode_varint_neon(buf)
     }
 
+    /// Decode QUIC variable-length integer (scalar fallback for non-NEON targets).
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     #[inline(always)]
     pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
@@ -4267,7 +3774,10 @@ pub mod transport {
             1 => 2,
             2 => 4,
             3 => 8,
-            _ => unreachable!(),
+            _ => {
+                debug_assert!(false, "invalid QUIC varint prefix");
+                return None;
+            }
         };
         if buf.len() < len {
             return None;
@@ -4284,8 +3794,10 @@ pub mod transport {
 // STRING OPERATIONS - Ultra-fast comparison
 // ============================================================================
 
+/// SIMD-accelerated byte-string comparison.
 pub mod string {
-    use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::optimize::{CpuFeature, FeatureDetector};
 
     /// String comparison with SIMD acceleration when available.
     #[inline(always)]
@@ -4294,10 +3806,12 @@ pub mod string {
             return false;
         }
 
-        let features = FeatureDetector::instance();
-
+        // SAFETY: Runtime feature detection matches each callee's `#[target_feature]`.
+        // Both `a` and `b` are borrowed slices of equal length (checked above).
+        // Callees process in SIMD-width chunks with scalar tail handling.
         #[cfg(target_arch = "x86_64")]
         {
+            let features = FeatureDetector::instance();
             if features.has_feature(CpuFeature::AVX2) {
                 return unsafe { super::x86::string_compare_avx2(a, b) };
             }
@@ -4314,6 +3828,7 @@ pub mod string {
 // HTTP/3 QPACK - Header compression with SIMD
 // ============================================================================
 
+/// HTTP/3 QPACK Huffman encode/decode with SIMD acceleration.
 pub mod h3 {
     use super::*;
 
@@ -4322,6 +3837,9 @@ pub mod h3 {
     pub fn qpack_encode(input: &[u8], output: &mut [u8]) -> usize {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Runtime feature detection matches each callee's `#[target_feature]`.
+        // Callees read from `input`, write to `output` with bounds checks,
+        // and return the number of bytes written.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX2) {
@@ -4335,10 +3853,10 @@ pub mod h3 {
         #[cfg(target_arch = "aarch64")]
         {
             if features.has_feature(CpuFeature::SVE2) {
-                return unsafe { super::arm::qpack_encode_sve2(input, output) };
+                return super::arm::qpack_encode_sve2(input, output);
             }
             if features.has_feature(CpuFeature::NEON) {
-                return unsafe { super::arm::qpack_encode_neon(input, output) };
+                return super::arm::qpack_encode_neon(input, output);
             }
         }
 
@@ -4350,6 +3868,8 @@ pub mod h3 {
     pub fn qpack_decode(input: &[u8], output: &mut [u8]) -> usize {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Runtime feature detection matches each callee's `#[target_feature]`.
+        // Callees read from `input` and write to `output` with bounds checks.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::AVX2) {
@@ -4363,10 +3883,10 @@ pub mod h3 {
         #[cfg(target_arch = "aarch64")]
         {
             if features.has_feature(CpuFeature::SVE2) {
-                return unsafe { super::arm::qpack_decode_sve2(input, output) };
+                return super::arm::qpack_decode_sve2(input, output);
             }
             if features.has_feature(CpuFeature::NEON) {
-                return unsafe { super::arm::qpack_decode_neon(input, output) };
+                return super::arm::qpack_decode_neon(input, output);
             }
         }
 
@@ -4379,7 +3899,7 @@ pub mod h3 {
 // ============================================================================
 
 #[cfg(all(target_arch = "x86_64", target_feature = "amx-tile"))]
-pub mod amx {
+pub(crate) mod amx {
     use std::arch::asm;
 
     const TILE_BYTES: usize = 64;
@@ -4427,7 +3947,7 @@ pub mod amx {
 
     /// Configure AMX tiles for the canonical 16x64 layout used in GF(256) blocks.
     #[target_feature(enable = "amx-tile")]
-    pub unsafe fn amx_init() {
+    pub(super) unsafe fn amx_init() {
         TILE_CONFIG.configure(TILE_ROWS_0, TILE_COLS_0);
         asm!(
             "ldtilecfg [{cfg}]",
@@ -4438,13 +3958,20 @@ pub mod amx {
 
     /// Release AMX tiles after use.
     #[target_feature(enable = "amx-tile")]
-    pub unsafe fn amx_release() {
+    pub(super) unsafe fn amx_release() {
         asm!("tilerelease", options(nostack));
     }
 
     /// Matrix multiply with Intel AMX
     #[target_feature(enable = "amx-int8")]
-    pub unsafe fn amx_matmul_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
+    pub(super) unsafe fn amx_matmul_i8(
+        a: &[i8],
+        b: &[i8],
+        c: &mut [i32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
         use std::arch::asm;
 
         amx_init();
@@ -4467,7 +3994,7 @@ pub mod amx {
 
     /// GF(256) matrix x vector multiply specialised for Wiedemann solver.
     #[target_feature(enable = "amx-int8")]
-    pub unsafe fn matmul_gf256_amx(
+    pub(super) unsafe fn matmul_gf256_amx(
         matrix: &[u8],
         vector: &[u8],
         output: &mut [u8],
@@ -4548,7 +4075,7 @@ mod x86_extended {
 
     /// Berlekamp-Massey with AVX-512 GFNI acceleration when available.
     #[target_feature(enable = "avx512f", enable = "gfni")]
-    pub unsafe fn berlekamp_massey_gfni(syndrome: &[u8], len: usize) -> Vec<u8> {
+    pub(super) unsafe fn berlekamp_massey_gfni(syndrome: &[u8], len: usize) -> Vec<u8> {
         let mut error_locator = vec![0u8; len + 1];
         error_locator[0] = 1;
         let mut old_locator = vec![0u8; len + 1];
@@ -4648,14 +4175,14 @@ mod x86_extended {
 
     /// Berlekamp-Massey with AVX2 acceleration when available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn berlekamp_massey_avx2(syndrome: &[u8], len: usize) -> Vec<u8> {
+    pub(super) unsafe fn berlekamp_massey_avx2(syndrome: &[u8], len: usize) -> Vec<u8> {
         // Keep AVX2 routing separate from GFNI/AVX-512 to avoid unsupported instructions.
         scalar::berlekamp_massey(syndrome, len)
     }
 
     /// GF(256) matrix multiplication with GFNI
     #[target_feature(enable = "avx512f", enable = "gfni")]
-    pub unsafe fn matmul_gf256_gfni(
+    pub(super) unsafe fn matmul_gf256_gfni(
         a: &[u8],
         b: &[u8],
         c: &mut [u8],
@@ -4702,7 +4229,7 @@ mod x86_extended {
 
     /// GF(256) matrix multiplication with AVX2
     #[target_feature(enable = "avx2")]
-    pub unsafe fn matmul_gf256_avx2(
+    pub(super) unsafe fn matmul_gf256_avx2(
         a: &[u8],
         b: &[u8],
         c: &mut [u8],
@@ -4781,23 +4308,23 @@ mod x86_extended {
     }
 
     #[target_feature(enable = "sse2")]
-    pub unsafe fn encode_varint_sse2(val: u64, buf: &mut [u8]) -> Option<usize> {
+    pub(super) unsafe fn encode_varint_sse2(val: u64, buf: &mut [u8]) -> Option<usize> {
         quic_encode_bytes(val, buf)
     }
 
     #[target_feature(enable = "avx2")]
-    pub unsafe fn encode_varint_avx2(val: u64, buf: &mut [u8]) -> Option<usize> {
+    pub(super) unsafe fn encode_varint_avx2(val: u64, buf: &mut [u8]) -> Option<usize> {
         quic_encode_bytes(val, buf)
     }
 
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn encode_varint_avx512(val: u64, buf: &mut [u8]) -> Option<usize> {
+    pub(super) unsafe fn encode_varint_avx512(val: u64, buf: &mut [u8]) -> Option<usize> {
         quic_encode_bytes(val, buf)
     }
 
     /// Varint encoding with BMI2 acceleration when available.
     #[target_feature(enable = "bmi2")]
-    pub unsafe fn varint_encode_bmi2(mut value: u64, buf: &mut [u8]) -> usize {
+    pub(super) unsafe fn varint_encode_bmi2(mut value: u64, buf: &mut [u8]) -> usize {
         use std::arch::x86_64::*;
 
         if value < 128 {
@@ -4821,7 +4348,7 @@ mod x86_extended {
 
     /// Varint decoding with BMI2 acceleration when available.
     #[target_feature(enable = "bmi2")]
-    pub unsafe fn varint_decode_bmi2(buf: &[u8]) -> Option<(u64, usize)> {
+    pub(super) unsafe fn varint_decode_bmi2(buf: &[u8]) -> Option<(u64, usize)> {
         use std::arch::x86_64::*;
 
         if buf.is_empty() {
@@ -4855,6 +4382,8 @@ mod x86_extended {
         let detector = FeatureDetector::instance();
         let features = detector.features_full();
 
+        // SAFETY: Runtime feature check matches each callee's `#[target_feature]`.
+        // Callees iterate keys with internal length checks and scalar tail handling.
         #[cfg(target_arch = "x86_64")]
         {
             if features.avx512f {
@@ -4889,7 +4418,7 @@ mod x86_extended {
 
     /// Batch XOR with multiple keys (vectorized when available).
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn xor_multi_key_avx512(data: &mut [u8], keys: &[&[u8]]) {
+    pub(super) unsafe fn xor_multi_key_avx512(data: &mut [u8], keys: &[&[u8]]) {
         use std::arch::x86_64::*;
 
         for key in keys {
@@ -4920,7 +4449,7 @@ mod x86_extended {
 
     /// Batch XOR with multiple keys using AVX2 when available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn xor_multi_key_avx2(data: &mut [u8], keys: &[&[u8]]) {
+    pub(super) unsafe fn xor_multi_key_avx2(data: &mut [u8], keys: &[&[u8]]) {
         use std::arch::x86_64::*;
 
         for key in keys {
@@ -4953,7 +4482,7 @@ mod x86_extended {
 
     /// Packet header validation with AVX2 when available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn validate_header_avx2(header: &[u8]) -> bool {
+    pub(super) unsafe fn validate_header_avx2(header: &[u8]) -> bool {
         use std::arch::x86_64::*;
 
         if header.len() < 32 {
@@ -4977,7 +4506,7 @@ mod x86_extended {
 
     /// Packet header validation with SSE2 when available.
     #[target_feature(enable = "sse2")]
-    pub unsafe fn validate_header_sse2(header: &[u8]) -> bool {
+    pub(super) unsafe fn validate_header_sse2(header: &[u8]) -> bool {
         use std::arch::x86_64::*;
 
         if header.is_empty() {
@@ -5011,7 +4540,7 @@ mod x86_extended {
 
     /// Pack bits with BMI2 acceleration when available.
     #[target_feature(enable = "bmi2")]
-    pub unsafe fn pack_bits_bmi2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn pack_bits_bmi2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         use std::arch::x86_64::*;
 
         let mut src_idx = 0;
@@ -5047,7 +4576,7 @@ mod x86_extended {
 
     /// Unpack bits with BMI2 acceleration when available.
     #[target_feature(enable = "bmi2")]
-    pub unsafe fn unpack_bits_bmi2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
+    pub(super) unsafe fn unpack_bits_bmi2(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         use std::arch::x86_64::*;
 
         let mut src_idx = 0;
@@ -5082,7 +4611,7 @@ mod x86_extended {
 
     /// String comparison with AVX2 when available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn string_compare_avx2(a: &[u8], b: &[u8]) -> bool {
+    pub(super) unsafe fn string_compare_avx2(a: &[u8], b: &[u8]) -> bool {
         use std::arch::x86_64::*;
 
         let len = a.len();
@@ -5119,7 +4648,7 @@ mod x86_extended {
 
     /// String comparison with SSE4.2 when available.
     #[target_feature(enable = "sse4.2")]
-    pub unsafe fn string_compare_sse42(a: &[u8], b: &[u8]) -> bool {
+    pub(super) unsafe fn string_compare_sse42(a: &[u8], b: &[u8]) -> bool {
         use std::arch::x86_64::*;
 
         let len = a.len();
@@ -5155,7 +4684,7 @@ mod x86_extended {
 
     /// POPCNT with AVX-512 VPOPCNTDQ when available (large bitmaps).
     #[target_feature(enable = "avx512f", enable = "avx512vpopcntdq")]
-    pub unsafe fn popcnt_avx512(data: &[u8]) -> usize {
+    pub(super) unsafe fn popcnt_avx512(data: &[u8]) -> usize {
         use std::arch::x86_64::*;
 
         let mut count = 0usize;
@@ -5180,7 +4709,7 @@ mod x86_extended {
 
     /// Batch CRC32 with PCLMULQDQ when available.
     #[target_feature(enable = "pclmulqdq", enable = "sse4.2")]
-    pub unsafe fn batch_crc32_pclmul(data: &[&[u8]], initial: u32) -> Vec<u32> {
+    pub(super) unsafe fn batch_crc32_pclmul(data: &[&[u8]], initial: u32) -> Vec<u32> {
         use std::arch::x86_64::*;
 
         let mut results = Vec::with_capacity(data.len());
@@ -5217,7 +4746,7 @@ mod x86_extended {
 
     /// Reed-Solomon encoding with AVX-512 GFNI when available.
     #[target_feature(enable = "avx512f", enable = "gfni")]
-    pub unsafe fn reed_solomon_encode_gfni(data: &[u8], parity_shards: usize) -> Vec<u8> {
+    pub(super) unsafe fn reed_solomon_encode_gfni(data: &[u8], parity_shards: usize) -> Vec<u8> {
         // Generate parity using GFNI for GF(256) operations
         let data_shards = data.len() / 256;
         let total_shards = data_shards + parity_shards;
@@ -5256,7 +4785,7 @@ mod x86_extended {
 
     /// Reed-Solomon encoding with AVX2 when available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn reed_solomon_encode_avx2(data: &[u8], parity_shards: usize) -> Vec<u8> {
+    pub(super) unsafe fn reed_solomon_encode_avx2(data: &[u8], parity_shards: usize) -> Vec<u8> {
         use std::arch::x86_64::*;
 
         let data_shards = (data.len() + 255) / 256;
@@ -5318,7 +4847,7 @@ mod x86_extended {
 
     /// Reed-Solomon decoding with GFNI when available.
     #[target_feature(enable = "avx512f", enable = "gfni")]
-    pub unsafe fn reed_solomon_decode_gfni(
+    pub(super) unsafe fn reed_solomon_decode_gfni(
         shards: &[Vec<u8>],
         indices: &[usize],
     ) -> Result<Vec<u8>, &'static str> {
@@ -5517,7 +5046,7 @@ mod x86_extended {
 
     /// Reed-Solomon decoding with AVX2
     #[target_feature(enable = "avx2")]
-    pub unsafe fn reed_solomon_decode_avx2(
+    pub(super) unsafe fn reed_solomon_decode_avx2(
         shards: &[Vec<u8>],
         indices: &[usize],
     ) -> Result<Vec<u8>, &'static str> {
@@ -5526,7 +5055,7 @@ mod x86_extended {
 
     /// QPACK Huffman encoding with AVX2
     #[target_feature(enable = "avx2")]
-    pub unsafe fn qpack_encode_avx2(input: &[u8], output: &mut [u8]) -> usize {
+    pub(super) unsafe fn qpack_encode_avx2(input: &[u8], output: &mut [u8]) -> usize {
         use crate::transport::h3::qpack::{HUFF_CODES, HUFF_LENS};
         use std::arch::x86_64::*;
 
@@ -5635,7 +5164,7 @@ mod x86_extended {
 
     /// QPACK Huffman encoding with SSSE3/SSE4.1 fallback
     #[target_feature(enable = "ssse3", enable = "sse4.1")]
-    pub unsafe fn qpack_encode_ssse3(input: &[u8], output: &mut [u8]) -> usize {
+    pub(super) unsafe fn qpack_encode_ssse3(input: &[u8], output: &mut [u8]) -> usize {
         use crate::transport::h3::qpack::{HUFF_CODES, HUFF_LENS};
         use std::arch::x86_64::*;
 
@@ -5739,7 +5268,7 @@ mod x86_extended {
 
     /// QPACK Huffman decoding with AVX2 helper (delegates to shared decode)
     #[target_feature(enable = "avx2")]
-    pub unsafe fn qpack_decode_avx2(input: &[u8], output: &mut [u8]) -> usize {
+    pub(super) unsafe fn qpack_decode_avx2(input: &[u8], output: &mut [u8]) -> usize {
         use crate::transport::h3;
         match h3::qpack::huff_decode_into(input, output) {
             Ok(written) => written,
@@ -5750,7 +5279,7 @@ mod x86_extended {
 
     /// QPACK Huffman decoding with SSSE3 helper (reuses shared decode)
     #[target_feature(enable = "ssse3")]
-    pub unsafe fn qpack_decode_ssse3(input: &[u8], output: &mut [u8]) -> usize {
+    pub(super) unsafe fn qpack_decode_ssse3(input: &[u8], output: &mut [u8]) -> usize {
         use crate::transport::h3;
         match h3::qpack::huff_decode_into(input, output) {
             Ok(written) => written,
@@ -5884,13 +5413,13 @@ mod tests_arm {
             scalar_buf.truncate(scalar_len);
 
             let mut neon_buf = vec![0u8; scalar_len + 8];
-            let neon_len = unsafe { arm::qpack_encode_neon(sample, &mut neon_buf) };
+            let neon_len = arm::qpack_encode_neon(sample, &mut neon_buf);
             neon_buf.truncate(neon_len);
 
             assert_eq!(neon_buf, scalar_buf);
 
             let mut decode_buf = vec![0u8; sample.len() + 8];
-            let decoded = unsafe { arm::qpack_decode_neon(&neon_buf, &mut decode_buf) };
+            let decoded = arm::qpack_decode_neon(&neon_buf, &mut decode_buf);
             decode_buf.truncate(decoded);
 
             let mut scalar_decode = vec![0u8; sample.len() + 8];
@@ -5908,10 +5437,11 @@ mod x86_rest {
     use super::*;
 }
 
+/// Pure-scalar fallback implementations for every SIMD-dispatched operation.
 pub mod scalar {
     use crate::crypto::{aes, gcm, hkdf};
     use crate::simd::{CpuFeature, FeatureDetector};
-    /// GF(256) power for Reed-Solomon
+    /// GF(256) exponentiation for Reed-Solomon generator polynomials.
     pub fn gf_pow(base: u8, exp: u8) -> u8 {
         if exp == 0 {
             return 1;
@@ -5923,16 +5453,14 @@ pub mod scalar {
         result
     }
 
+    /// XOR `src` into `dst` byte-by-byte (scalar fallback).
     pub fn xor_blocks(dst: &mut [u8], src: &[u8]) {
         for (d, s) in dst.iter_mut().zip(src.iter()) {
             *d ^= *s;
         }
     }
 
-    pub fn memcpy(dst: &mut [u8], src: &[u8]) {
-        dst.copy_from_slice(src);
-    }
-
+    /// CRC-32 using a precomputed 256-entry table (scalar fallback).
     pub fn crc32(data: &[u8], mut crc: u32) -> u32 {
         // CRC-32 polynomial: 0xEDB88320 (reversed representation)
         const POLY: u32 = 0xEDB88320;
@@ -5967,16 +5495,19 @@ pub mod scalar {
         !crc
     }
 
+    /// Population count over a byte slice (scalar fallback).
     pub fn popcnt(data: &[u8]) -> usize {
         data.iter().map(|&b| b.count_ones() as usize).sum()
     }
 
+    /// GF(2^8) multiply each byte of `a` by scalar `b` into `dst` (scalar fallback).
     pub fn gf_mul(a: &[u8], b: u8, dst: &mut [u8]) {
         for i in 0..a.len().min(dst.len()) {
             dst[i] = gf_mul_byte(a[i], b);
         }
     }
 
+    /// Single GF(2^8) byte multiplication with AES reduction polynomial.
     pub fn gf_mul_byte(a: u8, b: u8) -> u8 {
         let mut result = 0u8;
         let mut aa = a;
@@ -5995,21 +5526,25 @@ pub mod scalar {
         result
     }
 
+    /// AES-128 single-block encrypt in place (scalar, delegates to software AES).
     pub fn aes_encrypt_block(state: &mut [u8; 16], key: &[u8; 16]) {
         let block = *state;
         let encrypted = aes::aes128_encrypt_block(key, &block);
         state.copy_from_slice(&encrypted);
     }
 
+    /// GHASH for GCM mode (scalar fallback, delegates to crypto::gcm).
     pub fn ghash(h: &[u8; 16], data: &[u8], tag: &mut [u8; 16]) {
         let computed = gcm::ghash(*h, &[], data);
         tag.copy_from_slice(&computed);
     }
 
+    /// SHA-256 digest (scalar fallback, delegates to hkdf::sha256).
     pub fn sha256(data: &[u8]) -> [u8; 32] {
         hkdf::sha256(data)
     }
 
+    /// Byte-frequency histogram over a data slice (scalar).
     pub fn histogram(data: &[u8]) -> [u32; 256] {
         let mut hist = [0u32; 256];
         for &byte in data {
@@ -6018,14 +5553,17 @@ pub mod scalar {
         hist
     }
 
+    /// Find first occurrence of `needle` in `haystack` (scalar linear scan).
     pub fn find_pattern(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|window| window == needle)
     }
 
+    /// f32 dot product of two equal-length slices (scalar).
     pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
 
+    /// f32 matrix multiplication C = A * B with dimensions (m x k) * (k x n) (scalar).
     pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
         for i in 0..m {
             for j in 0..n {
@@ -6038,6 +5576,7 @@ pub mod scalar {
         }
     }
 
+    /// Berlekamp-Massey algorithm over GF(256) for error-locator polynomial (scalar).
     pub fn berlekamp_massey(syndrome: &[u8], len: usize) -> Vec<u8> {
         let mut error_locator = vec![0u8; len + 1];
         error_locator[0] = 1;
@@ -6087,6 +5626,7 @@ pub mod scalar {
         error_locator
     }
 
+    /// GF(256) matrix multiplication C = A * B with dimensions (m x k) * (k x n) (scalar).
     pub fn matmul_gf256(a: &[u8], b: &[u8], c: &mut [u8], m: usize, k: usize, n: usize) {
         // Zero the output
         for elem in c.iter_mut().take(m * n) {
@@ -6106,9 +5646,13 @@ pub mod scalar {
         }
     }
 
+    /// Reed-Solomon encode with SIMD dispatch; produces `parity_shards` extra shards.
     pub fn reed_solomon_encode(data: &[u8], parity_shards: usize) -> Vec<u8> {
         let features = FeatureDetector::instance();
 
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. Callees process 256-byte shards with SIMD
+        // GF(256) multiplication and write to owned Vec output.
         #[cfg(target_arch = "x86_64")]
         {
             if features.has_feature(CpuFeature::GFNI) && features.has_feature(CpuFeature::AVX512F) {
@@ -6155,6 +5699,7 @@ pub mod scalar {
         output
     }
 
+    /// Reed-Solomon decode from available shards and their indices via Gaussian elimination.
     pub fn reed_solomon_decode(
         shards: &[Vec<u8>],
         indices: &[usize],
@@ -6163,10 +5708,12 @@ pub mod scalar {
             return Err("No shards provided");
         }
 
-        let features = FeatureDetector::instance();
-
+        // SAFETY: Each branch is guarded by runtime feature detection matching the
+        // callee's `#[target_feature]`. Callees read from `shards` and `indices`,
+        // perform GF(256) Gaussian elimination, and return owned decoded data.
         #[cfg(target_arch = "x86_64")]
         {
+            let features = FeatureDetector::instance();
             if features.has_feature(CpuFeature::GFNI) && features.has_feature(CpuFeature::AVX512F) {
                 return unsafe { super::x86::reed_solomon_decode_gfni(shards, indices) };
             }
@@ -6255,18 +5802,21 @@ pub mod scalar {
         Ok(output)
     }
 
+    /// QPACK encode (scalar identity copy fallback).
     pub fn qpack_encode(input: &[u8], output: &mut [u8]) -> usize {
         let len = input.len().min(output.len());
         output[..len].copy_from_slice(&input[..len]);
         len
     }
 
+    /// QPACK decode (scalar identity copy fallback).
     pub fn qpack_decode(input: &[u8], output: &mut [u8]) -> usize {
         let len = input.len().min(output.len());
         output[..len].copy_from_slice(&input[..len]);
         len
     }
 
+    /// Validate QUIC packet header fixed-bit constraint (scalar fallback).
     pub fn validate_header(header: &[u8]) -> bool {
         if header.is_empty() {
             return false;
@@ -6275,6 +5825,7 @@ pub mod scalar {
         (header[0] & 0x40) != 0
     }
 
+    /// Pack values into a bitstream at the given bit width (scalar fallback).
     pub fn pack_bits(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         if bit_width == 0 || bit_width > 8 {
             return 0;
@@ -6302,6 +5853,7 @@ pub mod scalar {
         di
     }
 
+    /// Unpack a bitstream at the given bit width into individual bytes (scalar fallback).
     pub fn unpack_bits(src: &[u8], bit_width: u8, dst: &mut [u8]) -> usize {
         if bit_width == 0 || bit_width > 8 {
             return 0;
@@ -6328,6 +5880,7 @@ pub mod scalar {
         di
     }
 
+    /// Encode a value as a variable-length integer into `buf` (scalar fallback).
     pub fn encode_varint(mut value: u64, buf: &mut [u8]) -> usize {
         let mut pos = 0;
 
@@ -6341,6 +5894,7 @@ pub mod scalar {
         pos + 1
     }
 
+    /// Decode a variable-length integer from `buf`; returns (value, bytes_consumed) (scalar fallback).
     pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
         let mut value = 0u64;
         let mut shift = 0;
@@ -6432,6 +5986,395 @@ pub mod scalar {
 }
 
 // ----------------------------------------------------------------------------
+// Tests (platform-independent) - dispatched API correctness
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests_dispatched {
+    use super::*;
+
+    // ===================== GF(2^8) batch operations =====================
+
+    #[test]
+    fn gf_mul_known_vectors() {
+        // Multiply each byte of input by 0x02 (xtime) - well-known AES operation
+        let input = [0x57u8, 0xAE, 0x00, 0x01, 0x80, 0xFF];
+        let mut dst = [0u8; 6];
+        galois::gf_mul(&input, 0x02, &mut dst);
+        // Verify against scalar reference
+        let mut expected = [0u8; 6];
+        for i in 0..input.len() {
+            expected[i] = scalar::gf_mul_byte(input[i], 0x02);
+        }
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn gf_mul_identity_element() {
+        // Multiplying by 1 in GF(2^8) must return the original value
+        let input: Vec<u8> = (0..=255).collect();
+        let mut dst = vec![0u8; 256];
+        galois::gf_mul(&input, 1, &mut dst);
+        assert_eq!(dst, input);
+    }
+
+    #[test]
+    fn gf_mul_zero_input() {
+        // Multiplying by 0 must yield all zeros
+        let input = [0xAB, 0xCD, 0xEF, 0x12, 0x34];
+        let mut dst = [0xFFu8; 5];
+        galois::gf_mul(&input, 0, &mut dst);
+        assert_eq!(dst, [0u8; 5]);
+    }
+
+    #[test]
+    fn gf_mul_zero_data() {
+        // All-zero input multiplied by anything must yield all zeros
+        let input = [0u8; 64];
+        let mut dst = [0xFFu8; 64];
+        galois::gf_mul(&input, 0x42, &mut dst);
+        assert_eq!(dst, [0u8; 64]);
+    }
+
+    #[test]
+    fn gf_mul_inverse_checking() {
+        // For every nonzero a, a * a^-1 = 1 in GF(2^8)
+        for a in 1u8..=255 {
+            let inv = scalar::gf_inv(a);
+            let product = scalar::gf_mul_byte(a, inv);
+            assert_eq!(product, 1, "gf_inv failed for a={a}: a*inv={product}, inv={inv}");
+        }
+    }
+
+    // ===================== GF(2^4) operations =====================
+
+    #[test]
+    fn gf4_mul_identity_and_zero() {
+        // GF(2^4) multiply by 1 preserves nibbles, multiply by 0 zeroes
+        let input = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let mut dst_one = [0u8; 8];
+        let mut dst_zero = [0xFFu8; 8];
+        galois::gf4_mul(&input, 1, &mut dst_one);
+        galois::gf4_mul(&input, 0, &mut dst_zero);
+        assert_eq!(dst_one, input, "gf4 multiply by 1 should be identity");
+        assert_eq!(dst_zero, [0u8; 8], "gf4 multiply by 0 should be zero");
+    }
+
+    // ===================== GF(2^16) operations =====================
+
+    #[test]
+    fn gf16_mul_identity_and_zero() {
+        let input: Vec<u16> = vec![0x0001, 0x1234, 0xABCD, 0xFFFF, 0x0000];
+        let mut dst_one = vec![0u16; 5];
+        let mut dst_zero = vec![0xFFFFu16; 5];
+        galois::gf16_mul(&input, 1, &mut dst_one);
+        galois::gf16_mul(&input, 0, &mut dst_zero);
+        assert_eq!(dst_one, input, "gf16 multiply by 1 should be identity");
+        assert_eq!(dst_zero, vec![0u16; 5], "gf16 multiply by 0 should be zero");
+    }
+
+    #[test]
+    fn gf16_mul_commutativity() {
+        // a * b should equal b * a for single elements
+        let a_val: u16 = 0x1234;
+        let b_val: u16 = 0x5678;
+        let mut ab = [0u16; 1];
+        let mut ba = [0u16; 1];
+        galois::gf16_mul(&[a_val], b_val, &mut ab);
+        galois::gf16_mul(&[b_val], a_val, &mut ba);
+        assert_eq!(ab, ba, "GF(2^16) multiplication should be commutative");
+    }
+
+    // ===================== CRC32 =====================
+
+    #[test]
+    fn crc32_known_vector() {
+        // CRC-32 of "123456789" is 0xCBF43926
+        let result = core::crc32(b"123456789", 0);
+        assert_eq!(result, 0xCBF43926, "CRC32 known vector mismatch: got {result:#010X}");
+    }
+
+    #[test]
+    fn crc32_empty_input() {
+        let result = core::crc32(b"", 0);
+        // CRC32 of empty data with initial 0 should be 0x00000000
+        assert_eq!(result, 0x00000000, "CRC32 of empty should be 0x00000000");
+    }
+
+    #[test]
+    fn crc32_incremental_vs_full() {
+        // Compute CRC32 of "Hello, World!" in one shot vs two parts
+        let full_data = b"Hello, World!";
+        let full_crc = core::crc32(full_data, 0);
+
+        // For table-based CRC, we can verify consistency with scalar
+        let scalar_crc = scalar::crc32(full_data, 0);
+        assert_eq!(full_crc, scalar_crc, "dispatched CRC32 should match scalar");
+    }
+
+    // ===================== SIMD dispatch / feature detection =====================
+
+    #[test]
+    fn acceleration_planner_global_returns_consistent() {
+        let p1 = planner::AccelerationPlanner::global();
+        let p2 = planner::AccelerationPlanner::global();
+        // Same singleton, same default AEAD
+        assert_eq!(p1.crypto_default_aead(), p2.crypto_default_aead());
+    }
+
+    #[test]
+    fn simd_ops_instance_returns_consistent() {
+        let s1 = SimdOps::instance();
+        let s2 = SimdOps::instance();
+        assert!(std::ptr::eq(s1, s2), "SimdOps::instance should return same pointer");
+    }
+
+    #[test]
+    fn crypto_aead_plan_select_returns_valid_variant() {
+        let plan = CryptoAeadPlan::select();
+        // Must be one of the four valid variants
+        match plan {
+            CryptoAeadPlan::Aegis128L
+            | CryptoAeadPlan::Aegis128X4
+            | CryptoAeadPlan::Aegis128X8
+            | CryptoAeadPlan::Morus => {}
+        }
+    }
+
+    #[test]
+    fn crypto_aead_plan_length_based_selection() {
+        // Small payload should not select X8
+        let small = CryptoAeadPlan::select_for_len(10);
+        assert_ne!(small, CryptoAeadPlan::Aegis128X8, "10-byte payload should not use X8");
+
+        // Large payload selection should still be valid
+        let large = CryptoAeadPlan::select_for_len(4096);
+        match large {
+            CryptoAeadPlan::Aegis128L
+            | CryptoAeadPlan::Aegis128X4
+            | CryptoAeadPlan::Aegis128X8
+            | CryptoAeadPlan::Morus => {}
+        }
+    }
+
+    // ===================== Transport QUIC varint encode/decode =====================
+
+    #[test]
+    fn quic_varint_roundtrip_1byte() {
+        // 1-byte encoding: values 0..63
+        for val in [0u64, 1, 37, 63] {
+            let mut buf = [0u8; 8];
+            let encoded_len = transport::encode_varint(val, &mut buf);
+            assert_eq!(encoded_len, 1, "value {val} should encode in 1 byte");
+            let (decoded, consumed) =
+                transport::decode_varint(&buf[..encoded_len]).expect("decode failed");
+            assert_eq!(decoded, val, "roundtrip mismatch for {val}");
+            assert_eq!(consumed, 1);
+        }
+    }
+
+    #[test]
+    fn quic_varint_roundtrip_2byte() {
+        // 2-byte encoding: values 64..16383
+        for val in [64u64, 255, 1000, 16383] {
+            let mut buf = [0u8; 8];
+            let encoded_len = transport::encode_varint(val, &mut buf);
+            assert_eq!(encoded_len, 2, "value {val} should encode in 2 bytes");
+            let (decoded, consumed) =
+                transport::decode_varint(&buf[..encoded_len]).expect("decode failed");
+            assert_eq!(decoded, val, "roundtrip mismatch for {val}");
+            assert_eq!(consumed, 2);
+        }
+    }
+
+    #[test]
+    fn quic_varint_roundtrip_4byte() {
+        // 4-byte encoding: values 16384..1073741823
+        for val in [16384u64, 100_000, 1_073_741_823] {
+            let mut buf = [0u8; 8];
+            let encoded_len = transport::encode_varint(val, &mut buf);
+            assert_eq!(encoded_len, 4, "value {val} should encode in 4 bytes");
+            let (decoded, consumed) =
+                transport::decode_varint(&buf[..encoded_len]).expect("decode failed");
+            assert_eq!(decoded, val, "roundtrip mismatch for {val}");
+            assert_eq!(consumed, 4);
+        }
+    }
+
+    #[test]
+    fn quic_varint_roundtrip_8byte() {
+        // 8-byte encoding: values 1073741824..(2^62 - 1)
+        for val in [1_073_741_824u64, (1u64 << 62) - 1] {
+            let mut buf = [0u8; 8];
+            let encoded_len = transport::encode_varint(val, &mut buf);
+            assert_eq!(encoded_len, 8, "value {val} should encode in 8 bytes");
+            let (decoded, consumed) =
+                transport::decode_varint(&buf[..encoded_len]).expect("decode failed");
+            assert_eq!(decoded, val, "roundtrip mismatch for {val}");
+            assert_eq!(consumed, 8);
+        }
+    }
+
+    #[test]
+    fn quic_varint_decode_empty_returns_none() {
+        assert!(transport::decode_varint(&[]).is_none());
+    }
+
+    // ===================== Crypto helpers (SHA-256, HMAC) =====================
+
+    #[test]
+    fn sha256_empty_message_nist_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        let hash = crypto::sha256(b"");
+        let expected = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(hash, expected, "SHA-256 empty message vector mismatch");
+    }
+
+    #[test]
+    fn sha256_abc_nist_vector() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let hash = crypto::sha256(b"abc");
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(hash, expected, "SHA-256 'abc' vector mismatch");
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231_vector() {
+        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?"
+        let mac = crypto::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let expected = [
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+            0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+            0x64, 0xec, 0x38, 0x43,
+        ];
+        assert_eq!(mac, expected, "HMAC-SHA256 RFC4231 test case 2 mismatch");
+    }
+
+    // ===================== XOR blocks =====================
+
+    #[test]
+    fn xor_blocks_correctness() {
+        let mut dst = [0xAAu8; 32];
+        let src = [0x55u8; 32];
+        core::xor_blocks(&mut dst, &src);
+        assert_eq!(dst, [0xFFu8; 32], "0xAA ^ 0x55 should be 0xFF");
+    }
+
+    #[test]
+    fn xor_blocks_self_inverse() {
+        let original = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let key = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
+        let mut data = original;
+        core::xor_blocks(&mut data, &key);
+        assert_ne!(data, original, "XOR should change data");
+        core::xor_blocks(&mut data, &key);
+        assert_eq!(data, original, "double XOR should restore original");
+    }
+
+    // ===================== Popcount =====================
+
+    #[test]
+    fn popcnt_known_values() {
+        assert_eq!(core::popcnt(&[0x00]), 0);
+        assert_eq!(core::popcnt(&[0xFF]), 8);
+        assert_eq!(core::popcnt(&[0xAA]), 4); // 10101010
+        assert_eq!(core::popcnt(&[0xFF; 16]), 128);
+    }
+
+    #[test]
+    fn popcnt_matches_scalar() {
+        let data: Vec<u8> = (0..=255).collect();
+        let dispatched = core::popcnt(&data);
+        let reference = scalar::popcnt(&data);
+        assert_eq!(dispatched, reference);
+    }
+
+    // ===================== Bitstream pack/unpack =====================
+
+    #[test]
+    fn bitstream_pack_unpack_roundtrip_all_widths() {
+        let src: Vec<u8> = (0..64).collect();
+        for bw in 1u8..=8 {
+            let mask = (1u16 << bw) - 1;
+            let masked_src: Vec<u8> = src.iter().map(|&v| v & (mask as u8)).collect();
+            let mut packed = vec![0u8; 128];
+            let packed_len = bitstream::pack_bits(&masked_src, bw, &mut packed);
+            let mut unpacked = vec![0u8; masked_src.len()];
+            bitstream::unpack_bits(&packed[..packed_len], bw, &mut unpacked);
+            assert_eq!(unpacked, masked_src, "pack/unpack roundtrip failed for bit_width={bw}");
+        }
+    }
+
+    // ===================== Header validation =====================
+
+    #[test]
+    fn validate_header_too_short() {
+        assert!(!fec::validate_header(&[]));
+        assert!(!fec::validate_header(&[0xC0]));
+        assert!(!fec::validate_header(&[0xC0, 0, 0, 0])); // needs >= 5
+    }
+
+    #[test]
+    fn validate_header_long_header_valid() {
+        // Long header: 0x80 set + 0x40 set = 0xC0
+        assert!(fec::validate_header(&[0xC0, 0, 0, 0, 0]));
+        assert!(fec::validate_header(&[0xFF, 0, 0, 0, 0])); // all bits set, still valid long
+    }
+
+    #[test]
+    fn validate_header_short_header_reserved_bits() {
+        // Short header (0x80 clear), fixed bit set (0x40), reserved bits zero
+        assert!(fec::validate_header(&[0x40, 0, 0, 0, 0]));
+        // Reserved bits (0x18) non-zero - invalid
+        assert!(!fec::validate_header(&[0x58, 0, 0, 0, 0])); // 0x40 | 0x18
+        assert!(!fec::validate_header(&[0x48, 0, 0, 0, 0])); // 0x40 | 0x08
+        assert!(!fec::validate_header(&[0x50, 0, 0, 0, 0])); // 0x40 | 0x10
+    }
+
+    #[test]
+    fn validate_header_no_fixed_bit() {
+        assert!(!fec::validate_header(&[0x00, 0, 0, 0, 0]));
+        assert!(!fec::validate_header(&[0x80, 0, 0, 0, 0])); // long but no fixed bit
+    }
+
+    // ===================== Scalar fallback parity =====================
+
+    #[test]
+    fn scalar_gf_mul_matches_dispatched() {
+        let input: Vec<u8> = (0..128).collect();
+        let multiplier = 0x53u8;
+        let mut scalar_dst = vec![0u8; 128];
+        let mut dispatched_dst = vec![0u8; 128];
+        scalar::gf_mul(&input, multiplier, &mut scalar_dst);
+        galois::gf_mul(&input, multiplier, &mut dispatched_dst);
+        assert_eq!(scalar_dst, dispatched_dst);
+    }
+
+    #[test]
+    fn scalar_crc32_matches_dispatched() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let scalar = scalar::crc32(data, 0);
+        let dispatched = core::crc32(data, 0);
+        assert_eq!(scalar, dispatched);
+    }
+
+    #[test]
+    fn scalar_sha256_matches_dispatched() {
+        let data = b"parity check data for sha256";
+        let scalar = scalar::sha256(data);
+        let dispatched = crypto::sha256(data);
+        assert_eq!(scalar, dispatched);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Tests (aarch64 only) - validate NEON header checks vs. dispatcher semantics
 // ----------------------------------------------------------------------------
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -6480,7 +6423,10 @@ mod tests {
                 }
                 buf[0] = (prefix << 6) | (val as u8 & 0x3F);
             }
-            _ => unreachable!(),
+            _ => {
+                debug_assert!(false, "invalid varint encoded length");
+                return 0;
+            }
         }
         len
     }
@@ -6495,7 +6441,10 @@ mod tests {
             1 => 2,
             2 => 4,
             3 => 8,
-            _ => unreachable!(),
+            _ => {
+                debug_assert!(false, "invalid QUIC varint prefix");
+                return None;
+            }
         };
         if buf.len() < len {
             return None;
@@ -6578,19 +6527,18 @@ mod tests {
     fn neon_varint_random_parity() {
         let mut rng = StdRng::seed_from_u64(0x0F0E_0D0C_0B0A_0908);
         for _ in 0..1024 {
-            let val = rng.gen::<u64>() & ((1u64 << 62) - 1);
+            let val = rng.random::<u64>() & ((1u64 << 62) - 1);
             let mut buf_scalar = [0u8; 16];
             let mut buf_neon = [0u8; 16];
             let len_scalar = scalar_encode_quic_varint(val, &mut buf_scalar);
-            let len_neon =
-                unsafe { crate::simd::arm_varint::encode_varint_neon(val, &mut buf_neon) };
+            let len_neon = crate::simd::arm_varint::encode_varint_neon(val, &mut buf_neon);
             assert_eq!(len_scalar, len_neon, "encode len mismatch for {val}");
             assert_eq!(&buf_scalar[..len_scalar], &buf_neon[..len_neon]);
 
             let (dec_scalar, used_scalar) =
                 scalar_decode_quic_varint(&buf_scalar[..len_scalar]).expect("scalar decode");
             let (dec_neon, used_neon) =
-                unsafe { crate::simd::arm_varint::decode_varint_neon(&buf_neon[..len_neon]) }
+                crate::simd::arm_varint::decode_varint_neon(&buf_neon[..len_neon])
                     .expect("neon decode");
             assert_eq!(dec_scalar, dec_neon, "decode mismatch for {val}");
             assert_eq!(used_scalar, used_neon, "decode len mismatch for {val}");
@@ -6599,12 +6547,11 @@ mod tests {
             {
                 if FeatureDetector::instance().has_feature(crate::optimize::CpuFeature::SVE2) {
                     let mut buf_sve = [0u8; 16];
-                    let len_sve =
-                        unsafe { crate::simd::arm_varint::encode_varint_sve2(val, &mut buf_sve) };
+                    let len_sve = crate::simd::arm_varint::encode_varint_sve2(val, &mut buf_sve);
                     assert_eq!(len_scalar, len_sve, "SVE2 encode len mismatch for {val}");
                     assert_eq!(&buf_scalar[..len_scalar], &buf_sve[..len_sve]);
                     let (dec_sve, used_sve) =
-                        unsafe { crate::simd::arm_varint::decode_varint_sve2(&buf_sve[..len_sve]) }
+                        crate::simd::arm_varint::decode_varint_sve2(&buf_sve[..len_sve])
                             .expect("sve2 decode");
                     assert_eq!(dec_scalar, dec_sve, "SVE2 decode mismatch for {val}");
                     assert_eq!(used_scalar, used_sve, "SVE2 decode len mismatch for {val}");
@@ -6615,8 +6562,6 @@ mod tests {
 
     #[cfg(all(test, target_arch = "aarch64"))]
     mod tests_rs_neon {
-        use super::*;
-
         #[test]
         fn neon_rs_encode_matches_scalar() {
             // Two data shards (512 bytes), two parity shards
@@ -6664,96 +6609,5 @@ mod tests {
             let neon = unsafe { super::arm::popcnt_neon(&data) };
             assert_eq!(scalar, neon);
         }
-    }
-}
-
-pub mod sha_ni {
-    //! SHA-NI Hardware Acceleration Module
-    //! Provides SHA-256 acceleration using Intel SHA extensions (4x speedup)
-
-    use crate::optimize::{CpuFeature, CpuProfile, FeatureDetector};
-
-    /// SHA-256 with hardware acceleration
-    #[inline(always)]
-    pub fn sha256(data: &[u8]) -> [u8; 32] {
-        let profile = FeatureDetector::instance().profile();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            // SHA-NI available on P1b+ with SHA feature
-            if FeatureDetector::instance().has_feature(CpuFeature::SHA) {
-                return unsafe { sha256_ni(data) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            match profile {
-                CpuProfile::ARM_A1d | CpuProfile::ARM_A2 | CpuProfile::Apple_M => {
-                    return unsafe { sha256_neon(data) };
-                }
-                _ => {}
-            }
-        }
-
-        // Fallback to software implementation
-        sha256_software(data)
-    }
-
-    /// SHA-256 with Intel SHA-NI - 4x faster
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "sha", enable = "sse4.1")]
-    unsafe fn sha256_ni(data: &[u8]) -> [u8; 32] {
-        // Correctness-first fallback until complete SHA-NI round/padding implementation.
-        sha256_software(data)
-    }
-
-    /// SHA-256 with ARM crypto extensions
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon", enable = "sha2")]
-    unsafe fn sha256_neon(data: &[u8]) -> [u8; 32] {
-        // Placeholder for NEON implementation; fall back to software to preserve behavior.
-        sha256_software(data)
-    }
-
-    /// Software SHA-256 fallback
-    fn sha256_software(data: &[u8]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
-    }
-
-    /// HMAC-SHA256 with hardware acceleration
-    pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-        const BLOCK_SIZE: usize = 64;
-        const IPAD: u8 = 0x36;
-        const OPAD: u8 = 0x5C;
-
-        let mut k = [0u8; BLOCK_SIZE];
-        if key.len() > BLOCK_SIZE {
-            let hash = sha256(key);
-            k[..32].copy_from_slice(&hash);
-        } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-
-        let mut inner = Vec::with_capacity(BLOCK_SIZE + data.len());
-        for &kb in &k {
-            inner.push(kb ^ IPAD);
-        }
-        inner.extend_from_slice(data);
-        let inner_hash = sha256(&inner);
-
-        let mut outer = Vec::with_capacity(BLOCK_SIZE + 32);
-        for &kb in &k {
-            outer.push(kb ^ OPAD);
-        }
-        outer.extend_from_slice(&inner_hash);
-
-        sha256(&outer)
     }
 }

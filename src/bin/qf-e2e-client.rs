@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !checked_token {
                         let (hdr, _) = quicfuscate::transport::packet::parse_header(&out[..len], 0)
                             .map_err(|e| format!("parse header failed: {e:?}"))?;
-                        if hdr.ty == quicfuscate::transport::packet::PacketType::Initial {
+                        if hdr.ty == quicfuscate::transport::PacketType::Initial {
                             let got = hdr.token.unwrap_or_default();
                             if got.as_slice() != qkey_id.as_bytes() {
                                 return Err("initial token mismatch".into());

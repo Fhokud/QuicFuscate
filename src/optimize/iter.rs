@@ -624,3 +624,130 @@ unsafe fn sum_u64_sve2(data: &[u64]) -> u128 {
 fn sum_u64_rvv(data: &[u64]) -> u128 {
     scalar_sum_u64(data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- sum_f32 ----
+
+    #[test]
+    fn test_sum_f32_empty() {
+        assert_eq!(sum_f32(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_sum_f32_single() {
+        assert!((sum_f32(&[42.5]) - 42.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_sum_f32_power_of_two_length() {
+        // 16 elements - aligns with AVX512/NEON chunk boundaries
+        let data: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+        let result = sum_f32(&data);
+        let expected: f32 = (1..=16).map(|i| i as f32).sum();
+        assert!((result - expected).abs() < 0.01, "got {result}, expected {expected}");
+    }
+
+    #[test]
+    fn test_sum_f32_non_aligned_length() {
+        // 19 elements - not a multiple of any SIMD lane width
+        let data: Vec<f32> = (1..=19).map(|i| i as f32).collect();
+        let result = sum_f32(&data);
+        let expected: f32 = (1..=19).map(|i| i as f32).sum();
+        assert!((result - expected).abs() < 0.01, "got {result}, expected {expected}");
+    }
+
+    #[test]
+    fn test_sum_f32_negative_values() {
+        let data = [-1.0f32, -2.0, -3.0, 4.0, 5.0];
+        let result = sum_f32(&data);
+        assert!((result - 3.0).abs() < f32::EPSILON);
+    }
+
+    // ---- sum_u32 ----
+
+    #[test]
+    fn test_sum_u32_empty() {
+        assert_eq!(sum_u32(&[]), 0);
+    }
+
+    #[test]
+    fn test_sum_u32_single() {
+        assert_eq!(sum_u32(&[999]), 999);
+    }
+
+    #[test]
+    fn test_sum_u32_large_values_no_overflow() {
+        // u32::MAX * 4 would overflow u32 but fits in u64
+        let data = [u32::MAX; 4];
+        let result = sum_u32(&data);
+        assert_eq!(result, u32::MAX as u64 * 4);
+    }
+
+    #[test]
+    fn test_sum_u32_power_of_two_length() {
+        let data: Vec<u32> = (1..=16).collect();
+        assert_eq!(sum_u32(&data), (1u64 + 16) * 16 / 2);
+    }
+
+    #[test]
+    fn test_sum_u32_non_aligned_length() {
+        let data: Vec<u32> = (1..=17).collect();
+        assert_eq!(sum_u32(&data), (1u64 + 17) * 17 / 2);
+    }
+
+    // ---- sum_u64 ----
+
+    #[test]
+    fn test_sum_u64_empty() {
+        assert_eq!(sum_u64(&[]), 0);
+    }
+
+    #[test]
+    fn test_sum_u64_single() {
+        assert_eq!(sum_u64(&[u64::MAX]), u64::MAX as u128);
+    }
+
+    #[test]
+    fn test_sum_u64_large_values_no_overflow() {
+        // u64::MAX * 3 overflows u64 but fits in u128
+        let data = [u64::MAX; 3];
+        let result = sum_u64(&data);
+        assert_eq!(result, u64::MAX as u128 * 3);
+    }
+
+    #[test]
+    fn test_sum_u64_non_aligned_length() {
+        let data: Vec<u64> = (1..=7).collect();
+        let result = sum_u64(&data);
+        assert_eq!(result, (1u128 + 7) * 7 / 2);
+    }
+
+    // ---- scalar fallbacks ----
+
+    #[test]
+    fn test_scalar_sum_f32_matches_iter() {
+        let data: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+        let result = scalar_sum_f32(&data);
+        let expected: f32 = data.iter().copied().sum();
+        assert!((result - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_scalar_sum_u32_matches_fold() {
+        let data: Vec<u32> = (0..100).collect();
+        let result = scalar_sum_u32(&data);
+        let expected = data.iter().fold(0u64, |acc, &v| acc + v as u64);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_scalar_sum_u64_matches_fold() {
+        let data: Vec<u64> = (0..50).map(|i| i * 1_000_000).collect();
+        let result = scalar_sum_u64(&data);
+        let expected = data.iter().fold(0u128, |acc, &v| acc + v as u128);
+        assert_eq!(result, expected);
+    }
+}

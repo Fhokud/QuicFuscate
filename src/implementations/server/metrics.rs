@@ -13,6 +13,7 @@ pub struct Metrics {
     // Connection metrics
     pub clients_active: AtomicU64,
     pub clients_total: AtomicU64,
+    pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
 
     // Traffic metrics
@@ -44,6 +45,7 @@ impl Metrics {
         Self {
             clients_active: AtomicU64::new(0),
             clients_total: AtomicU64::new(0),
+            connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
@@ -63,6 +65,42 @@ impl Metrics {
     /// Get uptime in seconds.
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
+    }
+
+    pub fn record_connection_accepted(&self) {
+        self.clients_total.fetch_add(1, Ordering::Relaxed);
+        self.connections_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_connection_rejected(&self) {
+        self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+        crate::instrumentation::global().server.connection_rejected();
+    }
+
+    pub fn record_auth_failure(&self) {
+        self.auth_failed.fetch_add(1, Ordering::Relaxed);
+        crate::instrumentation::global().server.auth_failure();
+    }
+
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+        crate::instrumentation::global().server.rate_limit_hit();
+    }
+
+    pub fn record_ingress_datagram(&self, bytes: usize) {
+        self.bytes_in.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.packets_in.fetch_add(1, Ordering::Relaxed);
+        let global = crate::instrumentation::global();
+        global.transport.record_bytes_in(bytes as u64);
+        global.transport.record_packet_in();
+    }
+
+    pub fn record_egress_datagram(&self, bytes: usize) {
+        self.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.packets_out.fetch_add(1, Ordering::Relaxed);
+        let global = crate::instrumentation::global();
+        global.transport.record_bytes_out(bytes as u64);
+        global.transport.record_packet_out();
     }
 
     /// Export as Prometheus text format.
@@ -91,6 +129,13 @@ impl Metrics {
         out.push_str(&format!(
             "quicfuscate_clients_total {}\n\n",
             self.clients_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP quicfuscate_connections_accepted Accepted connections\n");
+        out.push_str("# TYPE quicfuscate_connections_accepted counter\n");
+        out.push_str(&format!(
+            "quicfuscate_connections_accepted {}\n\n",
+            self.connections_accepted.load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP quicfuscate_connections_rejected Rejected connections\n");
@@ -174,7 +219,7 @@ impl Metrics {
             self.auth_failed.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP quicfuscate_rate_limited_total Rate limited connections\n");
+        out.push_str("# HELP quicfuscate_rate_limited_total Rate-limited events\n");
         out.push_str("# TYPE quicfuscate_rate_limited_total counter\n");
         out.push_str(&format!(
             "quicfuscate_rate_limited_total {}\n",
@@ -239,7 +284,10 @@ impl MetricsServer {
             {
                 Ok(Ok((mut socket, _addr))) => {
                     let mut buf = [0u8; 1024];
-                    let _ = socket.read(&mut buf).await;
+                    if let Err(e) = socket.read(&mut buf).await {
+                        log::debug!("Metrics request read failed: {}", e);
+                        continue;
+                    }
 
                     let request = String::from_utf8_lossy(&buf);
 
@@ -273,7 +321,9 @@ impl MetricsServer {
                             .to_string()
                     };
 
-                    let _ = socket.write_all(response.as_bytes()).await;
+                    if let Err(e) = socket.write_all(response.as_bytes()).await {
+                        log::debug!("Metrics response write failed: {}", e);
+                    }
                 }
                 Ok(Err(e)) => {
                     log::warn!("Metrics server accept error: {}", e);
@@ -292,11 +342,13 @@ impl MetricsServer {
 /// Metrics HTTP server using global instrumentation.
 ///
 /// This server reads from the global metrics registry at `crate::instrumentation::global()`.
+#[cfg(any(test, feature = "rust-tests"))]
 pub struct GlobalMetricsServer {
     addr: std::net::SocketAddr,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(any(test, feature = "rust-tests"))]
 impl GlobalMetricsServer {
     /// Create a new global metrics server.
     pub fn new(port: u16) -> Self {
@@ -327,7 +379,10 @@ impl GlobalMetricsServer {
             {
                 Ok(Ok((mut socket, _addr))) => {
                     let mut buf = [0u8; 1024];
-                    let _ = socket.read(&mut buf).await;
+                    if let Err(e) = socket.read(&mut buf).await {
+                        log::debug!("Global metrics request read failed: {}", e);
+                        continue;
+                    }
 
                     let request = String::from_utf8_lossy(&buf);
                     let global = crate::instrumentation::global();
@@ -362,7 +417,9 @@ impl GlobalMetricsServer {
                             .to_string()
                     };
 
-                    let _ = socket.write_all(response.as_bytes()).await;
+                    if let Err(e) = socket.write_all(response.as_bytes()).await {
+                        log::debug!("Global metrics response write failed: {}", e);
+                    }
                 }
                 Ok(Err(e)) => {
                     log::warn!("Global metrics server accept error: {}", e);
@@ -385,12 +442,16 @@ mod tests {
     #[test]
     fn test_metrics_export() {
         let metrics = Metrics::new();
+        metrics.record_connection_accepted();
+        metrics.record_connection_rejected();
+        metrics.record_ingress_datagram(1_000_000);
         metrics.clients_active.store(42, Ordering::Relaxed);
-        metrics.bytes_in.store(1_000_000, Ordering::Relaxed);
 
         let output = metrics.export();
         assert!(output.contains("quicfuscate_up 1"));
         assert!(output.contains("quicfuscate_clients_active 42"));
+        assert!(output.contains("quicfuscate_connections_accepted 1"));
+        assert!(output.contains("quicfuscate_connections_rejected 1"));
         assert!(output.contains("quicfuscate_bytes_in_total 1000000"));
     }
 
@@ -402,5 +463,32 @@ mod tests {
         let output = metrics.export_health();
         assert!(output.contains("\"status\":\"ok\""));
         assert!(output.contains("\"clients\":10"));
+    }
+
+    #[test]
+    fn test_metrics_mirror_global_instrumentation_for_runtime_events() {
+        let global = crate::instrumentation::global();
+        let rejected_before = global.server.connections_rejected.load(Ordering::Relaxed);
+        let auth_failed_before = global.server.auth_failed.load(Ordering::Relaxed);
+        let rate_limited_before = global.server.rate_limited.load(Ordering::Relaxed);
+        let bytes_in_before = global.transport.bytes_in.load(Ordering::Relaxed);
+        let bytes_out_before = global.transport.bytes_out.load(Ordering::Relaxed);
+        let packets_in_before = global.transport.packets_in.load(Ordering::Relaxed);
+        let packets_out_before = global.transport.packets_out.load(Ordering::Relaxed);
+
+        let metrics = Metrics::new();
+        metrics.record_connection_rejected();
+        metrics.record_auth_failure();
+        metrics.record_rate_limited();
+        metrics.record_ingress_datagram(321);
+        metrics.record_egress_datagram(654);
+
+        assert!(global.server.connections_rejected.load(Ordering::Relaxed) > rejected_before);
+        assert!(global.server.auth_failed.load(Ordering::Relaxed) > auth_failed_before);
+        assert!(global.server.rate_limited.load(Ordering::Relaxed) > rate_limited_before);
+        assert!(global.transport.bytes_in.load(Ordering::Relaxed) >= bytes_in_before + 321);
+        assert!(global.transport.bytes_out.load(Ordering::Relaxed) >= bytes_out_before + 654);
+        assert!(global.transport.packets_in.load(Ordering::Relaxed) > packets_in_before);
+        assert!(global.transport.packets_out.load(Ordering::Relaxed) > packets_out_before);
     }
 }

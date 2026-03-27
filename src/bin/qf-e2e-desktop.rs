@@ -51,7 +51,9 @@ fn parse_args() -> Result<(String, u64, u64, bool), String> {
 fn map_stealth_mode(value: &str) -> StealthMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "off" => StealthMode::Off,
-        "max" | "anti-dpi" | "antidpi" => StealthMode::Max,
+        "performance" => StealthMode::Performance,
+        "stealth" => StealthMode::Stealth,
+        "anti-dpi" | "antidpi" | "max" => StealthMode::AntiDpi,
         "manual" => StealthMode::Manual,
         _ => StealthMode::Auto,
     }
@@ -60,7 +62,6 @@ fn map_stealth_mode(value: &str) -> StealthMode {
 fn map_fec_mode(value: &str) -> FecMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "off" => FecMode::Off,
-        "manual" => FecMode::Manual,
         _ => FecMode::Auto,
     }
 }

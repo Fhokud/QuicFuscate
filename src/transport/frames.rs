@@ -1,5 +1,6 @@
 use crate::error::ConnectionError;
 use crate::transport::varint::{read_varint, varint_len, write_varint, write_varint_with_len};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 const MAX_FRAME_DATA_LEN: usize = 64 * 1024;
@@ -16,14 +17,8 @@ fn check_frame_len(len: usize, remaining: usize) -> Result<(), ConnectionError> 
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
-#[allow(unused_imports)]
-use std::arch::aarch64::*;
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
 #[inline(always)]
-pub fn wire_len(frame: &crate::transport::Frame) -> usize {
+pub fn wire_len(frame: &crate::transport::Frame<'_>) -> usize {
     use crate::transport::Frame as F;
     match frame {
         F::Padding { len } => *len,
@@ -98,7 +93,10 @@ pub fn wire_len(frame: &crate::transport::Frame) -> usize {
 }
 
 #[inline(always)]
-pub fn to_bytes(frame: &crate::transport::Frame, out: &mut [u8]) -> Result<usize, ConnectionError> {
+pub fn to_bytes(
+    frame: &crate::transport::Frame<'_>,
+    out: &mut [u8],
+) -> Result<usize, ConnectionError> {
     use crate::transport::Frame as F;
     let mut off = 0usize;
     let need = wire_len(frame);
@@ -176,12 +174,8 @@ pub fn to_bytes(frame: &crate::transport::Frame, out: &mut [u8]) -> Result<usize
             off += write_varint(*stream_id, &mut out[off..])?;
             off += write_varint(*offset, &mut out[off..])?;
             off += write_varint_with_len(data.len() as u64, 2, &mut out[off..])?;
-            // SIMD memcpy fast-path
             if out.len() >= off + data.len() {
-                #[allow(unused_unsafe)]
-                {
-                    crate::simd::core::memcpy_fast(&mut out[off..off + data.len()], data);
-                }
+                out[off..off + data.len()].copy_from_slice(data);
                 off += data.len();
             } else {
                 return Err(ConnectionError::BufferTooShort);
@@ -294,7 +288,7 @@ pub fn to_bytes(frame: &crate::transport::Frame, out: &mut [u8]) -> Result<usize
 
 /// Batch encode multiple frames with SIMD optimization
 pub fn batch_encode_frames(
-    frames: &[crate::transport::Frame],
+    frames: &[crate::transport::Frame<'_>],
     out: &mut [u8],
     pool: Arc<crate::optimize::MemoryPool>,
 ) -> Result<Vec<usize>, ConnectionError> {
@@ -345,7 +339,6 @@ fn canonical_ack_blocks(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         if ranges.len() >= 4
             && crate::simd::FeatureDetector::instance().has_feature(crate::simd::CpuFeature::SVE2)
         {
-            #[cfg(target_feature = "sve2")]
             unsafe {
                 return canonical_ack_blocks_sve2(ranges);
             }
@@ -378,7 +371,6 @@ fn canonical_ack_blocks_scalar(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(target_feature = "sve2"), allow(dead_code))]
 unsafe fn canonical_ack_blocks_sve2(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     #[cfg(target_feature = "sve2")]
     {
@@ -518,10 +510,10 @@ impl<'a> Cursor<'a> {
 }
 
 #[inline(always)]
-pub fn from_bytes(
-    input: &[u8],
+pub fn from_bytes<'a>(
+    input: &'a [u8],
     pkt: crate::transport::PacketType,
-) -> Result<(crate::transport::Frame, usize), ConnectionError> {
+) -> Result<(crate::transport::Frame<'a>, usize), ConnectionError> {
     use crate::transport::{Frame as F, PacketType as PT};
     let mut c = Cursor::new(input);
     let ty = c.get_varint()?;
@@ -567,12 +559,15 @@ pub fn from_bytes(
                 ranges.push((smallest_ack, largest_plus_one));
             }
             ranges.sort_by_key(|r| r.0);
-            if ty == 0x03 {
-                let _ect0 = c.get_varint()?;
-                let _ect1 = c.get_varint()?;
-                let _ce = c.get_varint()?;
-            }
-            F::Ack { ack_delay, ranges, ecn_counts: None }
+            let ecn_counts = if ty == 0x03 {
+                let ect0 = c.get_varint()?;
+                let ect1 = c.get_varint()?;
+                let ce = c.get_varint()?;
+                Some(crate::transport::EcnCounts { ect0, ect1, ce })
+            } else {
+                None
+            };
+            F::Ack { ack_delay, ranges, ecn_counts }
         }
         0x04 => {
             let stream_id = c.get_varint()?;
@@ -589,13 +584,13 @@ pub fn from_bytes(
             let offset = c.get_varint()?;
             let len = c.get_varint()? as usize;
             check_frame_len(len, c.remaining())?;
-            let data = c.get_bytes(len)?.to_vec();
+            let data = Cow::Borrowed(c.get_bytes(len)?);
             F::Crypto { offset, data }
         }
         0x07 => {
             let len = c.get_varint()? as usize;
             check_frame_len(len, c.remaining())?;
-            let token = c.get_bytes(len)?.to_vec();
+            let token = Cow::Borrowed(c.get_bytes(len)?);
             F::NewToken { token }
         }
         ty if (ty & 0xf8) == 0x08 => {
@@ -613,9 +608,7 @@ pub fn from_bytes(
                         c.off += used;
                         // Daten kopieren (LEN-Bit erwartet aktiv in diesem Projekt)
                         check_frame_len(dlen, c.remaining())?;
-                        let bytes = c.get_bytes(dlen)?;
-                        let mut data = vec![0u8; dlen];
-                        crate::simd::core::memcpy_fast(&mut data[..], bytes);
+                        let data = Cow::Borrowed(c.get_bytes(dlen)?);
                         Some(crate::transport::Frame::Stream {
                             stream_id: sid,
                             offset: offv,
@@ -631,7 +624,7 @@ pub fn from_bytes(
             };
 
             #[cfg(not(target_arch = "aarch64"))]
-            let parsed: Option<crate::transport::Frame> = None;
+            let parsed: Option<crate::transport::Frame<'_>> = None;
 
             if let Some(f) = parsed {
                 f
@@ -642,13 +635,13 @@ pub fn from_bytes(
                 if ty & 0x04 != 0 {
                     offset = c.get_varint()?;
                 }
-                let mut data = Vec::new();
-                if ty & 0x02 != 0 {
+                let data = if ty & 0x02 != 0 {
                     let len = c.get_varint()? as usize;
                     check_frame_len(len, c.remaining())?;
-                    let bytes = c.get_bytes(len)?;
-                    data.extend_from_slice(bytes);
-                }
+                    Cow::Borrowed(c.get_bytes(len)?)
+                } else {
+                    Cow::Borrowed(&[] as &[u8])
+                };
                 let fin = (ty & 0x01) != 0;
                 F::Stream { stream_id, offset, data, fin }
             }
@@ -691,7 +684,7 @@ pub fn from_bytes(
             let seq_num = c.get_varint()?;
             let retire_prior_to = c.get_varint()?;
             let cid_len = c.get_u8()? as usize;
-            let conn_id = c.get_bytes(cid_len)?.to_vec();
+            let conn_id = Cow::Borrowed(c.get_bytes(cid_len)?);
             let tok_bytes = c.get_bytes(16)?;
             let mut token_arr = [0u8; 16];
             token_arr.copy_from_slice(tok_bytes);
@@ -714,23 +707,195 @@ pub fn from_bytes(
             let frame_type = c.get_varint()?;
             let len = c.get_varint()? as usize;
             check_frame_len(len, c.remaining())?;
-            let reason = c.get_bytes(len)?.to_vec();
+            let reason = Cow::Borrowed(c.get_bytes(len)?);
             F::ConnectionClose { error_code, frame_type, reason }
         }
         0x1d => {
             let error_code = c.get_varint()?;
             let len = c.get_varint()? as usize;
             check_frame_len(len, c.remaining())?;
-            let reason = c.get_bytes(len)?.to_vec();
+            let reason = Cow::Borrowed(c.get_bytes(len)?);
             F::ApplicationClose { error_code, reason }
         }
         0x31 => {
             let len = c.get_varint()? as usize;
             check_frame_len(len, c.remaining())?;
-            let data = c.get_bytes(len)?.to_vec();
+            let data = Cow::Borrowed(c.get_bytes(len)?);
             F::Datagram { data }
         }
         _ => return Err(ConnectionError::InvalidFrame),
     };
     Ok((frame, c.off))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{Frame, PacketType};
+    use std::borrow::Cow;
+
+    #[test]
+    fn test_wire_len_padding() {
+        let frame = Frame::Padding { len: 42 };
+        assert_eq!(wire_len(&frame), 42);
+
+        let frame_zero = Frame::Padding { len: 0 };
+        assert_eq!(wire_len(&frame_zero), 0);
+
+        let frame_large = Frame::Padding { len: 1024 };
+        assert_eq!(wire_len(&frame_large), 1024);
+    }
+
+    #[test]
+    fn test_wire_len_ping() {
+        let frame = Frame::Ping { mtu_probe: None };
+        assert_eq!(wire_len(&frame), 1);
+
+        let frame_probe = Frame::Ping { mtu_probe: Some(1200) };
+        assert_eq!(wire_len(&frame_probe), 1);
+    }
+
+    #[test]
+    fn test_roundtrip_ping() {
+        let frame = Frame::Ping { mtu_probe: None };
+        let mut buf = [0u8; 64];
+        let written = to_bytes(&frame, &mut buf).expect("to_bytes ping");
+        assert_eq!(written, 1);
+
+        let (decoded, consumed) = from_bytes(&buf[..written], PacketType::Short)
+            .expect("from_bytes ping");
+        assert_eq!(consumed, written);
+        assert!(matches!(decoded, Frame::Ping { .. }));
+    }
+
+    #[test]
+    fn test_roundtrip_padding() {
+        let frame = Frame::Padding { len: 10 };
+        let mut buf = [0u8; 64];
+        let written = to_bytes(&frame, &mut buf).expect("to_bytes padding");
+        assert_eq!(written, 10);
+        // All bytes should be zero
+        assert!(buf[..written].iter().all(|&b| b == 0));
+
+        let (decoded, consumed) = from_bytes(&buf[..written], PacketType::Short)
+            .expect("from_bytes padding");
+        assert_eq!(consumed, written);
+        match decoded {
+            Frame::Padding { len } => assert_eq!(len, 10),
+            other => panic!("expected Padding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_ack_simple() {
+        // Single range: packets 10..15 (exclusive end = 15)
+        let frame = Frame::Ack {
+            ack_delay: 100,
+            ranges: vec![(10, 15)],
+            ecn_counts: None,
+        };
+        let wlen = wire_len(&frame);
+        assert!(wlen > 0);
+
+        let mut buf = vec![0u8; 256];
+        let written = to_bytes(&frame, &mut buf).expect("to_bytes ack");
+        assert_eq!(written, wlen);
+
+        let (decoded, consumed) = from_bytes(&buf[..written], PacketType::Short)
+            .expect("from_bytes ack");
+        assert_eq!(consumed, written);
+        match decoded {
+            Frame::Ack { ack_delay, ranges, ecn_counts } => {
+                assert_eq!(ack_delay, 100);
+                assert!(ecn_counts.is_none());
+                // The decoded ranges should cover the same packet numbers.
+                // Original range (10, 15) means packets 10..14 (largest = end-1 = 14).
+                // Decoded produces (smallest, largest+1) after from_bytes logic.
+                assert!(!ranges.is_empty());
+                let (start, end) = ranges[0];
+                assert_eq!(start, 10);
+                assert_eq!(end, 15);
+            }
+            other => panic!("expected Ack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_stream_frame() {
+        let payload = b"hello world";
+        let frame = Frame::Stream {
+            stream_id: 4,
+            offset: 0,
+            data: Cow::Owned(payload.to_vec()),
+            fin: false,
+        };
+        let wlen = wire_len(&frame);
+        assert!(wlen > 0);
+
+        let mut buf = vec![0u8; 256];
+        let written = to_bytes(&frame, &mut buf).expect("to_bytes stream");
+        assert_eq!(written, wlen);
+
+        let (decoded, consumed) = from_bytes(&buf[..written], PacketType::Short)
+            .expect("from_bytes stream");
+        assert_eq!(consumed, written);
+        match decoded {
+            Frame::Stream { stream_id, offset, data, fin } => {
+                assert_eq!(stream_id, 4);
+                assert_eq!(offset, 0);
+                assert_eq!(data.as_ref(), payload);
+                assert!(!fin);
+            }
+            other => panic!("expected Stream, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_bytes_buffer_too_short() {
+        let frame = Frame::Ping { mtu_probe: None };
+        let mut buf = [0u8; 0]; // empty buffer
+        let result = to_bytes(&frame, &mut buf);
+        assert!(result.is_err());
+
+        let stream_frame = Frame::Stream {
+            stream_id: 4,
+            offset: 0,
+            data: Cow::Owned(vec![1, 2, 3, 4, 5]),
+            fin: false,
+        };
+        let mut tiny = [0u8; 2]; // too small for stream frame
+        let result = to_bytes(&stream_frame, &mut tiny);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_canonical_ack_blocks_empty() {
+        let result = canonical_ack_blocks_scalar(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_canonical_ack_blocks_single() {
+        let result = canonical_ack_blocks_scalar(&[(5, 10)]);
+        assert_eq!(result, vec![(5, 10)]);
+    }
+
+    #[test]
+    fn test_canonical_ack_blocks_overlapping() {
+        // Two overlapping ranges should merge
+        let result = canonical_ack_blocks_scalar(&[(5, 10), (8, 15)]);
+        assert_eq!(result, vec![(5, 15)]);
+
+        // Three ranges: two overlap, one disjoint
+        let result2 = canonical_ack_blocks_scalar(&[(1, 5), (3, 8), (20, 25)]);
+        assert_eq!(result2, vec![(1, 8), (20, 25)]);
+
+        // Adjacent ranges that touch (end == start of next) should merge
+        let result3 = canonical_ack_blocks_scalar(&[(1, 5), (5, 10)]);
+        assert_eq!(result3, vec![(1, 10)]);
+
+        // Non-overlapping ranges stay separate
+        let result4 = canonical_ack_blocks_scalar(&[(1, 3), (10, 15), (20, 25)]);
+        assert_eq!(result4, vec![(1, 3), (10, 15), (20, 25)]);
+    }
 }

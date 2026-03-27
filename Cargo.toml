@@ -3,45 +3,45 @@ members = [
     ".",
 ]
 exclude = [
-    "apps/desktop/src-tauri",
+    "apps/tauri/src-tauri",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["QuicFuscate Team"]
 license = "MIT"
+license-file = "docs/LICENSE"
 
 [package]
 name = "quicfuscate"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.93"
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-softaes = "0.1.3"
 aligned_box = "0.2"
 rustls = { version = "0.23", features = ["ring", "tls12", "logging", "std"] }
 rustls-native-certs = "0.8"
 rcgen = { version = "0.13", optional = true }
 webpki-roots = "0.26"
-morus = "0.1.3"
-aead = { version = "0.6.0-rc.1", features = ["alloc"], optional = true }
-rand = "0.8"
+rand = "0.9"
 fastrand = "2"
 log = "0.4"
 env_logger = "0.11.3"
 url = "2.5.0"
-crossbeam-utils = "0.8"
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["full"] }
-lazy_static = "1.4.0"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 cpufeatures = "0.2"
@@ -60,54 +60,76 @@ base64 = "0.21"
 clap = { version = "4.5", features = ["derive"] }
 argon2 = "0.5"
 password-hash = "0.5"
-md5 = "0.7"
-thiserror = "1"
 smallvec = "1.13"
 zeroize = "1.8"
 zstd = "0.13"
 zstd-sys = { version = "2.0.16", optional = true }
+hex = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 proptest = "1.6"
-hex = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
-default = ["client", "server"]
+default = ["client", "server", "rate_limiter"]
+
+# --- Role features ---
 client = []
 server = ["rcgen"]
-rust-tests = []
+
+# --- CPU / SIMD features ---
 aes = []
-aggressive_inline = []
-amx-int8 = []
-amx-tile = []
-avx10_preview = []
 avx2 = []
 avx512f = []
 avx512vbmi2 = []
-benches = []
-compression_zstd_ffi = ["dep:zstd-sys"]
-crc = []
-dev-certs = ["rcgen"]
 fma = []
 gfni = []
-masque-tests = []
 neon = []
+sse2 = []
+sve2 = []
+vaes = []
+
+# --- Runtime / transport features ---
+io_uring = ["dep:io-uring"]
+aggressive_inline = []
+compression_zstd_ffi = ["dep:zstd-sys"]
+crc = []
 orchestrator = []
 prefetch = []
 rate_limiter = []
-simd-selfcheck = []
-sse2 = []
 std = []
 stream_ring_buffer = []
-sve2 = []
-tun-tests = []
-tun-windows = []
-tun-ios = []
 unsafe_rust = []
-uring_sys = []
-vaes = []
-wiedemann = []
 zero_copy_dgram = []
+
+# --- Dev / cert features ---
+dev-certs = ["rcgen"]
+
+# --- Platform features ---
+tun-windows = []
+
+# --- Internal / experimental features ---
+internal_af_xdp_experimental = []
+internal_wiedemann = []
+internal_avx10_preview = []
+# Post-quantum key exchange: removed in TODO-286 (code + deps were orphaned).
+# Re-add when PQ is ready with pqcrypto-mlkem + pqcrypto-mldsa deps.
+# pq = ["dep:pqcrypto-mlkem", "dep:pqcrypto-mldsa"]
+
+# --- Test-only features ---
+rust-tests = []
+benches = []
+masque-tests = []
+tun-tests = []
+simd-selfcheck = []
+
+# --- Meta-features for convenience ---
+simd-all = ["avx2", "avx512f", "avx512vbmi2", "aes", "sse2"]
+test-suite = ["rust-tests", "benches"]
+experimental = ["internal_af_xdp_experimental", "internal_wiedemann", "internal_avx10_preview"]
 
 [profile.dev]
 opt-level = 0
@@ -132,6 +154,40 @@ name = "tun_factory_example"
 path = "examples/tun_factory_example.rs"
 required-features = ["tun-tests"]
 
+[[example]]
+name = "crypto_backend_bench"
+path = "examples/crypto_backend_bench.rs"
+required-features = ["benches"]
+
+[[example]]
+name = "shuffle_bench"
+path = "examples/shuffle_bench.rs"
+required-features = ["rust-tests"]
+
+[[example]]
+name = "brain_probe"
+path = "examples/brain_probe.rs"
+
+[[example]]
+name = "compress_bench"
+path = "examples/compress_bench.rs"
+
+[[example]]
+name = "fec_sim"
+path = "examples/fec_sim.rs"
+
+[[example]]
+name = "microbench"
+path = "examples/microbench.rs"
+
+[[example]]
+name = "rng_bench"
+path = "examples/rng_bench.rs"
+
+[[example]]
+name = "engine_basic"
+path = "examples/engine_basic.rs"
+
 [[test]]
 name = "rt-ack-merge-parity"
 path = "scripts/tests/rust/rt-ack-merge-parity.rs"
@@ -139,6 +195,11 @@ path = "scripts/tests/rust/rt-ack-merge-parity.rs"
 [[test]]
 name = "rt-admin-http-contract"
 path = "scripts/tests/rust/rt-admin-http-contract.rs"
+
+[[test]]
+name = "rt-anti-replay"
+path = "scripts/tests/rust/rt-anti-replay.rs"
+required-features = ["rust-tests"]
 
 [[test]]
 name = "rt-argsort-parity"
@@ -329,12 +390,12 @@ name = "rt-transport-recovery"
 path = "scripts/tests/rust/rt-transport-recovery.rs"
 
 [[test]]
-name = "rt-transport-udpfast"
-path = "scripts/tests/rust/rt-transport-udpfast.rs"
+name = "rt-transport-h3"
+path = "scripts/tests/rust/rt-transport-h3.rs"
 
 [[test]]
-name = "rt-transport-uring"
-path = "scripts/tests/rust/rt-transport-uring.rs"
+name = "rt-transport-udpfast"
+path = "scripts/tests/rust/rt-transport-udpfast.rs"
 
 [[test]]
 name = "rt-transport-xdp"
@@ -357,8 +418,8 @@ name = "rt-varint-roundtrip"
 path = "scripts/tests/rust/rt-varint-roundtrip.rs"
 
 [[test]]
-name = "rt-xor-obfuscator-parity"
-path = "scripts/tests/rust/rt-xor-obfuscator-parity.rs"
+name = "rt-xor-repeating-parity"
+path = "scripts/tests/rust/rt-xor-repeating-parity.rs"
 
 [[test]]
 name = "rt-xor-parity"
@@ -367,6 +428,10 @@ path = "scripts/tests/rust/rt-xor-parity.rs"
 [[test]]
 name = "rt-xor-sse2-parity"
 path = "scripts/tests/rust/rt-xor-sse2-parity.rs"
+
+[[test]]
+name = "rt-cc-algorithms"
+path = "scripts/tests/rust/rt-cc-algorithms.rs"
 
 [[test]]
 name = "rt-property-suite"
@@ -383,6 +448,7 @@ path = "scripts/tests/rust/integration/interface_capabilities.rs"
 [[test]]
 name = "it-masque-runtime-integration"
 path = "scripts/tests/rust/integration/masque_runtime_integration.rs"
+required-features = ["rust-tests"]
 
 [[test]]
 name = "it-orchestrator-runtime-activation"
@@ -391,7 +457,20 @@ path = "scripts/tests/rust/integration/orchestrator_runtime_activation.rs"
 [[test]]
 name = "it-qkey-auth-integration"
 path = "scripts/tests/rust/integration/qkey_auth_integration.rs"
+required-features = ["rust-tests"]
 
 [[test]]
 name = "it-stealth-mode-matrix"
 path = "scripts/tests/rust/integration/stealth_mode_matrix.rs"
+required-features = ["rust-tests"]
+
+[[test]]
+name = "rt-transport-uring"
+path = "scripts/tests/rust/rt-transport-uring.rs"
+required-features = ["io_uring"]
+
+[[bench]]
+name = "ci_regression"
+path = "scripts/benchmarks/ci_regression.rs"
+harness = false
+required-features = ["benches"]

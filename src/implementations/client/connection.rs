@@ -159,7 +159,14 @@ impl ClientConnection {
     /// Close the connection gracefully.
     pub fn close(&mut self, app_error: u64, reason: &[u8]) {
         let mut guard = self.inner.lock();
-        let _ = guard.conn.close(false, app_error, reason);
+        if let Err(e) = guard.conn.close(false, app_error, reason) {
+            log::warn!(
+                "Connection close returned error (app_error={}, reason={:?}): {:?}",
+                app_error,
+                reason,
+                e
+            );
+        }
         log::info!("Connection closed: error={}, reason={:?}", app_error, reason);
     }
 
@@ -209,14 +216,11 @@ impl ClientConnection {
             crate::engine::CcAlgorithm::Reno => {
                 tc.set_cc_algorithm(crate::transport::CongestionControlAlgorithm::Reno)
             }
-            crate::engine::CcAlgorithm::Cubic => {
-                tc.set_cc_algorithm(crate::transport::CongestionControlAlgorithm::Cubic)
-            }
-            crate::engine::CcAlgorithm::Bbr => {
-                tc.set_cc_algorithm(crate::transport::CongestionControlAlgorithm::BBR)
-            }
-            crate::engine::CcAlgorithm::Bbr2 | crate::engine::CcAlgorithm::Bbr2Gcongestion => {
+            crate::engine::CcAlgorithm::Bbr2 => {
                 tc.set_cc_algorithm(crate::transport::CongestionControlAlgorithm::BBR2)
+            }
+            crate::engine::CcAlgorithm::Bbr3 => {
+                tc.set_cc_algorithm(crate::transport::CongestionControlAlgorithm::BBR3)
             }
         }
 
@@ -227,7 +231,6 @@ impl ClientConnection {
         crate::stealth::StealthConfig {
             enable_domain_fronting: config.stealth.enable_domain_fronting,
             enable_http3_masquerading: config.stealth.enable_http3_masquerading,
-            enable_xor_obfuscation: config.stealth.enable_xor_obfuscation,
             use_tls_cover: config.stealth.use_tls_cover,
             use_qpack_headers: config.stealth.use_qpack_headers,
             enable_traffic_padding: config.stealth.enable_traffic_padding,
@@ -242,47 +245,14 @@ impl ClientConnection {
     }
 
     fn build_fec_config(config: &EngineConfig) -> crate::fec::FecConfig {
-        // Map engine FecMode to fec::FecMode
-        let initial_mode = match config.fec.mode {
-            crate::engine::FecMode::Off => crate::fec::FecMode::Zero,
-            crate::engine::FecMode::Auto => crate::fec::FecMode::Normal,
-            crate::engine::FecMode::Manual => crate::fec::FecMode::Normal,
-        };
-        let force_on = matches!(config.fec.mode, crate::engine::FecMode::Manual);
-
-        // Build window sizes from config
-        let mut window_sizes = std::collections::HashMap::new();
-        window_sizes.insert(crate::fec::FecMode::Zero, 0);
-        window_sizes.insert(crate::fec::FecMode::Light, config.fec.window_excellent);
-        window_sizes.insert(crate::fec::FecMode::Normal, config.fec.window_good);
-        window_sizes.insert(crate::fec::FecMode::Medium, config.fec.window_fair);
-        window_sizes.insert(crate::fec::FecMode::Strong, config.fec.window_poor);
-        window_sizes.insert(crate::fec::FecMode::Extreme, 100);
-        window_sizes.insert(crate::fec::FecMode::Streaming, config.fec.stream_every);
-
-        crate::fec::FecConfig {
-            initial_mode,
-            window_sizes,
-            lambda: 0.15,
-            burst_window: 16,
-            hysteresis: if config.fec.enable_hysteresis { 0.1 } else { 0.0 },
-            pid: crate::fec::PidConfig { kp: 1.2, ki: 0.5, kd: 0.1 },
-            force_on,
-            kalman_enabled: config.fec.enable_kalman,
-            kalman_q: 0.001,
-            kalman_r: 0.01,
-        }
+        crate::fec::FecConfig::from_engine_section(&config.fec)
     }
 
     fn build_optimize_config(config: &EngineConfig) -> crate::optimize::OptimizeConfig {
-        // Interface config has the XDP mode info
-        let enable_xdp = config.interface.xdp_mode != crate::engine::XdpMode::Skb;
-
         crate::optimize::OptimizeConfig {
             pool_capacity: config.optimization.memory_pool_size
                 / config.optimization.memory_pool_alignment.max(1),
             block_size: config.optimization.memory_pool_alignment.max(65536),
-            enable_xdp,
         }
     }
 }

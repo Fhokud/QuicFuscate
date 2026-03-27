@@ -13,7 +13,6 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift;;
     --rustflags) RUSTFLAGS_EXTRA="$2"; shift;;
     --fast) FAST=1;;
-    --dry-run) DRY_RUN=1;;
     --verbose) QUICFUSCATE_DEBUG_SCRIPTS=1; set -x;;
     --help|-h) echo "Usage: $(basename "$0") [--output-dir DIR] [--rustflags STR] [--fast]"; exit 0;;
     *) break;;
@@ -133,6 +132,7 @@ if (( FAST )); then
     --test rt-iter-reductions
     --test rt-simd-selfcheck
     --test rt-telemetry-counters
+    --test rt-xor-repeating-parity
   )
   if [[ "$(uname -m)" == "x86_64" ]]; then
     SIMD_FAST_TEST_ARGS+=(--test rt-ack-merge-parity --test rt-xor-sse2-parity)
@@ -295,6 +295,7 @@ SIMD_FULL_TEST_ARGS=(
   --test rt-transpose-parity
   --test rt-varint-roundtrip
   --test rt-xor-parity
+  --test rt-xor-repeating-parity
 )
 if [[ "$(uname -m)" == "x86_64" ]]; then
   SIMD_FULL_TEST_ARGS+=(--test rt-ack-merge-parity --test rt-xor-sse2-parity)
@@ -307,7 +308,7 @@ run_case "SIMD/Accelerate integration" "" cargo test --release --features "$FEAT
 echo -e "\n> Running Optimization Stress Test..."
 if test_pattern_exists "optimization_stress"; then
   run_case "Optimization stress" "QUICFUSCATE_NUMA_POLICY=interleave QUICFUSCATE_MADVISE_HUGEPAGE=1 QUICFUSCATE_TELEMETRY=1 RUSTFLAGS=-Ctarget-cpu=native" \
-    run_cargo test --release --lib optimization_stress -- --nocapture --test-threads=1
+    cargo test --release --lib optimization_stress -- --nocapture --test-threads=1
 else
   warn "Skipping optimization_stress (no matching tests)"
   SKIPPED=$((SKIPPED+1)); append_json "Optimization stress" "skipped" 0

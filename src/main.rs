@@ -1,19 +1,14 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use log::{error, info, warn};
 use quicfuscate::app_config::AppConfig;
 use quicfuscate::core::QuicFuscateConnection;
 use quicfuscate::error::ConnectionError;
 #[cfg(feature = "benches")]
+use quicfuscate::fec::FecMode as RuntimeFecMode;
+#[cfg(feature = "benches")]
 use quicfuscate::fec::FecPacket;
-use quicfuscate::fec::{AdaptiveFec, FecConfig, FecMode};
-#[cfg(unix)]
-use quicfuscate::implementations::server::admin::{
-    AdminHandler, AdminResponse, AdminServer, ClientInfo,
-};
-use quicfuscate::implementations::server::admin_http::{
-    AdminAuth, AdminHttpHandler, AdminHttpServer,
-};
-use quicfuscate::implementations::server::metrics::Metrics;
+use quicfuscate::fec::{AdaptiveFec, FecConfig};
+use quicfuscate::implementations::server::ServerRuntime;
 use quicfuscate::optimize::OptimizationManager;
 use quicfuscate::optimize::OptimizeConfig;
 #[cfg(unix)]
@@ -21,198 +16,26 @@ use quicfuscate::optimize::ZeroCopyBuffer;
 use quicfuscate::stealth::StealthConfig;
 use quicfuscate::stealth::TlsClientHelloSpoofer;
 use quicfuscate::stealth::{BrowserProfile, FingerprintProfile, OsProfile};
-use quicfuscate::transport::h3::NameValue;
-// use quicfuscate::transport::CongestionControlAlgorithm; // imported where needed
 use quicfuscate::telemetry;
-use std::cell::Cell;
-use std::collections::HashMap;
 #[cfg(feature = "benches")]
 use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
 #[cfg(feature = "benches")]
 use std::time::Instant;
 use tokio::io::Interest;
-use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 static ADMIN_LOG_BUFFER: OnceLock<
     Arc<quicfuscate::implementations::server::admin_logs::AdminLogBuffer>,
 > = OnceLock::new();
 
-const BUILTIN_FRONTING_SNI_ALLOWLIST: &[&str] = &[
-    "cdn.cloudflare.com",
-    "cloudflare-dns.com",
-    "one.one.one.one",
-    "warp.plus",
-    "workers.dev",
-    "cdn.fastly.net",
-    "fastly.com",
-    "fastlylb.net",
-    "fsly.net",
-    "akamaized.net",
-    "akamai.net",
-    "akamaihd.net",
-    "akamaitechnologies.com",
-    "edgesuite.net",
-    "cloudfront.net",
-    "amazonaws.com",
-    "aws.amazon.com",
-    "awsstatic.com",
-    "googleapis.com",
-    "googleusercontent.com",
-    "googlevideo.com",
-    "gstatic.com",
-    "google.com",
-    "azureedge.net",
-    "azure.microsoft.com",
-    "windows.net",
-    "msecnd.net",
-    "stackpathdns.com",
-    "stackpathcdn.com",
-    "bootstrapcdn.com",
-    "kxcdn.com",
-    "keycdn.com",
-    "b-cdn.net",
-    "bunnycdn.com",
-    "incapdns.net",
-    "imperva.com",
-];
-const DF_SNI_MODE_FIXED: &str = "fixed";
-const DF_SNI_MODE_AUTO_ROTATING: &str = "auto_rotating";
 const DEFAULT_RUNTIME_SNI_HOST: &str = "cdn.cloudflare.com";
 const DEFAULT_RUNTIME_URL: &str = "https://cloudflare-dns.com/";
-
-fn require_qkey_for_new_clients(_registry_has_entries: bool) -> bool {
-    true
-}
-
-fn is_valid_sni_host(value: &str) -> bool {
-    let s = value.trim();
-    if s.is_empty() {
-        return false;
-    }
-    if s.chars().any(char::is_whitespace) {
-        return false;
-    }
-    if s.contains(':') {
-        return false;
-    }
-    if s.contains('/') || s.contains('?') || s.contains('#') || s.contains('@') {
-        return false;
-    }
-    true
-}
-
-fn normalize_sni_host(value: &str) -> Option<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if is_valid_sni_host(&lower) {
-        Some(lower)
-    } else {
-        None
-    }
-}
-
-fn extract_host_from_endpoint(endpoint: &str) -> Option<String> {
-    let trimmed = endpoint.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        return normalize_sni_host(host);
-    }
-    if let Some((host, _port)) = trimmed.rsplit_once(':') {
-        if !host.is_empty() {
-            return normalize_sni_host(host);
-        }
-    }
-    normalize_sni_host(trimmed)
-}
-
-#[derive(Debug, Clone)]
-struct QKeyDomainFrontingPolicy {
-    qkey_sni: String,
-    extra_json: String,
-}
-
-fn resolve_qkey_domain_fronting_policy(
-    front_domain: &[String],
-    listen_addr: &str,
-    requested_strategy: Option<&str>,
-    requested_domain: Option<&str>,
-    nonce_hex: &str,
-) -> Result<QKeyDomainFrontingPolicy, String> {
-    let allowlist: Vec<String> =
-        BUILTIN_FRONTING_SNI_ALLOWLIST.iter().map(|d| (*d).to_string()).collect();
-    let default_domain =
-        allowlist.first().cloned().ok_or_else(|| "Missing SNI allowlist defaults".to_string())?;
-    let mode_raw = requested_strategy.unwrap_or("").trim().to_ascii_lowercase();
-    let mode = if mode_raw.is_empty()
-        || mode_raw == "auto"
-        || mode_raw == "rotating"
-        || mode_raw == DF_SNI_MODE_AUTO_ROTATING
-    {
-        DF_SNI_MODE_AUTO_ROTATING
-    } else if mode_raw == DF_SNI_MODE_FIXED {
-        DF_SNI_MODE_FIXED
-    } else {
-        return Err(
-            "Invalid Domain Fronting [SNI] strategy. Valid: fixed, auto_rotating".to_string()
-        );
-    };
-    let server_host = extract_host_from_endpoint(listen_addr);
-
-    if mode == DF_SNI_MODE_FIXED {
-        let requested = requested_domain
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "Domain Fronting [SNI] fixed mode requires a domain".to_string())?;
-        let domain = normalize_sni_host(requested)
-            .ok_or_else(|| "Invalid Domain Fronting [SNI] domain".to_string())?;
-        if !allowlist.iter().any(|v| v == &domain) {
-            return Err("Domain Fronting [SNI] domain is not allowlisted".to_string());
-        }
-        let domain_for_json = domain.clone();
-        return Ok(QKeyDomainFrontingPolicy {
-            qkey_sni: domain,
-            extra_json: serde_json::json!({
-                "nonce": nonce_hex,
-                "df_sni_mode": DF_SNI_MODE_FIXED,
-                "df_sni_domain": domain_for_json,
-                "server_host": server_host,
-            })
-            .to_string(),
-        });
-    }
-
-    let mut pool: Vec<String> = front_domain
-        .iter()
-        .filter_map(|raw| normalize_sni_host(raw))
-        .filter(|raw| allowlist.iter().any(|v| v == raw))
-        .collect();
-    if pool.is_empty() {
-        pool = allowlist;
-    }
-    let qkey_sni = pool.first().cloned().unwrap_or(default_domain);
-    Ok(QKeyDomainFrontingPolicy {
-        qkey_sni,
-        extra_json: serde_json::json!({
-            "nonce": nonce_hex,
-            "df_sni_mode": DF_SNI_MODE_AUTO_ROTATING,
-            "df_sni_pool": pool,
-            "server_host": server_host,
-        })
-        .to_string(),
-    })
-}
 
 #[cfg(test)]
 mod qkey_auth_tests {
@@ -222,8 +45,7 @@ mod qkey_auth_tests {
 
     #[test]
     fn require_qkey_for_new_clients_is_strict_by_default() {
-        assert!(require_qkey_for_new_clients(false));
-        assert!(require_qkey_for_new_clients(true));
+        assert!(quicfuscate::implementations::server::require_qkey_for_new_clients());
     }
 
     #[test]
@@ -237,18 +59,76 @@ mod qkey_auth_tests {
     }
 }
 
-#[derive(Clone)]
-struct ClientSnapshot {
-    connected_at: std::time::Instant,
-    bytes_in: u64,
-    bytes_out: u64,
-    stealth_mode: String,
-}
+#[cfg(all(test, feature = "rate_limiter"))]
+mod rate_limiter_env_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
 
-enum AdminAction {
-    Kick(String),
-    Reload,
-    Shutdown,
+    fn with_rate_limit_env<T>(
+        pps: Option<&str>,
+        bps: Option<&str>,
+        refill_ms: Option<&str>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard =
+            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev_pps = std::env::var("QUICFUSCATE_RATE_LIMIT_PPS").ok();
+        let prev_bps = std::env::var("QUICFUSCATE_RATE_LIMIT_BPS").ok();
+        let prev_refill = std::env::var("QUICFUSCATE_RATE_LIMIT_REFILL_MS").ok();
+
+        match pps {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_PPS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_PPS"),
+        }
+        match bps {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_BPS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_BPS"),
+        }
+        match refill_ms {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_REFILL_MS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_REFILL_MS"),
+        }
+
+        let out = f();
+
+        match prev_pps {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_PPS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_PPS"),
+        }
+        match prev_bps {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_BPS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_BPS"),
+        }
+        match prev_refill {
+            Some(v) => std::env::set_var("QUICFUSCATE_RATE_LIMIT_REFILL_MS", v),
+            None => std::env::remove_var("QUICFUSCATE_RATE_LIMIT_REFILL_MS"),
+        }
+
+        out
+    }
+
+    #[test]
+    fn rate_limit_env_overrides_are_applied() {
+        with_rate_limit_env(Some("777"), Some("888"), Some("250"), || {
+            let cfg = quicfuscate::implementations::server::load_rate_limit_config_from_env();
+            assert_eq!(cfg.max_pps, 777);
+            assert_eq!(cfg.max_bps, 888);
+            assert_eq!(cfg.refill_interval, Duration::from_millis(250));
+        });
+    }
+
+    #[test]
+    fn rate_limit_env_invalid_values_fallback_to_defaults() {
+        with_rate_limit_env(Some("0"), Some("NaN"), Some("0"), || {
+            let cfg = quicfuscate::implementations::server::load_rate_limit_config_from_env();
+            let defaults = quicfuscate::implementations::server::RateLimitConfig::default();
+            assert_eq!(cfg.max_pps, defaults.max_pps);
+            assert_eq!(cfg.max_bps, defaults.max_bps);
+            assert_eq!(cfg.refill_interval, defaults.refill_interval);
+        });
+    }
 }
 
 #[cfg(unix)]
@@ -257,6 +137,7 @@ async fn recv_connected_datagram(
     buf: &mut [u8],
 ) -> std::io::Result<usize> {
     use std::io::{Error, ErrorKind};
+    use std::os::unix::io::AsRawFd;
     loop {
         socket.ready(Interest::READABLE).await?;
         let mut slice = [&mut buf[..]];
@@ -290,72 +171,12 @@ async fn recv_connected_datagram(
 }
 
 #[cfg(unix)]
-async fn recv_datagram_from(
-    socket: &tokio::net::UdpSocket,
-    buf: &mut [u8],
-) -> std::io::Result<(usize, std::net::SocketAddr)> {
-    loop {
-        socket.ready(Interest::READABLE).await?;
-        let mut slice = [&mut buf[..]];
-        let mut zc = ZeroCopyBuffer::new_mut(&mut slice);
-        match zc.recv_from(socket.as_raw_fd()) {
-            Ok((rc, addr)) if rc >= 0 => return Ok((rc as usize, addr)),
-            Ok((_, _)) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "negative recv_from result",
-                ))
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-#[cfg(not(unix))]
-async fn recv_datagram_from(
-    socket: &tokio::net::UdpSocket,
-    buf: &mut [u8],
-) -> std::io::Result<(usize, std::net::SocketAddr)> {
-    loop {
-        socket.ready(Interest::READABLE).await?;
-        match socket.try_recv_from(buf) {
-            Ok(result) => return Ok(result),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-#[cfg(unix)]
 async fn send_connected_datagram(
     socket: &tokio::net::UdpSocket,
     data: &[u8],
 ) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-
-    #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-    {
-        use std::os::unix::io::AsRawFd;
-        match quicfuscate::transport::uring::try_send_connected(socket.as_raw_fd(), data) {
-            Ok(Some(len)) => {
-                if len == data.len() {
-                    return Ok(());
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::WriteZero,
-                        "partial datagram send (io_uring)",
-                    ));
-                }
-            }
-            Ok(None) => { /* fall back to standard path */ }
-            Err(err) => {
-                if err.kind() != ErrorKind::WouldBlock {
-                    log::debug!("io_uring connected send fallback: {}", err);
-                }
-            }
-        }
-    }
+    use std::os::unix::io::AsRawFd;
 
     loop {
         socket.ready(Interest::WRITABLE).await?;
@@ -401,60 +222,6 @@ async fn send_connected_datagram(
     }
 }
 
-#[cfg(unix)]
-async fn send_datagram_to(
-    socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    data: &[u8],
-) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-
-    #[cfg(all(target_os = "linux", feature = "uring_sys"))]
-    {
-        use std::os::unix::io::AsRawFd;
-        match quicfuscate::transport::uring::try_send_to(socket.as_raw_fd(), addr, data) {
-            Ok(Some(len)) => {
-                if len == data.len() {
-                    return Ok(());
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::WriteZero,
-                        "partial datagram send (io_uring)",
-                    ));
-                }
-            }
-            Ok(None) => { /* fall back to standard path */ }
-            Err(err) => {
-                if err.kind() != ErrorKind::WouldBlock {
-                    log::debug!("io_uring send_to fallback: {}", err);
-                }
-            }
-        }
-    }
-
-    loop {
-        socket.ready(Interest::WRITABLE).await?;
-        let zc = ZeroCopyBuffer::new(&[data]);
-        let rc = zc.send_to(socket.as_raw_fd(), *addr);
-        if rc >= 0 {
-            if rc as usize == data.len() {
-                return Ok(());
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "partial datagram send_to",
-                ));
-            }
-        }
-        let err = Error::last_os_error();
-        if err.kind() == ErrorKind::WouldBlock {
-            continue;
-        } else {
-            return Err(err);
-        }
-    }
-}
-
 async fn flush_connected_outgoing(
     socket: &tokio::net::UdpSocket,
     conn: &mut QuicFuscateConnection,
@@ -475,58 +242,6 @@ async fn flush_connected_outgoing(
         }
     }
     Ok(())
-}
-
-async fn flush_server_outgoing(
-    socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    conn: &mut QuicFuscateConnection,
-    out: &mut [u8],
-    metrics: &Metrics,
-) -> std::io::Result<(u64, u64)> {
-    let mut bytes_sent = 0u64;
-    let mut packets_sent = 0u64;
-    loop {
-        match conn.send(out) {
-            Ok(len) if len > 0 => {
-                telemetry!(quicfuscate::telemetry::BYTES_SENT.inc_by(len as u64));
-                metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
-                metrics.packets_out.fetch_add(1, Ordering::Relaxed);
-                bytes_sent = bytes_sent.saturating_add(len as u64);
-                packets_sent = packets_sent.saturating_add(1);
-                send_datagram_to(socket, addr, &out[..len]).await?;
-            }
-            Ok(_) => break,
-            Err(ConnectionError::Done) => break,
-            Err(e) => {
-                log::error!("Send failed to {}: {:?}", addr, e);
-                break;
-            }
-        }
-    }
-    Ok((bytes_sent, packets_sent))
-}
-
-#[cfg(not(unix))]
-async fn send_datagram_to(
-    socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    data: &[u8],
-) -> std::io::Result<()> {
-    loop {
-        socket.ready(Interest::WRITABLE).await?;
-        match socket.try_send_to(data, addr) {
-            Ok(len) if len == data.len() => return Ok(()),
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "partial datagram send_to",
-                ))
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -565,10 +280,10 @@ mod tokio_udp_tests {
         let client_addr = client.local_addr()?;
 
         let payload = b"tokio-unconnected";
-        send_datagram_to(&client, &server_addr, payload).await?;
+        quicfuscate::implementations::server::send_live_datagram_to(&client, &server_addr, payload)
+            .await?;
         let mut buf = [0u8; 64];
-        let (len, from) =
-            timeout(Duration::from_secs(1), recv_datagram_from(&server, &mut buf)).await??;
+        let (len, from) = timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await??;
         assert_eq!(from, client_addr);
         assert_eq!(&buf[..len], payload);
         Ok(())
@@ -621,7 +336,7 @@ fn insert_bench_metadata(
 fn run_fec_bench(
     packets: usize,
     payload: usize,
-    mode: FecMode,
+    mode: RuntimeFecMode,
     pool_capacity: usize,
     block_size: usize,
     warmup: usize,
@@ -636,7 +351,7 @@ fn run_fec_bench(
     let bench_once = |parallel: bool| -> (f64, usize) {
         // configure env toggle used by fec emit path
         std::env::set_var("QUICFUSCATE_FEC_PARALLEL", if parallel { "1" } else { "0" });
-        let opt = OptimizationManager::new_with_config(pool_capacity, block_size, false);
+        let opt = OptimizationManager::new_with_config(pool_capacity, block_size);
         let mem_pool = opt.memory_pool();
         let cfg = FecConfig { initial_mode: mode, ..Default::default() };
         // fresh FEC per run for fairness
@@ -737,7 +452,7 @@ fn run_pool_bench(
             "payload must be > 0 and <= block_size",
         ));
     }
-    let opt = OptimizationManager::new_with_config(pool_capacity, block_size, false);
+    let opt = OptimizationManager::new_with_config(pool_capacity, block_size);
     let start_once = |iters: usize| -> f64 {
         let mut touched: u64 = 0;
         let t0 = Instant::now();
@@ -925,32 +640,125 @@ fn run_net_bench(
     Ok(())
 }
 
-/// Congestion control algorithms selectable via CLI
+/// Congestion control algorithms selectable via CLI.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum)]
 enum CcAlgorithm {
     #[clap(name = "reno")]
     Reno,
-    #[clap(name = "cubic")]
-    Cubic,
-    #[clap(name = "bbr")]
-    Bbr,
     #[clap(name = "bbr2")]
     Bbr2,
-    #[clap(name = "bbr2_gcongestion")]
-    Bbr2Gcongestion,
+    #[clap(name = "bbr3")]
+    Bbr3,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliFecMode {
+    #[clap(name = "off")]
+    Off,
+    #[clap(name = "auto")]
+    Auto,
+}
+
+fn resolve_cli_fec_mode_override(mode: Option<CliFecMode>) -> Option<quicfuscate::engine::FecMode> {
+    mode.map(|mode| match mode {
+        CliFecMode::Off => quicfuscate::engine::FecMode::Off,
+        CliFecMode::Auto => quicfuscate::engine::FecMode::Auto,
+    })
 }
 
 impl From<CcAlgorithm> for quicfuscate::transport::CongestionControlAlgorithm {
     fn from(cc: CcAlgorithm) -> Self {
         match cc {
             CcAlgorithm::Reno => quicfuscate::transport::CongestionControlAlgorithm::Reno,
-            CcAlgorithm::Cubic => quicfuscate::transport::CongestionControlAlgorithm::Cubic,
-            CcAlgorithm::Bbr => quicfuscate::transport::CongestionControlAlgorithm::BBR,
-            CcAlgorithm::Bbr2 | CcAlgorithm::Bbr2Gcongestion => {
-                quicfuscate::transport::CongestionControlAlgorithm::BBR2
-            }
+            CcAlgorithm::Bbr2 => quicfuscate::transport::CongestionControlAlgorithm::BBR2,
+            CcAlgorithm::Bbr3 => quicfuscate::transport::CongestionControlAlgorithm::BBR3,
         }
     }
+}
+
+/// Shared CLI arguments used by both client and server subcommands.
+#[derive(Args, Clone, Debug)]
+struct SharedArgs {
+    /// Browser fingerprint profile (chrome, firefox, opera, brave)
+    #[clap(long, value_enum, default_value_t = BrowserProfile::Chrome)]
+    profile: BrowserProfile,
+
+    /// Operating system for the profile (windows, macos, linux, ios, android)
+    #[clap(long, value_enum, default_value_t = OsProfile::Windows)]
+    os: OsProfile,
+
+    /// Comma separated list of profiles to cycle through
+    #[clap(long, value_delimiter = ',')]
+    profile_seq: Option<Vec<String>>,
+
+    /// Interval in seconds for profile switching
+    #[clap(long, default_value_t = 0)]
+    profile_interval: u64,
+
+    /// FEC mode (auto or off)
+    #[clap(long, value_enum)]
+    fec_mode: Option<CliFecMode>,
+
+    /// Memory pool capacity (number of blocks)
+    #[clap(long, default_value_t = 1024)]
+    pool_capacity: usize,
+
+    /// Memory pool block size in bytes
+    #[clap(long, default_value_t = 4096)]
+    pool_block: usize,
+
+    // XDP is compatibility-only in this branch and maps to UDP/io_uring fast paths
+    /// Path to a unified TOML configuration file
+    #[clap(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Path to a TOML file with Adaptive FEC settings
+    #[clap(long, value_name = "PATH")]
+    fec_config: Option<PathBuf>,
+
+    /// Custom DNS-over-HTTPS provider URL
+    #[clap(long, default_value = "https://cloudflare-dns.com/dns-query")]
+    doh_provider: String,
+
+    /// Domain used for fronting (can be specified multiple times)
+    #[clap(long, value_delimiter = ',')]
+    front_domain: Vec<String>,
+
+    /// Disable DNS over HTTPS
+    #[clap(long)]
+    disable_doh: bool,
+
+    /// Disable domain fronting
+    #[clap(long)]
+    disable_fronting: bool,
+
+    /// Disable HTTP/3 masquerading
+    #[clap(long)]
+    disable_http3: bool,
+
+    /// Congestion control algorithm
+    #[clap(long, value_enum, default_value = "bbr3")]
+    cc_algorithm: CcAlgorithm,
+
+    /// Enable TUN bridging (experimental)
+    #[clap(long)]
+    tun: bool,
+
+    /// TUN interface name (optional)
+    #[clap(long)]
+    tun_name: Option<String>,
+
+    /// TUN MTU
+    #[clap(long)]
+    tun_mtu: Option<u16>,
+
+    /// TUN IP address
+    #[clap(long)]
+    tun_ip: Option<String>,
+
+    /// TUN netmask
+    #[clap(long)]
+    tun_netmask: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -969,50 +777,9 @@ enum Commands {
         #[clap(short, long, default_value = "https://cloudflare-dns.com/")]
         url: String,
 
-        /// Browser fingerprint profile (chrome, firefox, opera, brave)
-        #[clap(long, value_enum, default_value_t = BrowserProfile::Chrome)]
-        profile: BrowserProfile,
+        #[command(flatten)]
+        shared: SharedArgs,
 
-        /// Operating system for the profile (windows, macos, linux, ios, android)
-        #[clap(long, value_enum, default_value_t = OsProfile::Windows)]
-        os: OsProfile,
-
-        /// Comma separated list of profiles to cycle through
-        #[clap(long, value_delimiter = ',')]
-        profile_seq: Option<Vec<String>>,
-
-        /// Interval in seconds for profile switching
-        #[clap(long, default_value_t = 0)]
-        profile_interval: u64,
-
-        /// Initial FEC mode
-        #[clap(long, value_enum, default_value = "zero")]
-        fec_mode: FecMode,
-
-        /// Memory pool capacity (number of blocks)
-        #[clap(long, default_value_t = 1024)]
-        pool_capacity: usize,
-
-        /// Memory pool block size in bytes
-        #[clap(long, default_value_t = 4096)]
-        pool_block: usize,
-
-        // XDP removed - using native UDP/io_uring fast paths
-        /// Path to a unified TOML configuration file
-        #[clap(long, value_name = "PATH")]
-        config: Option<PathBuf>,
-
-        /// Path to a TOML file with Adaptive FEC settings
-        #[clap(long, value_name = "PATH")]
-        fec_config: Option<PathBuf>,
-
-        /// Custom DNS-over-HTTPS provider URL
-        #[clap(long, default_value = "https://cloudflare-dns.com/dns-query")]
-        doh_provider: String,
-
-        /// Domain used for fronting (can be specified multiple times)
-        #[clap(long, value_delimiter = ',')]
-        front_domain: Vec<String>,
         /// CA file for peer verification
         #[clap(long, value_name = "PATH")]
         ca_file: Option<PathBuf>,
@@ -1028,42 +795,6 @@ enum Commands {
         /// Enable certificate validation when connecting to the server
         #[clap(long)]
         verify_peer: bool,
-
-        /// Disable DNS over HTTPS
-        #[clap(long)]
-        disable_doh: bool,
-
-        /// Disable domain fronting
-        #[clap(long)]
-        disable_fronting: bool,
-
-        /// Disable XOR obfuscation
-        #[clap(long)]
-        disable_xor: bool,
-
-        /// Disable HTTP/3 masquerading
-        #[clap(long)]
-        disable_http3: bool,
-
-        /// Congestion control algorithm
-        #[clap(long, value_enum, default_value = "bbr2")]
-        cc_algorithm: CcAlgorithm,
-
-        /// Enable TUN bridging (experimental): send TUN frames over HTTP/3
-        #[clap(long)]
-        tun: bool,
-        /// TUN interface name (optional)
-        #[clap(long)]
-        tun_name: Option<String>,
-        /// TUN MTU
-        #[clap(long)]
-        tun_mtu: Option<u16>,
-        /// TUN IP address
-        #[clap(long)]
-        tun_ip: Option<String>,
-        /// TUN netmask
-        #[clap(long)]
-        tun_netmask: Option<String>,
     },
     /// Runs the server
     Server {
@@ -1079,86 +810,8 @@ enum Commands {
         #[clap(short, long, required = true)]
         key: PathBuf,
 
-        /// Browser fingerprint profile used for connections
-        #[clap(long, value_enum, default_value_t = BrowserProfile::Chrome)]
-        profile: BrowserProfile,
-
-        /// Operating system for the profile (windows, macos, linux, ios, android)
-        #[clap(long, value_enum, default_value_t = OsProfile::Windows)]
-        os: OsProfile,
-
-        /// Comma separated list of profiles to cycle through
-        #[clap(long, value_delimiter = ',')]
-        profile_seq: Option<Vec<String>>,
-
-        /// Interval in seconds for profile switching
-        #[clap(long, default_value_t = 0)]
-        profile_interval: u64,
-
-        /// Initial FEC mode
-        #[clap(long, value_enum, default_value = "zero")]
-        fec_mode: FecMode,
-
-        /// Memory pool capacity (number of blocks)
-        #[clap(long, default_value_t = 1024)]
-        pool_capacity: usize,
-
-        /// Memory pool block size in bytes
-        #[clap(long, default_value_t = 4096)]
-        pool_block: usize,
-
-        // XDP removed - using native UDP/io_uring fast paths
-        /// Path to a unified TOML configuration file
-        #[clap(long, value_name = "PATH")]
-        config: Option<PathBuf>,
-
-        /// Path to a TOML file with Adaptive FEC settings
-        #[clap(long, value_name = "PATH")]
-        fec_config: Option<PathBuf>,
-
-        /// Custom DNS-over-HTTPS provider URL
-        #[clap(long, default_value = "https://cloudflare-dns.com/dns-query")]
-        doh_provider: String,
-
-        /// Domain used for fronting (can be specified multiple times)
-        #[clap(long, value_delimiter = ',')]
-        front_domain: Vec<String>,
-
-        /// Disable DNS over HTTPS
-        #[clap(long)]
-        disable_doh: bool,
-
-        /// Disable domain fronting
-        #[clap(long)]
-        disable_fronting: bool,
-
-        /// Disable XOR obfuscation
-        #[clap(long)]
-        disable_xor: bool,
-
-        /// Disable HTTP/3 masquerading
-        #[clap(long)]
-        disable_http3: bool,
-
-        /// Congestion control algorithm
-        #[clap(long, value_enum, default_value = "bbr2")]
-        cc_algorithm: CcAlgorithm,
-
-        /// Enable TUN bridging (experimental): write received frames to TUN
-        #[clap(long)]
-        tun: bool,
-        /// TUN interface name (optional)
-        #[clap(long)]
-        tun_name: Option<String>,
-        /// TUN MTU
-        #[clap(long)]
-        tun_mtu: Option<u16>,
-        /// TUN IP address
-        #[clap(long)]
-        tun_ip: Option<String>,
-        /// TUN netmask
-        #[clap(long)]
-        tun_netmask: Option<String>,
+        #[command(flatten)]
+        shared: SharedArgs,
 
         /// Admin control socket (unix only)
         #[clap(long, value_name = "PATH")]
@@ -1198,8 +851,6 @@ enum Commands {
     HighLossSim {},
     #[clap(hide = true)]
     OptimizeProbe {},
-    #[clap(hide = true)]
-    XdpSmoke {},
     #[cfg(feature = "benches")]
     #[clap(hide = true)]
     /// Internal FEC benchmark harness (sequential vs parallel)
@@ -1210,9 +861,9 @@ enum Commands {
         /// Payload size per packet (bytes)
         #[clap(long, default_value_t = 1200)]
         payload: usize,
-        /// Initial FEC mode/window profile to benchmark
+        /// Internal runtime FEC mode/window profile to benchmark
         #[clap(long, value_enum, default_value = "normal")]
-        mode: FecMode,
+        mode: RuntimeFecMode,
         /// Memory pool capacity (blocks)
         #[clap(long, default_value_t = 1024)]
         pool_capacity: usize,
@@ -1295,14 +946,41 @@ enum Commands {
     },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    // Quick CLI parse before full async startup (must happen before Tokio runtime
+    // because std::env::set_var is unsafe in multi-threaded contexts since Rust 1.66).
+    let args: Vec<String> = std::env::args().collect();
+    let worker_threads = {
+        let mut threads = 8usize; // default
+        if let Some(pos) = args.iter().position(|a| a == "--config") {
+            if let Some(cfg_path) = args.get(pos + 1) {
+                if let Ok(content) = std::fs::read_to_string(cfg_path) {
+                    if let Ok(engine_cfg) = quicfuscate::engine::EngineConfig::from_toml(&content) {
+                        if engine_cfg.optimization.num_worker_threads > 0 {
+                            threads = engine_cfg.optimization.num_worker_threads;
+                        }
+                    }
+                }
+            }
+        }
+        threads
+    };
+    if args.iter().any(|a| a == "--verbose" || a == "-v") {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let admin_log_buffer =
         Arc::new(quicfuscate::implementations::server::admin_logs::AdminLogBuffer::new(4096));
-    let _ = ADMIN_LOG_BUFFER.set(admin_log_buffer.clone());
-    if cli.verbose {
-        std::env::set_var("RUST_LOG", "info");
+    if ADMIN_LOG_BUFFER.set(admin_log_buffer.clone()).is_err() {
+        log::debug!("ADMIN_LOG_BUFFER already initialized, reusing existing buffer");
     }
     {
         use std::io::Write;
@@ -1350,7 +1028,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
     if cli.telemetry {
-        use quicfuscate::telemetry_metrics::TELEMETRY_ENABLED;
+        use quicfuscate::telemetry::TELEMETRY_ENABLED;
         TELEMETRY_ENABLED.store(true, Ordering::Relaxed);
         // Spawn minimal telemetry HTTP server at /telemetry
         quicfuscate::metrics::spawn_telemetry_server();
@@ -1361,63 +1039,43 @@ async fn main() -> std::io::Result<()> {
             remote,
             local,
             url,
-            profile,
-            os,
-            profile_seq,
-            profile_interval,
-            fec_mode,
-            pool_capacity,
-            pool_block,
-            config,
-            fec_config,
-            doh_provider,
-            front_domain,
+            shared,
             ca_file,
             no_utls,
             debug_tls,
             list_fingerprints,
             verify_peer,
-            disable_doh,
-            disable_fronting,
-            disable_xor,
-            disable_http3,
-            cc_algorithm,
-            tun,
-            tun_name,
-            tun_mtu,
-            tun_ip,
-            tun_netmask,
         } => {
+            let fec_mode = resolve_cli_fec_mode_override(shared.fec_mode);
             run_client(
                 remote.as_str(),
                 local.as_str(),
                 url.as_str(),
-                profile,
-                os,
-                &profile_seq,
-                profile_interval,
+                shared.profile,
+                shared.os,
+                &shared.profile_seq,
+                shared.profile_interval,
                 fec_mode,
-                pool_capacity,
-                pool_block,
-                &config,
-                &fec_config,
-                doh_provider.as_str(),
-                &front_domain,
+                shared.pool_capacity,
+                shared.pool_block,
+                &shared.config,
+                &shared.fec_config,
+                shared.doh_provider.as_str(),
+                &shared.front_domain,
                 &ca_file,
                 no_utls,
                 debug_tls,
                 list_fingerprints,
                 verify_peer,
-                disable_doh,
-                disable_fronting,
-                disable_xor,
-                disable_http3,
-                cc_algorithm,
-                tun,
-                tun_name,
-                tun_mtu,
-                tun_ip,
-                tun_netmask,
+                shared.disable_doh,
+                shared.disable_fronting,
+                shared.disable_http3,
+                shared.cc_algorithm,
+                shared.tun,
+                shared.tun_name,
+                shared.tun_mtu,
+                shared.tun_ip,
+                shared.tun_netmask,
             )
             .await?;
         }
@@ -1425,27 +1083,7 @@ async fn main() -> std::io::Result<()> {
             listen,
             cert,
             key,
-            profile,
-            os,
-            profile_seq,
-            profile_interval,
-            fec_mode,
-            pool_capacity,
-            pool_block,
-            config,
-            fec_config,
-            doh_provider,
-            front_domain,
-            disable_doh,
-            disable_fronting,
-            disable_xor,
-            disable_http3,
-            cc_algorithm,
-            tun,
-            tun_name,
-            tun_mtu,
-            tun_ip,
-            tun_netmask,
+            shared,
             admin_socket,
             metrics_port,
             admin_web,
@@ -1455,31 +1093,31 @@ async fn main() -> std::io::Result<()> {
             qkey_ttl_secs,
             qkey_store,
         } => {
+            let fec_mode = resolve_cli_fec_mode_override(shared.fec_mode);
             run_server(
                 listen.as_str(),
                 cert.as_path(),
                 key.as_path(),
-                profile,
-                os,
-                &profile_seq,
-                profile_interval,
+                shared.profile,
+                shared.os,
+                &shared.profile_seq,
+                shared.profile_interval,
                 fec_mode,
-                pool_capacity,
-                pool_block,
-                &config,
-                &fec_config,
-                doh_provider.as_str(),
-                &front_domain,
-                disable_doh,
-                disable_fronting,
-                disable_xor,
-                disable_http3,
-                cc_algorithm,
-                tun,
-                tun_name,
-                tun_mtu,
-                tun_ip,
-                tun_netmask,
+                shared.pool_capacity,
+                shared.pool_block,
+                &shared.config,
+                &shared.fec_config,
+                shared.doh_provider.as_str(),
+                &shared.front_domain,
+                shared.disable_doh,
+                shared.disable_fronting,
+                shared.disable_http3,
+                shared.cc_algorithm,
+                shared.tun,
+                shared.tun_name,
+                shared.tun_mtu,
+                shared.tun_ip,
+                shared.tun_netmask,
                 admin_socket,
                 metrics_port,
                 admin_web,
@@ -1499,9 +1137,6 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::OptimizeProbe {} => {
             run_optimize_probe()?;
-        }
-        Commands::XdpSmoke {} => {
-            // XDP smoke test removed
         }
         #[cfg(feature = "benches")]
         Commands::FecBench { packets, payload, mode, pool_capacity, block_size, warmup, json } => {
@@ -1530,44 +1165,15 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    use quicfuscate::telemetry_metrics::TELEMETRY_ENABLED;
+    use quicfuscate::telemetry::TELEMETRY_ENABLED;
     if TELEMETRY_ENABLED.load(Ordering::Relaxed) {
         quicfuscate::telemetry::flush();
     }
     Ok(())
 }
 
-fn parse_profile_entry(entry: &str, default_os: OsProfile) -> Option<FingerprintProfile> {
-    let parts: Vec<&str> = entry.split('@').collect();
-    let browser_part = parts.first()?;
-    let browser = match browser_part.parse() {
-        Ok(b) => b,
-        Err(_) => {
-            warn!("Invalid browser profile: {}", browser_part);
-            return None;
-        }
-    };
-    let os = if let Some(os_part) = parts.get(1) {
-        match os_part.parse() {
-            Ok(o) => o,
-            Err(_) => {
-                warn!("Invalid OS profile: {}", os_part);
-                return None;
-            }
-        }
-    } else {
-        default_os
-    };
-    let fp = FingerprintProfile::new(browser, os);
-    if fp.client_hello.is_none() {
-        warn!("No ClientHello found for {}@{}", browser_part, format!("{:?}", os).to_lowercase());
-        return None;
-    }
-    Some(fp)
-}
-
 fn run_crossfade_sim() -> std::io::Result<()> {
-    println!("[legacy] Cross-fade simulation starting...");
+    println!("[compat] Cross-fade simulation starting...");
     let opt = OptimizationManager::new();
     let _mem_pool = opt.memory_pool();
     let mut fec = AdaptiveFec::new(FecConfig::default());
@@ -1597,12 +1203,12 @@ fn run_crossfade_sim() -> std::io::Result<()> {
             }
         }
     }
-    println!("[legacy] Cross-fade simulation complete. final mode: {:?}", last_mode);
+    println!("[compat] Cross-fade simulation complete. final mode: {:?}", last_mode);
     Ok(())
 }
 
 fn run_high_loss_sim() -> std::io::Result<()> {
-    println!("[legacy] High-loss simulation starting...");
+    println!("[compat] High-loss simulation starting...");
     let opt = OptimizationManager::new();
     let _mem_pool = opt.memory_pool();
     let mut fec = AdaptiveFec::new(FecConfig::default());
@@ -1616,14 +1222,14 @@ fn run_high_loss_sim() -> std::io::Result<()> {
             last_mode = m;
         }
     }
-    println!("[legacy] High-loss simulation complete. final mode: {:?}", last_mode);
+    println!("[compat] High-loss simulation complete. final mode: {:?}", last_mode);
     Ok(())
 }
 
 fn run_optimize_probe() -> std::io::Result<()> {
-    println!("[legacy] Optimization probe starting...");
-    let opt = OptimizationManager::new_with_config(64, 4096, false);
-    println!(" xdp_available={} xdp_enabled={}", opt.is_xdp_available(), opt.is_xdp_enabled());
+    println!("[compat] Optimization probe starting...");
+    let opt = OptimizationManager::new_with_config(64, 4096);
+    println!(" xdp_compat_request_normalized=false active=false");
     // Exercise the memory pool
     let b1 = opt.alloc_block();
     let b2 = opt.alloc_block();
@@ -1643,11 +1249,105 @@ fn run_optimize_probe() -> std::io::Result<()> {
     let pool = opt.memory_pool();
     pool.set_capacity(128);
     println!(" pool capacity adjusted to 128 (probe)");
-    println!("[legacy] Optimization probe complete.");
+    println!("[compat] Optimization probe complete.");
     Ok(())
 }
 
-// XDP smoke test removed - AF_XDP no longer supported
+fn load_runtime_profiles(
+    config_path: Option<&PathBuf>,
+    fec_config: &Option<PathBuf>,
+    fec_mode_override: Option<quicfuscate::engine::FecMode>,
+) -> (FecConfig, StealthConfig, OptimizeConfig, quicfuscate::engine::AntiReplaySection) {
+    let (mut fec, stealth, optimize, anti_replay) = if let Some(cfg) = config_path {
+        match AppConfig::from_file(cfg) {
+            Ok(c) => {
+                if let Err(e) = c.validate() {
+                    warn!("Config validation failed: {}", e);
+                }
+                quicfuscate::implementations::server::runtime_components_from_app_config(
+                    c,
+                    fec_mode_override,
+                )
+            }
+            Err(e) => {
+                error!("Failed to load config {}: {}", cfg.display(), e);
+                (
+                    FecConfig::product_default(),
+                    StealthConfig::default(),
+                    OptimizeConfig::default(),
+                    quicfuscate::engine::AntiReplaySection::default(),
+                )
+            }
+        }
+    } else {
+        let fec = if let Some(path) = fec_config {
+            match FecConfig::from_file(path) {
+                Ok(cfg) => {
+                    if let Err(e) = cfg.validate() {
+                        warn!("FEC config validation failed: {}", e);
+                    }
+                    cfg
+                }
+                Err(e) => {
+                    error!("Failed to load FEC config {}: {}", path.display(), e);
+                    FecConfig::product_default()
+                }
+            }
+        } else {
+            FecConfig::product_default()
+        };
+        (
+            fec,
+            StealthConfig::default(),
+            OptimizeConfig::default(),
+            quicfuscate::engine::AntiReplaySection::default(),
+        )
+    };
+
+    if let Some(mode) = fec_mode_override {
+        fec.apply_engine_mode(mode);
+    }
+
+    (fec, stealth, optimize, anti_replay)
+}
+
+fn apply_runtime_transport_defaults(
+    config: &mut quicfuscate::transport::Config,
+    cc_algorithm: CcAlgorithm,
+) {
+    config.set_cc_algorithm(cc_algorithm.into());
+    if let Err(e) =
+        config.set_application_protos(&[b"hq-interop", b"h3-29", b"h3-28", b"h3-27", b"http/0.9"])
+    {
+        warn!("Failed to set application protos: {}", e);
+    }
+    config.set_max_idle_timeout(30000);
+    config.set_max_recv_udp_payload_size(1460);
+    config.set_max_send_udp_payload_size(1200);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
+}
+
+fn runtime_optimize_config(
+    config_path: Option<&PathBuf>,
+    opt_cfg: OptimizeConfig,
+    pool_capacity: usize,
+    pool_block: usize,
+    origin: &str,
+) -> OptimizeConfig {
+    if config_path.is_some() {
+        quicfuscate::implementations::server::normalize_runtime_optimize_config(
+            OptimizeConfig { pool_capacity: opt_cfg.pool_capacity, block_size: opt_cfg.block_size },
+            origin,
+        )
+    } else {
+        OptimizeConfig { pool_capacity, block_size: pool_block }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_client(
     remote_addr_str: &str,
@@ -1657,7 +1357,7 @@ async fn run_client(
     os: OsProfile,
     profile_seq: &Option<Vec<String>>,
     profile_interval: u64,
-    fec_mode: FecMode,
+    fec_mode: Option<quicfuscate::engine::FecMode>,
     pool_capacity: usize,
     pool_block: usize,
     config: &Option<PathBuf>,
@@ -1671,7 +1371,6 @@ async fn run_client(
     verify_peer: bool,
     disable_doh: bool,
     disable_fronting: bool,
-    disable_xor: bool,
     disable_http3: bool,
     cc_algorithm: CcAlgorithm,
     tun_enable: bool,
@@ -1704,43 +1403,8 @@ async fn run_client(
 
     info!("Client connecting to {}", server_addr);
 
-    let (mut fec_cfg, mut stealth_config, opt_cfg) = if let Some(cfg) = config_path {
-        match AppConfig::from_file(cfg) {
-            Ok(c) => {
-                if let Err(e) = c.validate() {
-                    warn!("Config validation failed: {}", e);
-                }
-                (c.fec, c.stealth, c.optimize)
-            }
-            Err(e) => {
-                error!("Failed to load config {}: {}", cfg.display(), e);
-                (FecConfig::default(), StealthConfig::default(), OptimizeConfig::default())
-            }
-        }
-    } else {
-        let fec = if let Some(path) = fec_config {
-            match FecConfig::from_file(path) {
-                Ok(cfg) => {
-                    if let Err(e) = cfg.validate() {
-                        warn!("FEC config validation failed: {}", e);
-                    }
-                    cfg
-                }
-                Err(e) => {
-                    error!("Failed to load FEC config {}: {}", path.display(), e);
-                    FecConfig::default()
-                }
-            }
-        } else {
-            FecConfig::default()
-        };
-        (fec, StealthConfig::default(), OptimizeConfig::default())
-    };
-    // Precedence: config file can specify `adaptive_fec.initial_mode`.
-    // CLI `--fec-mode` overrides only when explicitly non-zero, otherwise keep config.
-    if config_path.is_none() || fec_mode != FecMode::Zero {
-        fec_cfg.initial_mode = fec_mode;
-    }
+    let (fec_cfg, mut stealth_config, opt_cfg, _) =
+        load_runtime_profiles(config_path, fec_config, fec_mode);
 
     let mut config = match quicfuscate::transport::Config::new_with_version(
         quicfuscate::transport::PROTOCOL_VERSION,
@@ -1751,33 +1415,12 @@ async fn run_client(
             return Err(std::io::Error::other("transport config init failed"));
         }
     };
-    // Apply selected congestion control algorithm
-    // Map CLI CcAlgorithm to transport::CongestionControlAlgorithm
-    let cca = match cc_algorithm {
-        CcAlgorithm::Reno => quicfuscate::transport::CongestionControlAlgorithm::Reno,
-        CcAlgorithm::Cubic => quicfuscate::transport::CongestionControlAlgorithm::Cubic,
-        CcAlgorithm::Bbr => quicfuscate::transport::CongestionControlAlgorithm::BBR,
-        CcAlgorithm::Bbr2 | CcAlgorithm::Bbr2Gcongestion => {
-            quicfuscate::transport::CongestionControlAlgorithm::BBR2
-        }
-    };
-    config.set_cc_algorithm(cca);
-    if let Err(e) =
-        config.set_application_protos(&[b"hq-interop", b"h3-29", b"h3-28", b"h3-27", b"http/0.9"])
-    {
-        warn!("Failed to set application protos: {}", e);
-    }
-    config.set_max_idle_timeout(30000);
-    config.set_max_recv_udp_payload_size(1460);
-    config.set_max_send_udp_payload_size(1200);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
+    apply_runtime_transport_defaults(&mut config, cc_algorithm);
     config.verify_peer(verify_peer);
     if debug_tls {
-        config.log_keys();
+        warn!(
+            "--debug-tls currently relies on QUICFUSCATE_TRACE_TLS tracing paths; transport keylog emission is not wired in this fork"
+        );
     }
     if let Some(path) = ca_file {
         match path.to_str() {
@@ -1808,32 +1451,25 @@ async fn run_client(
             }
         }
     };
-    // Profile direkt setzen
-    stealth_config.initial_browser = profile;
-    stealth_config.initial_os = os;
-    stealth_config.enable_doh = !disable_doh;
-    stealth_config.doh_provider.clear();
-    stealth_config.doh_provider.push_str(doh_provider);
-    stealth_config.enable_domain_fronting = !disable_fronting;
-    stealth_config.fronting_domains = front_domain.to_vec();
-    stealth_config.enable_xor_obfuscation = !disable_xor;
-    stealth_config.enable_http3_masquerading = !disable_http3;
-    telemetry!(quicfuscate::telemetry_metrics::STEALTH_BROWSER_PROFILE
-        .set(stealth_config.initial_browser as i64));
-    telemetry!(
-        quicfuscate::telemetry_metrics::STEALTH_OS_PROFILE.set(stealth_config.initial_os as i64)
+    quicfuscate::implementations::server::apply_runtime_stealth_overrides(
+        &mut stealth_config,
+        profile,
+        os,
+        disable_doh,
+        doh_provider,
+        disable_fronting,
+        front_domain,
+        disable_http3,
     );
 
     let host = url_parsed.host_str().unwrap_or(DEFAULT_RUNTIME_SNI_HOST);
-    let opt_params = if config_path.is_some() {
-        OptimizeConfig {
-            pool_capacity: opt_cfg.pool_capacity,
-            block_size: opt_cfg.block_size,
-            enable_xdp: opt_cfg.enable_xdp,
-        }
-    } else {
-        OptimizeConfig { pool_capacity, block_size: pool_block, enable_xdp: false }
-    };
+    let opt_params = runtime_optimize_config(
+        config_path,
+        opt_cfg,
+        pool_capacity,
+        pool_block,
+        "client runtime config",
+    );
     let mut conn = match QuicFuscateConnection::new_client(
         host,
         local_addr,
@@ -1853,8 +1489,12 @@ async fn run_client(
     };
 
     let profiles: Vec<FingerprintProfile> = match profile_seq {
-        Some(seq) => seq.iter().filter_map(|s| parse_profile_entry(s, os)).collect(),
-        None => vec![FingerprintProfile::new(profile, os)],
+        Some(seq) => {
+            quicfuscate::implementations::server::resolve_runtime_profiles(profile, os, seq, false)
+        }
+        None => {
+            quicfuscate::implementations::server::resolve_runtime_profiles(profile, os, &[], true)
+        }
     };
 
     if profile_interval > 0 && profiles.is_empty() {
@@ -1909,7 +1549,9 @@ async fn run_client(
                                 Ok((block, len)) if len > 0 => {
                                     let mut v = vec![0u8; len];
                                     v.copy_from_slice(&block[..len]);
-                                    let _ = tx.send(v);
+                                    if tx.send(v).is_err() {
+                                        break;
+                                    }
                                     // block freed when dropped
                                 }
                                 Ok(_) => {}
@@ -1934,7 +1576,9 @@ async fn run_client(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received");
-                let _ = conn.conn.close(true, 0x0, b"ctrl_c");
+                if let Err(e) = conn.conn.close(true, 0x0, b"ctrl_c") {
+                    warn!("Client close on ctrl_c failed: {:?}", e);
+                }
                 break;
             }
             recv_res = recv_connected_datagram(&socket, &mut buf) => {
@@ -1987,9 +1631,11 @@ async fn run_client(
                             }
                         }
                     }
-                    let _ = conn.poll_http3_with(|_data| {
+                    if let Err(e) = conn.poll_http3_with(|_data| {
                         // client-side downlink to TUN could be added by writing to the interface
-                    });
+                    }) {
+                        warn!("HTTP/3 poll in TUN mode failed: {:?}", e);
+                    }
                 } else if let Err(e) = conn.poll_http3() {
                     warn!("HTTP/3 error: {:?}", e);
                 }
@@ -2013,191 +1659,47 @@ async fn run_client(
     Ok(())
 }
 
-fn apply_transport_overrides_from_toml(
-    cfg_path: &Path,
-    contents: &str,
-    transport: &mut quicfuscate::transport::Config,
-) {
-    let overrides = match parse_transport_overrides_from_toml(contents) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("transport overrides ignored (invalid values, {}): {}", cfg_path.display(), e);
-            return;
-        }
-    };
-
-    if let Some(algo) = overrides.cc_algorithm {
-        transport.set_cc_algorithm(algo);
-    }
-    if let Some(mtu) = overrides.mtu {
-        transport.set_max_send_udp_payload_size(mtu);
-    }
-    if let Some(pacing) = overrides.enable_pacing {
-        transport.enable_pacing(pacing);
-    }
-}
-
-#[derive(Default)]
-struct TransportOverrides {
-    cc_algorithm: Option<quicfuscate::transport::CongestionControlAlgorithm>,
-    mtu: Option<usize>,
-    enable_pacing: Option<bool>,
-}
-
-fn parse_transport_overrides_from_toml(contents: &str) -> Result<TransportOverrides, String> {
-    let doc: toml::Value =
-        toml::from_str(contents).map_err(|e| format!("TOML parse failed: {}", e))?;
-    let Some(tbl) = doc.get("transport").and_then(|v| v.as_table()) else {
-        return Ok(TransportOverrides::default());
-    };
-
-    let mut out = TransportOverrides::default();
-
-    if let Some(v) = tbl.get("cc_algorithm") {
-        let raw =
-            v.as_str().ok_or_else(|| "transport.cc_algorithm must be a string".to_string())?;
-        let name = raw.trim().to_lowercase();
-        let algo = match name.as_str() {
-            "reno" => Some(quicfuscate::transport::CongestionControlAlgorithm::Reno),
-            "cubic" => Some(quicfuscate::transport::CongestionControlAlgorithm::Cubic),
-            "bbr" => Some(quicfuscate::transport::CongestionControlAlgorithm::BBR),
-            "bbr2" | "bbr2_gcongestion" => {
-                Some(quicfuscate::transport::CongestionControlAlgorithm::BBR2)
-            }
-            "bbr3" => Some(quicfuscate::transport::CongestionControlAlgorithm::BBR3),
-            "ledbat" => Some(quicfuscate::transport::CongestionControlAlgorithm::Ledbat),
-            _ => None,
-        };
-        let Some(algo) = algo else {
-            return Err(format!("transport.cc_algorithm '{}' is not supported", raw));
-        };
-        out.cc_algorithm = Some(algo);
-    }
-
-    if let Some(v) = tbl.get("mtu") {
-        let mtu = v.as_integer().ok_or_else(|| "transport.mtu must be an integer".to_string())?;
-        if mtu <= 0 {
-            return Err("transport.mtu must be > 0".to_string());
-        }
-        // QUIC minimum payload is 1200. We allow jumbo frames for LAN.
-        if !(1200..=9000).contains(&mtu) {
-            return Err("transport.mtu must be between 1200 and 9000".to_string());
-        }
-        out.mtu = Some(mtu as usize);
-    }
-
-    if let Some(v) = tbl.get("enable_pacing") {
-        let pacing =
-            v.as_bool().ok_or_else(|| "transport.enable_pacing must be a boolean".to_string())?;
-        out.enable_pacing = Some(pacing);
-    }
-
-    Ok(out)
-}
-
-fn apply_transport_overrides_from_file(
-    cfg_path: &Path,
-    transport: &mut quicfuscate::transport::Config,
-) {
-    match std::fs::read_to_string(cfg_path) {
-        Ok(contents) => apply_transport_overrides_from_toml(cfg_path, &contents, transport),
-        Err(e) => warn!("transport overrides ignored (read failed, {}): {}", cfg_path.display(), e),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_runtime_stealth_overrides(
-    sc: &mut StealthConfig,
-    profile: BrowserProfile,
-    os: OsProfile,
-    disable_doh: bool,
-    doh_provider: &str,
-    disable_fronting: bool,
-    front_domain: &[String],
-    disable_xor: bool,
-    disable_http3: bool,
-) {
-    sc.initial_browser = profile;
-    sc.initial_os = os;
-    sc.enable_doh = !disable_doh;
-    sc.doh_provider.clear();
-    sc.doh_provider.push_str(doh_provider);
-    sc.enable_domain_fronting = !disable_fronting;
-    sc.fronting_domains = front_domain.to_vec();
-    sc.enable_xor_obfuscation = !disable_xor;
-    sc.enable_http3_masquerading = !disable_http3;
-    telemetry!(
-        quicfuscate::telemetry_metrics::STEALTH_BROWSER_PROFILE.set(sc.initial_browser as i64)
-    );
-    telemetry!(quicfuscate::telemetry_metrics::STEALTH_OS_PROFILE.set(sc.initial_os as i64));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_runtime_config_reload(
-    cfg_path: &Path,
-    fec_mode_override: FecMode,
-    transport: &mut quicfuscate::transport::Config,
-    fec_cfg_shared: &Arc<Mutex<FecConfig>>,
-    opt_params_shared: &Arc<Mutex<OptimizeConfig>>,
-    stealth_config: &Arc<Mutex<StealthConfig>>,
-    profile: BrowserProfile,
-    os: OsProfile,
-    disable_doh: bool,
-    doh_provider: &str,
-    disable_fronting: bool,
-    front_domain: &[String],
-    disable_xor: bool,
-    disable_http3: bool,
-) -> Result<(), String> {
-    let contents =
-        std::fs::read_to_string(cfg_path).map_err(|e| format!("Config read failed: {}", e))?;
-    let cfg = quicfuscate::interface::app_config::AppConfig::from_toml(&contents)
-        .map_err(|e| format!("Config parse failed: {}", e))?;
-
-    cfg.validate().map_err(|e| format!("Config validation failed: {}", e))?;
-    parse_transport_overrides_from_toml(&contents)?;
-
-    let mut fec = cfg.fec;
-    if fec_mode_override != FecMode::Zero {
-        fec.initial_mode = fec_mode_override;
-    }
-
-    {
-        let mut guard = fec_cfg_shared.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = fec;
-    }
-    {
-        let mut guard = opt_params_shared.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = OptimizeConfig {
-            pool_capacity: cfg.optimize.pool_capacity,
-            block_size: cfg.optimize.block_size,
-            enable_xdp: cfg.optimize.enable_xdp,
-        };
-    }
-    {
-        let mut guard = stealth_config.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = cfg.stealth;
-        apply_runtime_stealth_overrides(
-            &mut guard,
-            profile,
-            os,
-            disable_doh,
-            doh_provider,
-            disable_fronting,
-            front_domain,
-            disable_xor,
-            disable_http3,
-        );
-    }
-
-    apply_transport_overrides_from_toml(cfg_path, &contents, transport);
-    Ok(())
-}
-
 #[cfg(test)]
 mod runtime_reload_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    #[test]
+    fn normalize_runtime_optimize_config_preserves_runtime_values() {
+        let normalized = quicfuscate::implementations::server::normalize_runtime_optimize_config(
+            OptimizeConfig { pool_capacity: 64, block_size: 65_536 },
+            "test",
+        );
+        assert_eq!(normalized.pool_capacity, 64);
+        assert_eq!(normalized.block_size, 65_536);
+    }
+
+    #[test]
+    fn load_runtime_profiles_applies_non_zero_fec_mode_without_config_file() {
+        let (fec, stealth, optimize, _) = load_runtime_profiles(None, &None, None);
+        let default_stealth = StealthConfig::default();
+        let default_optimize = OptimizeConfig::default();
+        assert_eq!(fec.initial_mode, quicfuscate::fec::FecMode::Normal);
+        assert_eq!(stealth.initial_browser, default_stealth.initial_browser);
+        assert_eq!(stealth.initial_os, default_stealth.initial_os);
+        assert_eq!(stealth.enable_http3_masquerading, default_stealth.enable_http3_masquerading);
+        assert_eq!(optimize.pool_capacity, default_optimize.pool_capacity);
+        assert_eq!(optimize.block_size, default_optimize.block_size);
+    }
+
+    #[test]
+    fn runtime_optimize_config_uses_cli_values_without_config_file() {
+        let resolved = runtime_optimize_config(
+            None,
+            OptimizeConfig { pool_capacity: 1, block_size: 2 },
+            96,
+            32_768,
+            "test",
+        );
+        assert_eq!(resolved.pool_capacity, 96);
+        assert_eq!(resolved.block_size, 32_768);
+    }
 
     fn write_temp_config(contents: &str) -> std::path::PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2223,8 +1725,8 @@ mod runtime_reload_tests {
         let cfg_path = write_temp_config(
             r#"
 [fec]
-mode = "manual"
-initial_mode = "light"
+mode = "auto"
+initial_mode = "auto"
 window_good = 10
 window_fair = 30
 window_poor = 50
@@ -2235,14 +1737,13 @@ enable_doh = true
 doh_provider = "https://example.invalid/dns-query"
 enable_domain_fronting = true
 enable_http3_masquerading = true
-enable_xor_obfuscation = true
 
 [optimization]
 memory_pool_size = 7274496
 
 [transport]
 mtu = 1400
-cc_algorithm = "cubic"
+cc_algorithm = "bbr3"
 enable_pacing = false
 "#,
         );
@@ -2257,26 +1758,27 @@ enable_pacing = false
 
         // Keep runtime overrides strict to prove merge behavior.
         let front_domains = vec!["front.example".to_string()];
-        apply_runtime_config_reload(
+        quicfuscate::implementations::server::apply_runtime_config_reload(
             &cfg_path,
-            FecMode::Strong, // CLI override should win over config's "light"
+            Some(quicfuscate::engine::FecMode::Auto), // CLI override should win over config's initial mode
             &mut transport,
             &fec_shared,
             &opt_shared,
             &stealth_shared,
-            BrowserProfile::Chrome,
-            OsProfile::MacOS,
-            true, // disable DoH
-            "runtime-doh",
-            true, // disable fronting
-            &front_domains,
-            true, // disable xor
-            true, // disable http3 masquerade
+            quicfuscate::implementations::server::RuntimeStealthPolicy {
+                profile: BrowserProfile::Chrome,
+                os: OsProfile::MacOS,
+                disable_doh: true, // disable DoH
+                doh_provider: "runtime-doh",
+                disable_fronting: true, // disable fronting
+                front_domain: &front_domains,
+                disable_http3: true, // disable http3 masquerade
+            },
         )
         .expect("reload ok");
 
         let fec = fec_shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert_eq!(fec.initial_mode, FecMode::Strong);
+        assert_eq!(fec.initial_mode, quicfuscate::fec::FecMode::Normal);
 
         let opt = *opt_shared.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(opt.pool_capacity, 111);
@@ -2289,13 +1791,12 @@ enable_pacing = false
         assert_eq!(sc.doh_provider, "runtime-doh");
         assert!(!sc.enable_domain_fronting);
         assert_eq!(sc.fronting_domains, front_domains);
-        assert!(!sc.enable_xor_obfuscation);
         assert!(!sc.enable_http3_masquerading);
 
         assert_eq!(transport.max_udp_payload_size(), 1400);
         assert_eq!(
             transport.cc_algorithm(),
-            quicfuscate::transport::CongestionControlAlgorithm::Cubic
+            quicfuscate::transport::CongestionControlAlgorithm::BBR3
         );
         assert!(!transport.pacing_enabled());
     }
@@ -2306,7 +1807,7 @@ enable_pacing = false
             r#"
 [fec]
 mode = "auto"
-initial_mode = "normal"
+initial_mode = "auto"
 
 [stealth]
 mode = "auto"
@@ -2328,21 +1829,22 @@ mtu = 100
         .expect("transport config");
         let before = transport.max_udp_payload_size();
 
-        let err = apply_runtime_config_reload(
+        let err = quicfuscate::implementations::server::apply_runtime_config_reload(
             &cfg_path,
-            FecMode::Zero,
+            Some(quicfuscate::engine::FecMode::Off),
             &mut transport,
             &fec_shared,
             &opt_shared,
             &stealth_shared,
-            BrowserProfile::Chrome,
-            OsProfile::MacOS,
-            false,
-            "runtime-doh",
-            false,
-            &[],
-            false,
-            false,
+            quicfuscate::implementations::server::RuntimeStealthPolicy {
+                profile: BrowserProfile::Chrome,
+                os: OsProfile::MacOS,
+                disable_doh: false,
+                doh_provider: "runtime-doh",
+                disable_fronting: false,
+                front_domain: &[],
+                disable_http3: false,
+            },
         )
         .unwrap_err();
         assert!(err.to_ascii_lowercase().contains("transport.mtu"));
@@ -2359,7 +1861,7 @@ async fn run_server(
     os: OsProfile,
     profile_seq: &Option<Vec<String>>,
     profile_interval: u64,
-    fec_mode: FecMode,
+    fec_mode: Option<quicfuscate::engine::FecMode>,
     pool_capacity: usize,
     pool_block: usize,
     config: &Option<PathBuf>,
@@ -2368,7 +1870,6 @@ async fn run_server(
     front_domain: &[String],
     disable_doh: bool,
     disable_fronting: bool,
-    disable_xor: bool,
     disable_http3: bool,
     cc_algorithm: CcAlgorithm,
     tun_enable: bool,
@@ -2386,747 +1887,65 @@ async fn run_server(
     qkey_store: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let config_path = config.as_ref();
-    let admin_log_buffer = ADMIN_LOG_BUFFER.get().cloned().unwrap_or_else(|| {
-        Arc::new(quicfuscate::implementations::server::admin_logs::AdminLogBuffer::new(4096))
-    });
+    let config_path_ref = config_path.map(PathBuf::as_path);
 
-    // Apply persisted logging mode as early as possible to honor privacy expectations.
-    let initial_logging_mode = config_path
-        .map(|p| p.with_extension("logging.json"))
-        .and_then(|p| std::fs::read_to_string(&p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("mode").and_then(|m| m.as_str().map(String::from)))
-        .unwrap_or_else(|| "normal".to_string());
-    match initial_logging_mode.as_str() {
-        "no-log" => {
-            admin_log_buffer.clear();
-            log::set_max_level(log::LevelFilter::Off);
-        }
-        "minimal" => log::set_max_level(log::LevelFilter::Warn),
-        "verbose" => log::set_max_level(log::LevelFilter::Trace),
-        _ => log::set_max_level(log::LevelFilter::Info),
-    }
+    let (fec_cfg, stealth_cfg, opt_cfg, anti_replay_section) =
+        load_runtime_profiles(config_path, fec_config, fec_mode);
 
-    let std_socket = std::net::UdpSocket::bind(listen_addr)?;
-    std_socket.set_nonblocking(true)?;
-    let socket = tokio::net::UdpSocket::from_std(std_socket)?;
-    info!("Server listening on {}", listen_addr);
-    let metrics = Arc::new(Metrics::new());
-    let (admin_actions_tx, mut admin_actions_rx) = mpsc::unbounded_channel::<AdminAction>();
-    let mut admin_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = None;
-    let mut admin_web_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = None;
-    let mut metrics_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = None;
-
-    let client_snapshots: Arc<Mutex<HashMap<std::net::SocketAddr, ClientSnapshot>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let blocked_ips_path = config_path.map(|p| p.with_extension("blocked.json"));
-    let initial_blocked: std::collections::HashSet<String> = blocked_ips_path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-        .map(|v| v.into_iter().collect())
-        .unwrap_or_default();
-    if !initial_blocked.is_empty() {
-        log::info!("Loaded {} blocked IPs from disk", initial_blocked.len());
-    }
-    let blocked_ips: Arc<parking_lot::RwLock<std::collections::HashSet<String>>> =
-        Arc::new(parking_lot::RwLock::new(initial_blocked));
-    let qkey_ttl_secs = match qkey_ttl_secs {
-        Some(0) => None,
-        Some(v) => Some(v),
-        None => match std::env::var("QUICFUSCATE_QKEY_TTL_SECS") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(0) => None,
-                Ok(v) => Some(v),
-                Err(e) => {
-                    log::warn!("Invalid QUICFUSCATE_QKEY_TTL_SECS '{}': {}", raw, e);
-                    None
+    // Apply telemetry.enabled and logging.level from TOML config file when present.
+    // CLI --telemetry flag (already applied above) takes precedence; config only adds enablement.
+    if let Some(cfg_path) = config_path.as_ref() {
+        if let Ok(content) = std::fs::read_to_string(cfg_path) {
+            if let Ok(engine_cfg) = quicfuscate::engine::EngineConfig::from_toml(&content) {
+                if engine_cfg.telemetry.enabled {
+                    use quicfuscate::telemetry::TELEMETRY_ENABLED;
+                    TELEMETRY_ENABLED.store(true, Ordering::Relaxed);
                 }
-            },
-            Err(_) => None,
-        },
-    };
-    let qkey_store_path = qkey_store.or_else(|| {
-        config_path
-            .map(|path| path.with_extension("qkeys.json"))
-            .or_else(|| Some(PathBuf::from("config/local/qkeys.json")))
-    });
-    let qkey_registry: Arc<Mutex<QKeyRegistry>> =
-        Arc::new(Mutex::new(QKeyRegistry::new(200, qkey_store_path, qkey_ttl_secs)));
-
-    #[cfg(unix)]
-    struct ServerAdminHandler {
-        metrics: Arc<Metrics>,
-        blocked_ips: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
-        client_snapshots: Arc<Mutex<HashMap<std::net::SocketAddr, ClientSnapshot>>>,
-        actions: mpsc::UnboundedSender<AdminAction>,
-        listen_addr: String,
-        front_domain: Vec<String>,
-        qkeys: Arc<Mutex<QKeyRegistry>>,
-    }
-
-    #[cfg(unix)]
-    impl AdminHandler for ServerAdminHandler {
-        fn handle_status(&self) -> AdminResponse {
-            use std::sync::atomic::Ordering;
-            let data = serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_secs": self.metrics.uptime_secs(),
-                "clients_active": self.metrics.clients_active.load(Ordering::Relaxed),
-                "clients_total": self.metrics.clients_total.load(Ordering::Relaxed),
-                "bytes_in": self.metrics.bytes_in.load(Ordering::Relaxed),
-                "bytes_out": self.metrics.bytes_out.load(Ordering::Relaxed),
-            });
-            AdminResponse::ok_with_data(data)
-        }
-
-        fn handle_list_clients(&self) -> Vec<ClientInfo> {
-            let now = std::time::Instant::now();
-            let guard = match self.client_snapshots.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard
-                .iter()
-                .map(|(addr, c)| ClientInfo {
-                    id: addr.to_string(),
-                    ip: addr.ip().to_string(),
-                    remote_addr: addr.to_string(),
-                    connected_secs: now.duration_since(c.connected_at).as_secs(),
-                    bytes_in: c.bytes_in,
-                    bytes_out: c.bytes_out,
-                    stealth_mode: c.stealth_mode.clone(),
-                })
-                .collect()
-        }
-
-        fn handle_kick(&self, id: &str) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Kick(id.to_string()));
-            AdminResponse::ok_with_message(format!("Client {} scheduled for disconnect", id))
-        }
-
-        fn handle_block(&self, ip: &str) -> AdminResponse {
-            self.blocked_ips.write().insert(ip.to_string());
-            AdminResponse::ok_with_message(format!("IP {} blocked", ip))
-        }
-
-        fn handle_unblock(&self, ip: &str) -> AdminResponse {
-            if self.blocked_ips.write().remove(ip) {
-                AdminResponse::ok_with_message(format!("IP {} unblocked", ip))
-            } else {
-                AdminResponse::error(format!("IP {} was not blocked", ip))
-            }
-        }
-
-        fn handle_reload(&self) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Reload);
-            AdminResponse::ok_with_message("Configuration reload scheduled")
-        }
-
-        fn handle_qkey(&self) -> String {
-            use quicfuscate::engine::qkey;
-            use rand::RngCore;
-            let mut nonce = [0u8; 8];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-            let nonce_hex: String = nonce.iter().map(|b| format!("{:02x}", b)).collect();
-            let policy = resolve_qkey_domain_fronting_policy(
-                &self.front_domain,
-                &self.listen_addr,
-                Some(DF_SNI_MODE_AUTO_ROTATING),
-                None,
-                &nonce_hex,
-            )
-            .unwrap_or_else(|e| {
-                log::warn!("QKey SNI policy fallback engaged: {}", e);
-                QKeyDomainFrontingPolicy {
-                    qkey_sni: BUILTIN_FRONTING_SNI_ALLOWLIST[0].to_string(),
-                    extra_json: serde_json::json!({
-                        "nonce": nonce_hex,
-                        "df_sni_mode": DF_SNI_MODE_AUTO_ROTATING,
-                        "df_sni_pool": [BUILTIN_FRONTING_SNI_ALLOWLIST[0]],
-                    })
-                    .to_string(),
+                // Apply per-category telemetry export gates
+                {
+                    use quicfuscate::telemetry::{
+                        COLLECT_CONGESTION_STATS, COLLECT_FEC_STATS, COLLECT_PACKET_STATS,
+                        COLLECT_STEALTH_STATS, COLLECT_STREAM_STATS,
+                    };
+                    COLLECT_PACKET_STATS
+                        .store(engine_cfg.telemetry.collect_packet_stats, Ordering::Relaxed);
+                    COLLECT_STREAM_STATS
+                        .store(engine_cfg.telemetry.collect_stream_stats, Ordering::Relaxed);
+                    COLLECT_CONGESTION_STATS
+                        .store(engine_cfg.telemetry.collect_congestion_stats, Ordering::Relaxed);
+                    COLLECT_FEC_STATS
+                        .store(engine_cfg.telemetry.collect_fec_stats, Ordering::Relaxed);
+                    COLLECT_STEALTH_STATS
+                        .store(engine_cfg.telemetry.collect_stealth_stats, Ordering::Relaxed);
                 }
-            });
-            let mut token_bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-            let token_hex = hex_from_bytes(&token_bytes);
-            let config = qkey::QKeyConfig::new(&self.listen_addr, &policy.qkey_sni)
-                .with_stealth("auto")
-                .with_extra(&policy.extra_json)
-                .with_token(&token_hex);
-            let qkey_value = qkey::generate(&config);
-            let mut registry = self.qkeys.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = registry.insert(qkey_value.clone(), token_hex, None) {
-                log::warn!("qkey registry insert failed: {}", e);
-            }
-            qkey_value
-        }
-
-        fn handle_shutdown(&self) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Shutdown);
-            AdminResponse::ok_with_message("Shutdown scheduled")
-        }
-    }
-
-    use quicfuscate::implementations::server::qkey_registry::{QKeyRecord, QKeyRegistry};
-
-    struct ServerAdminHttpHandler {
-        metrics: Arc<Metrics>,
-        blocked_ips: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
-        blocked_ips_path: Option<PathBuf>,
-        client_snapshots: Arc<Mutex<HashMap<std::net::SocketAddr, ClientSnapshot>>>,
-        actions: mpsc::UnboundedSender<AdminAction>,
-        listen_addr: String,
-        front_domain: Vec<String>,
-        config_path: Option<PathBuf>,
-        qkeys: Arc<Mutex<QKeyRegistry>>,
-        logging_mode: Arc<parking_lot::RwLock<String>>,
-        log_buffer: Arc<quicfuscate::implementations::server::admin_logs::AdminLogBuffer>,
-    }
-
-    fn persist_blocked_ips(path: &Path, ips: &std::collections::HashSet<String>) {
-        let mut sorted: Vec<&String> = ips.iter().collect();
-        sorted.sort();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&sorted) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = atomic_write_file(path, &bytes, Some(0o600)) {
-                log::warn!("blocked IPs persist failed: {}", e);
-            }
-        }
-    }
-
-    fn hex_from_bytes(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{:02x}", byte));
-        }
-        out
-    }
-
-    fn atomic_write_text(path: &Path, contents: &str, mode: Option<u32>) -> std::io::Result<()> {
-        atomic_write_file(path, contents.as_bytes(), mode)
-    }
-
-    fn atomic_write_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-        use rand::RngCore;
-        use std::fs::File;
-        use std::io::Write;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut nonce = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let mut suffix = String::from(".tmp-");
-        for b in nonce {
-            let _ = std::fmt::Write::write_fmt(&mut suffix, format_args!("{:02x}", b));
-        }
-
-        let tmp_path = path.with_file_name(format!(
-            "{}{}",
-            path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-            suffix
-        ));
-
-        let mut f = File::create(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-
-        std::fs::rename(&tmp_path, path)?;
-
-        #[cfg(unix)]
-        if let Some(mode) = mode {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-        }
-
-        Ok(())
-    }
-
-    impl AdminHttpHandler for ServerAdminHttpHandler {
-        fn handle_status(&self) -> AdminResponse {
-            use std::sync::atomic::Ordering;
-            let data = serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_secs": self.metrics.uptime_secs(),
-                "clients_active": self.metrics.clients_active.load(Ordering::Relaxed),
-                "clients_total": self.metrics.clients_total.load(Ordering::Relaxed),
-                "bytes_in": self.metrics.bytes_in.load(Ordering::Relaxed),
-                "bytes_out": self.metrics.bytes_out.load(Ordering::Relaxed),
-                "listen": self.listen_addr,
-                "config_writable": self.config_path.is_some(),
-            });
-            AdminResponse::ok_with_data(data)
-        }
-
-        fn handle_list_clients(&self) -> Vec<ClientInfo> {
-            let now = std::time::Instant::now();
-            let guard = match self.client_snapshots.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard
-                .iter()
-                .map(|(addr, c)| ClientInfo {
-                    id: addr.to_string(),
-                    ip: addr.ip().to_string(),
-                    remote_addr: addr.to_string(),
-                    connected_secs: now.duration_since(c.connected_at).as_secs(),
-                    bytes_in: c.bytes_in,
-                    bytes_out: c.bytes_out,
-                    stealth_mode: c.stealth_mode.clone(),
-                })
-                .collect()
-        }
-
-        fn handle_kick(&self, id: &str) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Kick(id.to_string()));
-            AdminResponse::ok_with_message(format!("Client {} scheduled for disconnect", id))
-        }
-
-        fn handle_block(&self, ip: &str) -> AdminResponse {
-            self.blocked_ips.write().insert(ip.to_string());
-            if let Some(path) = self.blocked_ips_path.as_ref() {
-                persist_blocked_ips(path, &self.blocked_ips.read());
-            }
-            AdminResponse::ok_with_message(format!("IP {} blocked", ip))
-        }
-
-        fn handle_unblock(&self, ip: &str) -> AdminResponse {
-            if self.blocked_ips.write().remove(ip) {
-                if let Some(path) = self.blocked_ips_path.as_ref() {
-                    persist_blocked_ips(path, &self.blocked_ips.read());
-                }
-                AdminResponse::ok_with_message(format!("IP {} unblocked", ip))
-            } else {
-                AdminResponse::error(format!("IP {} was not blocked", ip))
-            }
-        }
-
-        fn handle_list_blocked_ips(&self) -> AdminResponse {
-            let mut ips: Vec<String> = self.blocked_ips.read().iter().cloned().collect();
-            ips.sort();
-            AdminResponse::ok_with_data(serde_json::json!({ "ips": ips }))
-        }
-
-        fn handle_reload(&self) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Reload);
-            AdminResponse::ok_with_message("Configuration reload scheduled")
-        }
-
-        fn handle_qkey(
-            &self,
-            req: quicfuscate::implementations::server::admin_http::IssueQKeyRequest,
-        ) -> AdminResponse {
-            use quicfuscate::engine::qkey;
-            use rand::RngCore;
-            let name =
-                req.name.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
-            if let Some(ref n) = name {
-                if n.chars().count() > 64 {
-                    return AdminResponse::error("QKey name too long (max 64 chars)");
-                }
-                if n.chars().any(|ch| ch.is_control()) {
-                    return AdminResponse::error("QKey name contains invalid characters");
-                }
-            }
-            let mut nonce = [0u8; 8];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-            let nonce_hex: String = nonce.iter().map(|b| format!("{:02x}", b)).collect();
-            let sni_policy = match resolve_qkey_domain_fronting_policy(
-                &self.front_domain,
-                &self.listen_addr,
-                req.sni_strategy.as_deref(),
-                req.sni_domain.as_deref(),
-                &nonce_hex,
-            ) {
-                Ok(v) => v,
-                Err(e) => return AdminResponse::error(e),
-            };
-            let mut token_bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-            let token_hex = hex_from_bytes(&token_bytes);
-            let stealth_raw = req
-                .stealth
-                .as_deref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("auto");
-            let stealth = match stealth_raw.to_ascii_lowercase().as_str() {
-                "auto" => "auto",
-                "max" => "max",
-                "manual" => "manual",
-                "off" => "off",
-                _ => {
-                    return AdminResponse::error(
-                        "Invalid stealth preset. Valid: auto, max, manual, off",
-                    )
-                }
-            };
-            let fec_raw =
-                req.fec.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("auto");
-            let fec = match fec_raw.to_ascii_lowercase().as_str() {
-                "auto" => "auto",
-                "on" | "manual" => "manual",
-                "off" => "off",
-                _ => return AdminResponse::error("Invalid fec preset. Valid: auto, on, off"),
-            };
-            let remote = if let Some(port) = req.port {
-                let endpoint = self.listen_addr.trim();
-                if endpoint.is_empty() {
-                    return AdminResponse::error("Server listen address is empty");
-                }
-                if let Ok(sock) = endpoint.parse::<std::net::SocketAddr>() {
-                    match sock {
-                        std::net::SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), port),
-                        std::net::SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), port),
-                    }
-                } else if endpoint.starts_with('[') {
-                    match endpoint.find(']') {
-                        Some(end) => format!("{}:{}", &endpoint[..=end], port),
-                        None => return AdminResponse::error("Invalid server listen address"),
-                    }
-                } else if let Some((host, _)) = endpoint.rsplit_once(':') {
-                    if host.is_empty() {
-                        return AdminResponse::error("Invalid server listen address");
-                    }
-                    format!("{}:{}", host, port)
+                // Apply logging config: effective() applies mode overrides (Verbose/Minimal/NoLog),
+                // then engine.log_level overrides the result when explicitly different.
+                let effective_logging = engine_cfg.logging.effective();
+                let effective_level = if engine_cfg.engine.log_level != "info"
+                    && engine_cfg.engine.log_level != effective_logging.level
+                {
+                    engine_cfg.engine.log_level.clone()
                 } else {
-                    format!("{}:{}", endpoint, port)
+                    effective_logging.level.clone()
+                };
+                let level_filter = match effective_level.to_ascii_lowercase().as_str() {
+                    "error" => Some(log::LevelFilter::Error),
+                    "warn" => Some(log::LevelFilter::Warn),
+                    "info" => Some(log::LevelFilter::Info),
+                    "debug" => Some(log::LevelFilter::Debug),
+                    "trace" => Some(log::LevelFilter::Trace),
+                    _ => None,
+                };
+                if let Some(filter) = level_filter {
+                    log::set_max_level(filter);
                 }
-            } else {
-                self.listen_addr.clone()
-            };
-            let config = qkey::QKeyConfig::new(&remote, &sni_policy.qkey_sni)
-                .with_stealth(stealth)
-                .with_fec(fec)
-                .with_extra(&sni_policy.extra_json)
-                .with_token(&token_hex);
-            let qkey_value = qkey::generate(&config);
-            let mut registry = self.qkeys.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = match registry.insert_with_ttl(
-                qkey_value.clone(),
-                token_hex,
-                req.ttl_seconds,
-                name,
-            ) {
-                Ok(e) => e,
-                Err(e) => return AdminResponse::error(format!("QKey store failed: {}", e)),
-            };
-            AdminResponse::ok_with_data(serde_json::json!({
-                "qkey": qkey_value,
-                "created_at": entry.created_at,
-                "expires_at": entry.expires_at,
-            }))
-        }
-
-        fn handle_shutdown(&self) -> AdminResponse {
-            let _ = self.actions.send(AdminAction::Shutdown);
-            AdminResponse::ok_with_message("Shutdown scheduled")
-        }
-
-        fn handle_list_qkeys(&self) -> AdminResponse {
-            let mut registry = self.qkeys.lock().unwrap_or_else(|e| e.into_inner());
-            AdminResponse::ok_with_data(serde_json::json!({ "keys": registry.list() }))
-        }
-
-        fn handle_revoke_qkey(&self, id: &str) -> AdminResponse {
-            let mut registry = self.qkeys.lock().unwrap_or_else(|e| e.into_inner());
-            if registry.revoke(id) {
-                AdminResponse::ok_with_message("QKey revoked")
-            } else {
-                AdminResponse::error("QKey not found")
-            }
-        }
-
-        fn handle_read_config(&self) -> AdminResponse {
-            let Some(path) = self.config_path.as_ref() else {
-                return AdminResponse::error("Config path not set");
-            };
-            match std::fs::read_to_string(path) {
-                Ok(contents) => {
-                    AdminResponse::ok_with_data(serde_json::json!({ "config": contents }))
-                }
-                Err(e) => AdminResponse::error(format!("Config read failed: {}", e)),
-            }
-        }
-
-        fn handle_write_config(&self, contents: &str) -> AdminResponse {
-            let Some(path) = self.config_path.as_ref() else {
-                return AdminResponse::error("Config path not set");
-            };
-            match quicfuscate::interface::app_config::AppConfig::from_toml(contents) {
-                Ok(cfg) => {
-                    if let Err(e) = cfg.validate() {
-                        return AdminResponse::error(format!("Config validation failed: {}", e));
-                    }
-                }
-                Err(e) => {
-                    return AdminResponse::error(format!("Config parse failed: {}", e));
-                }
-            };
-            if let Err(e) = parse_transport_overrides_from_toml(contents) {
-                return AdminResponse::error(format!("Config validation failed: {}", e));
-            }
-            match atomic_write_text(path, contents, Some(0o600)) {
-                Ok(()) => {
-                    let _ = self.actions.send(AdminAction::Reload);
-                    AdminResponse::ok_with_message("Config saved and reload scheduled")
-                }
-                Err(e) => AdminResponse::error(format!("Config write failed: {}", e)),
-            }
-        }
-
-        fn handle_metrics_text(&self) -> String {
-            self.metrics.export()
-        }
-
-        fn handle_metrics_json(&self) -> AdminResponse {
-            use std::sync::atomic::Ordering;
-            AdminResponse::ok_with_data(serde_json::json!({
-                "metrics": {
-                    "quicfuscate_up": 1,
-                    "quicfuscate_uptime_seconds": self.metrics.uptime_secs(),
-                    "quicfuscate_clients_active": self.metrics.clients_active.load(Ordering::Relaxed),
-                    "quicfuscate_clients_total": self.metrics.clients_total.load(Ordering::Relaxed),
-                    "quicfuscate_connections_rejected": self.metrics.connections_rejected.load(Ordering::Relaxed),
-                    "quicfuscate_bytes_in_total": self.metrics.bytes_in.load(Ordering::Relaxed),
-                    "quicfuscate_bytes_out_total": self.metrics.bytes_out.load(Ordering::Relaxed),
-                    "quicfuscate_packets_in_total": self.metrics.packets_in.load(Ordering::Relaxed),
-                    "quicfuscate_packets_out_total": self.metrics.packets_out.load(Ordering::Relaxed),
-                    "quicfuscate_stealth_http3_active": self.metrics.stealth_http3_active.load(Ordering::Relaxed),
-                    "quicfuscate_stealth_tls13_active": self.metrics.stealth_tls13_active.load(Ordering::Relaxed),
-                    "quicfuscate_fec_packets_encoded": self.metrics.fec_packets_encoded.load(Ordering::Relaxed),
-                    "quicfuscate_fec_packets_decoded": self.metrics.fec_packets_decoded.load(Ordering::Relaxed),
-                    "quicfuscate_fec_packets_recovered": self.metrics.fec_packets_recovered.load(Ordering::Relaxed),
-                    "quicfuscate_auth_failed_total": self.metrics.auth_failed.load(Ordering::Relaxed),
-                    "quicfuscate_rate_limited_total": self.metrics.rate_limited.load(Ordering::Relaxed),
-                }
-            }))
-        }
-
-        fn handle_get_logging_config(&self) -> AdminResponse {
-            let mode = self.logging_mode.read();
-            AdminResponse::ok_with_data(serde_json::json!({ "mode": mode.as_str() }))
-        }
-
-        fn handle_set_logging_config(&self, mode: &str) -> AdminResponse {
-            let valid = ["verbose", "normal", "minimal", "no-log"];
-            if !valid.contains(&mode) {
-                return AdminResponse::error(format!(
-                    "Invalid logging mode '{}'. Valid: {:?}",
-                    mode, valid
-                ));
-            }
-            *self.logging_mode.write() = mode.to_string();
-
-            // Dynamically enforce log level - no-log kills ALL output
-            let level = match mode {
-                "no-log" => log::LevelFilter::Off,
-                "minimal" => log::LevelFilter::Warn,
-                "normal" => log::LevelFilter::Info,
-                "verbose" => log::LevelFilter::Trace,
-                _ => log::LevelFilter::Info,
-            };
-            log::set_max_level(level);
-
-            if mode == "no-log" {
-                self.log_buffer.clear();
-            }
-
-            // Persist to config file if available
-            if let Some(path) = self.config_path.as_ref() {
-                let logging_cfg_path = path.with_extension("logging.json");
-                let payload = serde_json::json!({ "mode": mode });
-                if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
-                    if let Some(parent) = logging_cfg_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = atomic_write_file(&logging_cfg_path, &bytes, Some(0o600)) {
-                        // Only log if we're not in no-log mode (we might have just set Off)
-                        if mode != "no-log" {
-                            log::warn!("logging config write failed: {}", e);
-                        }
-                    }
+                // Apply log_to_stdout: when mode=no-log disables stdout, suppress output
+                if !effective_logging.log_to_stdout {
+                    log::set_max_level(log::LevelFilter::Off);
                 }
             }
-            AdminResponse::ok_with_message(format!("Logging mode set to '{}'", mode))
-        }
-
-        fn handle_get_logs(&self, cursor: u64) -> AdminResponse {
-            // In no-log mode, return empty
-            let mode = self.logging_mode.read();
-            let mode_str = mode.as_str();
-            if mode_str == "no-log" {
-                return AdminResponse::ok_with_data(serde_json::json!({
-                    "lines": [],
-                    "cursor": 0,
-                    "mode": "no-log"
-                }));
-            }
-            let (lines, new_cursor) = self.log_buffer.since(cursor, mode_str, 600);
-            AdminResponse::ok_with_data(serde_json::json!({
-                "lines": lines.iter().map(|l| serde_json::json!({
-                    "ts": l.ts,
-                    "level": l.level,
-                    "msg": l.msg,
-                })).collect::<Vec<_>>(),
-                "cursor": new_cursor,
-                "mode": mode_str
-            }))
-        }
-
-        fn handle_clear_logs(&self) -> AdminResponse {
-            self.log_buffer.clear();
-            AdminResponse::ok_with_message("Logs cleared")
         }
     }
-
-    if let Some(port) = metrics_port {
-        let server = quicfuscate::implementations::server::metrics::MetricsServer::new(
-            port,
-            metrics.clone(),
-        );
-        metrics_shutdown = Some(server.shutdown_signal());
-        tokio::spawn(async move {
-            if let Err(e) = server.run().await {
-                log::warn!("metrics server failed: {}", e);
-            }
-        });
-    }
-
-    #[cfg(unix)]
-    if let Some(path) = admin_socket {
-        let handler = ServerAdminHandler {
-            metrics: metrics.clone(),
-            blocked_ips: blocked_ips.clone(),
-            client_snapshots: client_snapshots.clone(),
-            actions: admin_actions_tx.clone(),
-            listen_addr: listen_addr.to_string(),
-            front_domain: front_domain.to_vec(),
-            qkeys: qkey_registry.clone(),
-        };
-        let server = AdminServer::new(path, Arc::new(handler));
-        admin_shutdown = Some(server.shutdown_signal());
-        tokio::spawn(async move {
-            if let Err(e) = server.run().await {
-                log::warn!("admin server failed: {}", e);
-            }
-        });
-    }
-    #[cfg(not(unix))]
-    let _ = admin_socket;
-
-    if let Some(addr) = admin_web {
-        let admin_user = admin_web_user
-            .or_else(|| std::env::var("QUICFUSCATE_ADMIN_USER").ok())
-            .map(|u| u.trim().to_string())
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--admin-web requires --admin-web-user or QUICFUSCATE_ADMIN_USER",
-                )
-            })?;
-        let admin_password = admin_web_password
-            .or_else(|| std::env::var("QUICFUSCATE_ADMIN_PASSWORD").ok())
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--admin-web requires --admin-web-password or QUICFUSCATE_ADMIN_PASSWORD",
-                )
-            })?;
-        if admin_user == "admin" && admin_password == "123" {
-            let allow_weak_defaults = std::env::var("QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS")
-                .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !allow_weak_defaults {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Refusing weak default admin credentials [admin/123]. Set QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS=1 only for controlled test environments.",
-                ));
-            }
-            warn!(
-                "Admin web weak defaults [admin/123] explicitly allowed by QUICFUSCATE_ALLOW_WEAK_ADMIN_DEFAULTS."
-            );
-        }
-        let logging_mode = Arc::new(parking_lot::RwLock::new(initial_logging_mode));
-        let handler = ServerAdminHttpHandler {
-            metrics: metrics.clone(),
-            blocked_ips: blocked_ips.clone(),
-            blocked_ips_path: blocked_ips_path.clone(),
-            client_snapshots: client_snapshots.clone(),
-            actions: admin_actions_tx.clone(),
-            listen_addr: listen_addr.to_string(),
-            front_domain: front_domain.to_vec(),
-            config_path: config_path.cloned(),
-            qkeys: qkey_registry.clone(),
-            logging_mode,
-            log_buffer: admin_log_buffer.clone(),
-        };
-        let requires_password_change = admin_user == "admin" && admin_password == "123";
-        let auth = AdminAuth::new(admin_user, admin_password, requires_password_change);
-        let auth_path = config_path
-            .and_then(|p| p.parent().map(|dir| dir.join("admin-auth.json")))
-            .unwrap_or_else(|| std::path::PathBuf::from("config/local/admin-auth.json"));
-        let server = AdminHttpServer::new(
-            addr,
-            admin_web_root,
-            Some(auth),
-            Some(auth_path),
-            Arc::new(handler),
-        );
-        admin_web_shutdown = Some(server.shutdown_signal());
-        std::thread::spawn(move || {
-            if let Err(e) = server.run() {
-                log::warn!("admin web server failed: {}", e);
-            }
-        });
-    }
-
-    let (mut fec_cfg, stealth_cfg, opt_cfg) = if let Some(cfg) = config_path {
-        match AppConfig::from_file(cfg) {
-            Ok(c) => {
-                if let Err(e) = c.validate() {
-                    warn!("Config validation failed: {}", e);
-                }
-                (c.fec, c.stealth, c.optimize)
-            }
-            Err(e) => {
-                error!("Failed to load config {}: {}", cfg.display(), e);
-                (FecConfig::default(), StealthConfig::default(), OptimizeConfig::default())
-            }
-        }
-    } else {
-        let fec = if let Some(path) = fec_config {
-            match FecConfig::from_file(path) {
-                Ok(cfg) => {
-                    if let Err(e) = cfg.validate() {
-                        warn!("FEC config validation failed: {}", e);
-                    }
-                    cfg
-                }
-                Err(e) => {
-                    error!("Failed to load FEC config {}: {}", path.display(), e);
-                    FecConfig::default()
-                }
-            }
-        } else {
-            FecConfig::default()
-        };
-        (fec, StealthConfig::default(), OptimizeConfig::default())
-    };
-    // Precedence: config file can specify `adaptive_fec.initial_mode`.
-    // CLI `--fec-mode` overrides only when explicitly non-zero, otherwise keep config.
-    if config_path.is_none() || fec_mode != FecMode::Zero {
-        fec_cfg.initial_mode = fec_mode;
-    }
-    let fec_cfg_shared = Arc::new(Mutex::new(fec_cfg));
 
     let mut config = match quicfuscate::transport::Config::new_with_version(
         quicfuscate::transport::PROTOCOL_VERSION,
@@ -3137,118 +1956,33 @@ async fn run_server(
             return Err(std::io::Error::other("server transport config init failed"));
         }
     };
-    // Apply selected congestion control algorithm
-    let cca2 = match cc_algorithm {
-        CcAlgorithm::Reno => quicfuscate::transport::CongestionControlAlgorithm::Reno,
-        CcAlgorithm::Cubic => quicfuscate::transport::CongestionControlAlgorithm::Cubic,
-        CcAlgorithm::Bbr => quicfuscate::transport::CongestionControlAlgorithm::BBR,
-        CcAlgorithm::Bbr2 | CcAlgorithm::Bbr2Gcongestion => {
-            quicfuscate::transport::CongestionControlAlgorithm::BBR2
-        }
-    };
-    config.set_cc_algorithm(cca2);
-    let cert_str = match cert_path.to_str() {
-        Some(s) => s,
-        None => {
-            error!("Certificate path is not valid UTF-8: {}", cert_path.display());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid certificate path",
-            ));
-        }
-    };
-    if let Err(e) = config.load_cert_chain_from_pem_file(cert_str) {
-        error!("Failed to load server cert {}: {}", cert_path.display(), e);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid certificate path",
-        ));
-    }
-
-    let key_str = match key_path.to_str() {
-        Some(s) => s,
-        None => {
-            error!("Private key path is not valid UTF-8: {}", key_path.display());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid private key path",
-            ));
-        }
-    };
-    if let Err(e) = config.load_priv_key_from_pem_file(key_str) {
-        error!("Failed to load server key {}: {}", key_path.display(), e);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid private key path",
-        ));
-    }
-
-    // Ensure the TLS provider uses the server's configured cert/key.
-    quicfuscate::qftls::set_tls_cert_key_paths(cert_str, key_str);
-    if let Err(e) =
-        config.set_application_protos(&[b"hq-interop", b"h3-29", b"h3-28", b"h3-27", b"http/0.9"])
-    {
-        warn!("Failed to set application protos: {}", e);
-    }
-    config.set_max_idle_timeout(30000);
-    config.set_max_recv_udp_payload_size(1460);
-    config.set_max_send_udp_payload_size(1200);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
+    apply_runtime_transport_defaults(&mut config, cc_algorithm);
+    quicfuscate::implementations::server::load_server_identity(&mut config, cert_path, key_path)?;
 
     if let Some(cfg_path) = config_path.as_ref() {
-        apply_transport_overrides_from_file(cfg_path, &mut config);
-    }
-
-    #[derive(Clone)]
-    struct QKeyAuthState {
-        expected_token_sha256: String,
-        authed: bool,
-        connected_at: std::time::Instant,
-    }
-
-    let mut clients: HashMap<std::net::SocketAddr, QuicFuscateConnection> = HashMap::new();
-    let mut qkey_auth: HashMap<Vec<u8>, QKeyAuthState> = HashMap::new();
-    let mut buf = [0; 65535];
-    let mut out = [0; 1460];
-    let stealth_config = Arc::new(Mutex::new(stealth_cfg));
-    {
-        let mut sc = match stealth_config.lock() {
-            Ok(g) => g,
-            Err(p) => {
-                warn!("stealth_config mutex poisoned; recovering inner state");
-                p.into_inner()
-            }
-        };
-        apply_runtime_stealth_overrides(
-            &mut sc,
-            profile,
-            os,
-            disable_doh,
-            doh_provider,
-            disable_fronting,
-            front_domain,
-            disable_xor,
-            disable_http3,
+        quicfuscate::implementations::server::apply_transport_overrides_from_file(
+            cfg_path,
+            &mut config,
         );
     }
-    let opt_params = if config_path.is_some() {
-        OptimizeConfig {
-            pool_capacity: opt_cfg.pool_capacity,
-            block_size: opt_cfg.block_size,
-            enable_xdp: opt_cfg.enable_xdp,
-        }
-    } else {
-        OptimizeConfig { pool_capacity, block_size: pool_block, enable_xdp: false }
-    };
-    let opt_params_shared = Arc::new(Mutex::new(opt_params));
 
+    let server_config =
+        quicfuscate::implementations::server::server_config_from_listen_addr(listen_addr)
+            .map_err(std::io::Error::other)?;
+    let opt_params = runtime_optimize_config(
+        config_path,
+        opt_cfg,
+        pool_capacity,
+        pool_block,
+        "server runtime config",
+    );
     let profiles: Vec<FingerprintProfile> = match profile_seq {
-        Some(seq) => seq.iter().filter_map(|s| parse_profile_entry(s, os)).collect(),
-        None => vec![FingerprintProfile::new(profile, os)],
+        Some(seq) => {
+            quicfuscate::implementations::server::resolve_runtime_profiles(profile, os, seq, false)
+        }
+        None => {
+            quicfuscate::implementations::server::resolve_runtime_profiles(profile, os, &[], true)
+        }
     };
 
     if profile_interval > 0 && profiles.is_empty() {
@@ -3259,509 +1993,60 @@ async fn run_server(
         ));
     }
 
-    if profile_interval > 0 && profiles.len() > 1 {
-        let cfg = stealth_config.clone();
-        // Use a dedicated runtime for profile rotation.
-        tokio::task::spawn(async move {
-            let mut idx = 0usize;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(profile_interval)).await;
-                idx = (idx + 1) % profiles.len();
-                let mut guard = match cfg.lock() {
-                    Ok(g) => g,
-                    Err(p) => {
-                        warn!("stealth_config mutex poisoned; recovering inner state");
-                        p.into_inner()
-                    }
-                };
-                // Apply the profile directly.
-                guard.initial_browser = profiles[idx].browser;
-                guard.initial_os = profiles[idx].os;
-            }
-        });
-    }
-
-    // Optional TUN interface for downlink frames from client
-    let server_tun: Option<quicfuscate::interface::TunInterface> = if tun_enable {
-        let tcfg = quicfuscate::interface::TunConfig {
+    let standalone_tun_config = if tun_enable {
+        Some(quicfuscate::interface::TunConfig {
             name: tun_name,
             ip: tun_ip.and_then(|s| s.parse().ok()),
             netmask: tun_netmask.and_then(|s| s.parse().ok()),
             mtu: tun_mtu.unwrap_or(1500),
             ..Default::default()
-        };
-        let opt_cfg = match opt_params_shared.lock() {
-            Ok(g) => *g,
-            Err(p) => *p.into_inner(),
-        };
-        let optm = OptimizationManager::from_cfg(opt_cfg);
-        match quicfuscate::interface::TunInterface::open(tcfg, optm.memory_pool()) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                warn!("server TUN open failed: {:?}", e);
-                None
-            }
-        }
+        })
     } else {
         None
     };
+    let mut runtime = ServerRuntime::new_initialized_standalone_default(
+        quicfuscate::engine::EngineConfig::default(),
+        server_config,
+        standalone_tun_config,
+        opt_params,
+        config_path_ref,
+        ADMIN_LOG_BUFFER.get().cloned(),
+        qkey_ttl_secs,
+        qkey_store,
+    )?;
+    let fec_mode_override = fec_mode;
+    let mut launch =
+        quicfuscate::implementations::server::PreparedStandaloneLaunch::new_with_runtime_stealth(
+            metrics_port,
+            admin_socket,
+            admin_web,
+            admin_web_root,
+            admin_web_user,
+            admin_web_password,
+            config_path.cloned(),
+            config,
+            fec_cfg,
+            opt_params,
+            stealth_cfg,
+            fec_mode_override,
+            profiles,
+            profile_interval,
+            quicfuscate::implementations::server::RuntimeStealthPolicy {
+                profile,
+                os,
+                disable_doh,
+                doh_provider,
+                disable_fronting,
+                front_domain,
+                disable_http3,
+            },
+            tun_enable,
+        );
+    launch.set_anti_replay_section(anti_replay_section);
+    let local_addr = runtime.local_addr();
+    info!("Server listening on {}", local_addr);
 
-    let mut housekeeping = interval(Duration::from_millis(5));
-    housekeeping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            Some(action) = admin_actions_rx.recv() => {
-                match action {
-                    AdminAction::Kick(id) => {
-                        if let Ok(addr) = id.parse::<std::net::SocketAddr>() {
-                            if let Some(mut conn) = clients.remove(&addr) {
-                                let conn_id = conn.conn.source_id().as_ref().to_vec();
-                                let _ = conn.conn.close(true, 0x0, b"admin_kick");
-                                qkey_auth.remove(&conn_id);
-                            }
-                            if let Ok(mut guard) = client_snapshots.lock() {
-                                guard.remove(&addr);
-                            }
-                            metrics.clients_active.store(clients.len() as u64, Ordering::Relaxed);
-                        }
-                    }
-                    AdminAction::Reload => {
-                        if let Some(cfg_path) = config_path.as_ref() {
-                            if let Err(e) = apply_runtime_config_reload(
-                                cfg_path,
-                                fec_mode,
-                                &mut config,
-                                &fec_cfg_shared,
-                                &opt_params_shared,
-                                &stealth_config,
-                                profile,
-                                os,
-                                disable_doh,
-                                doh_provider,
-                                disable_fronting,
-                                front_domain,
-                                disable_xor,
-                                disable_http3,
-                            ) {
-                                warn!("Config reload failed: {}", e);
-                            }
-                        } else {
-                            warn!("Config reload requested but no config path is set");
-                        }
-                    }
-                    AdminAction::Shutdown => {
-                        info!("Admin shutdown requested");
-                        if let Some(sig) = admin_shutdown.take() {
-                            sig.store(true, Ordering::SeqCst);
-                        }
-                        if let Some(sig) = admin_web_shutdown.take() {
-                            sig.store(true, Ordering::SeqCst);
-                        }
-                        if let Some(sig) = metrics_shutdown.take() {
-                            sig.store(true, Ordering::SeqCst);
-                        }
-                        for conn in clients.values_mut() {
-                            let _ = conn.conn.close(true, 0x0, b"admin_shutdown");
-                        }
-                        break;
-                    }
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received");
-                if let Some(sig) = admin_shutdown.take() {
-                    sig.store(true, Ordering::SeqCst);
-                }
-                if let Some(sig) = admin_web_shutdown.take() {
-                    sig.store(true, Ordering::SeqCst);
-                }
-                if let Some(sig) = metrics_shutdown.take() {
-                    sig.store(true, Ordering::SeqCst);
-                }
-                for conn in clients.values_mut() {
-                    let _ = conn.conn.close(true, 0x0, b"ctrl_c");
-                }
-                break;
-            }
-            recv_res = recv_datagram_from(&socket, &mut buf) => {
-                match recv_res {
-                    Ok((len, from)) => {
-                        telemetry!(quicfuscate::telemetry::BYTES_RECEIVED.inc_by(len as u64));
-                        metrics.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
-                        metrics.packets_in.fetch_add(1, Ordering::Relaxed);
-
-                        let ip_str = from.ip().to_string();
-                        if blocked_ips.read().contains(&ip_str) {
-                            metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-
-                        // Best-effort path-churn handling: if packets arrive from a new source
-                        // address but carry a DCID that maps to an existing connection, re-key
-                        // the runtime maps from old address to the new one.
-                        if !clients.contains_key(&from) {
-                            let migrated_from = quicfuscate::transport::packet::parse_header(
-                                &buf[..len],
-                                0,
-                            )
-                            .ok()
-                            .and_then(|(hdr, _)| {
-                                clients.iter().find_map(|(addr, conn)| {
-                                    if conn.conn.source_id().as_ref() == hdr.dcid.as_slice() {
-                                        Some(*addr)
-                                    } else {
-                                        None
-                                    }
-                                })
-                            });
-                            if let Some(old_addr) = migrated_from {
-                                if old_addr != from {
-                                    if let Some(conn) = clients.remove(&old_addr) {
-                                        clients.insert(from, conn);
-                                    }
-                                    if let Ok(mut guard) = client_snapshots.lock() {
-                                        if let Some(snapshot) = guard.remove(&old_addr) {
-                                            guard.insert(from, snapshot);
-                                        }
-                                    }
-                                    quicfuscate::telemetry::QKEY_PATH_REBIND_TOTAL.inc();
-                                    info!("Client path updated: {} -> {}", old_addr, from);
-                                }
-                            }
-                        }
-
-                        use std::collections::hash_map::Entry;
-                        let mut clients_len = clients.len();
-                        let conn = match clients.entry(from) {
-                            Entry::Occupied(entry) => entry.into_mut(),
-                            Entry::Vacant(entry) => {
-                                // New connection must start with an Initial carrying the client's ODCID.
-                                // We need the ODCID for RFC 9001 Initial key derivation and, if enabled,
-                                // the token for QKey selection.
-                                let (mut initial_hdr, _) = match quicfuscate::transport::packet::parse_header(&buf[..len], 0) {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-                                };
-                                if initial_hdr.ty != quicfuscate::transport::packet::PacketType::Initial {
-                                    metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                let odcid = quicfuscate::transport::ConnectionId::from_vec(
-                                    std::mem::take(&mut initial_hdr.dcid),
-                                );
-                                let initial_token = initial_hdr.token.take();
-
-                                let require_qkey = require_qkey_for_new_clients({
-                                    let mut registry =
-                                        qkey_registry.lock().unwrap_or_else(|e| e.into_inner());
-                                    registry.has_entries()
-                                });
-                                let mut qkey_record: Option<QKeyRecord> = None;
-                                let mut pending_qkey_auth_state: Option<QKeyAuthState> = None;
-                                if require_qkey {
-                                    let token = match initial_token {
-                                        Some(token) if !token.is_empty() => token,
-                                        _ => {
-                                            metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                            continue;
-                                        }
-                                    };
-                                        let record = {
-                                            let mut registry = qkey_registry.lock().unwrap_or_else(|e| e.into_inner());
-                                            registry.lookup_initial_id_token(&token)
-                                        };
-                                    let Some(record) = record else {
-                                        metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    };
-                                    pending_qkey_auth_state = Some(QKeyAuthState {
-                                        expected_token_sha256: record.token_sha256.clone(),
-                                        authed: false,
-                                        connected_at: std::time::Instant::now(),
-                                    });
-                                    qkey_record = Some(record);
-                                }
-                                info!("New client connected: {}", from);
-                                // Each server connection should use a fresh, unpredictable SCID.
-                                let mut scid_bytes = [0u8; quicfuscate::transport::MAX_CONN_ID_LEN];
-                                quicfuscate::transport::rand::rand_bytes(&mut scid_bytes);
-                                let scid = quicfuscate::transport::ConnectionId::from_ref(&scid_bytes);
-                                let cfg = match stealth_config.lock() {
-                                    Ok(g) => g,
-                                    Err(p) => {
-                                        warn!(
-                                            "stealth_config mutex poisoned; recovering inner state"
-                                        );
-                                        p.into_inner()
-                                    }
-                                }
-                                .clone();
-                                let mut conn_stealth_cfg = cfg;
-                                let mut conn_fec_cfg = match fec_cfg_shared.lock() {
-                                    Ok(g) => g.clone(),
-                                    Err(p) => p.into_inner().clone(),
-                                };
-                                if let Some(ref record) = qkey_record {
-                                    // Enforce server-side policy from the issued key.
-                                    if let Some(mode_raw) = record.stealth.as_deref() {
-                                        let m = mode_raw.trim().to_ascii_lowercase();
-                                        let mapped = match m.as_str() {
-                                            "off" => Some(quicfuscate::stealth::StealthMode::Off),
-                                            "max" => Some(quicfuscate::stealth::StealthMode::AntiDpi),
-                                            "manual" => Some(quicfuscate::stealth::StealthMode::Manual),
-                                            _ => None,
-                                        };
-                                        if let Some(mapped) = mapped {
-                                            conn_stealth_cfg.mode = mapped;
-                                            apply_runtime_stealth_overrides(
-                                                &mut conn_stealth_cfg,
-                                                profile,
-                                                os,
-                                                disable_doh,
-                                                doh_provider,
-                                                disable_fronting,
-                                                front_domain,
-                                                disable_xor,
-                                                disable_http3,
-                                            );
-                                        }
-                                    }
-                                    if let Some(fec_raw) = record.fec.as_deref() {
-                                        // QKey "manual" is treated as "FEC On" with robust defaults.
-                                        if fec_raw.trim().eq_ignore_ascii_case("manual") {
-                                            conn_fec_cfg.initial_mode = quicfuscate::fec::FecMode::Normal;
-                                            conn_fec_cfg.force_on = true;
-                                        }
-                                    }
-                                }
-                                    match QuicFuscateConnection::new_server(
-                                    &scid,
-                                    Some(&odcid),
-                                    socket.local_addr().unwrap_or_else(|e| {
-                                        error!(
-                                            "socket.local_addr() failed: {} - using unspecified address",
-                                            e
-                                        );
-                                        std::net::SocketAddr::from(([0, 0, 0, 0], 0))
-                                    }),
-                                    from,
-                                    &mut config,
-                                    conn_stealth_cfg,
-                                    conn_fec_cfg,
-                                    match opt_params_shared.lock() {
-                                        Ok(g) => *g,
-                                        Err(p) => *p.into_inner(),
-                                    },
-                                ) {
-                                    Ok(conn) => {
-                                        metrics.clients_total.fetch_add(1, Ordering::Relaxed);
-                                        clients_len += 1;
-                                        if let Some(state) = pending_qkey_auth_state.take() {
-                                            let conn_id = conn.conn.source_id().as_ref().to_vec();
-                                            qkey_auth.insert(conn_id, state);
-                                        }
-                                        entry.insert(conn)
-                                    }
-                                    Err(e) => {
-                                        error!("failed to create server connection: {}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-                        metrics.clients_active.store(clients_len as u64, Ordering::Relaxed);
-
-                            {
-                                let mut snapshots_guard = match client_snapshots.lock() {
-                                    Ok(g) => g,
-                                    Err(p) => p.into_inner(),
-                                };
-                                let snap =
-                                    snapshots_guard.entry(from).or_insert_with(|| ClientSnapshot {
-                                        connected_at: std::time::Instant::now(),
-                                        bytes_in: 0,
-                                        bytes_out: 0,
-                                        stealth_mode: format!("{:?}", conn.stealth_mode()),
-                                    });
-                                snap.bytes_in = snap.bytes_in.saturating_add(len as u64);
-                                snap.stealth_mode = format!("{:?}", conn.stealth_mode());
-                            }
-
-                        if let Err(e) = conn.recv(&buf[..len]) {
-                            error!("QUIC recv failed: {:?}", e);
-                        }
-
-                            // HTTP/3: always poll and, if a QKey is required, enforce auth via an
-                            // encrypted header (post-handshake).
-                            let tun_ref = server_tun.as_ref();
-                            let conn_id = conn.conn.source_id().as_ref().to_vec();
-                            let require_auth = qkey_auth.contains_key(&conn_id);
-                            let qkey_auth_view = &qkey_auth;
-                            let authed =
-                                Cell::new(qkey_auth.get(&conn_id).map(|s| s.authed).unwrap_or(true));
-                            let should_close: Cell<Option<&'static [u8]>> = Cell::new(None);
-
-                            let _ = conn.poll_http3_with_headers(
-                                |_sid, headers| {
-                                    let Some(expected) = qkey_auth_view
-                                        .get(&conn_id)
-                                        .map(|s| s.expected_token_sha256.as_str())
-                                    else {
-                                        return;
-                                    };
-                                    if authed.get() {
-                                        return;
-                                    }
-                                    let mut provided: Option<&[u8]> = None;
-                                    for h in headers {
-                                        if h.name().eq_ignore_ascii_case(b"x-qf-auth") {
-                                            provided = Some(h.value());
-                                            break;
-                                        }
-                                    }
-                                    let Some(provided) = provided else {
-                                        should_close.set(Some(b"missing_qkey_auth"));
-                                        return;
-                                    };
-                                    let provided = match std::str::from_utf8(provided) {
-                                        Ok(s) => s.trim(),
-                                        Err(_) => {
-                                            should_close.set(Some(b"invalid_qkey_auth"));
-                                            return;
-                                        }
-                                    };
-                                    let provided_hash = match quicfuscate::implementations::server::qkey_registry::token_sha256_hex_from_token_hex(provided) {
-                                        Some(h) => h,
-                                        None => {
-                                            should_close.set(Some(b"invalid_qkey_auth"));
-                                            return;
-                                        }
-                                    };
-                                    if provided_hash.eq_ignore_ascii_case(expected.trim()) {
-                                        authed.set(true);
-                                    } else {
-                                        should_close.set(Some(b"invalid_qkey_auth"));
-                                    }
-                                },
-                                |_sid, data| {
-                                    // If a QKey is required, do not forward anything until authed.
-                                    if require_auth && !authed.get() {
-                                        return;
-                                    }
-                                    if tun_enable {
-                                        if let Some(t) = tun_ref {
-                                            let _ = t.write(data);
-                                        }
-                                    }
-                                },
-                            );
-
-                            if require_auth {
-                                if let Some(state) = qkey_auth.get_mut(&conn_id) {
-                                    state.authed = authed.get();
-                                }
-                            }
-
-                            if let Some(reason) = should_close.get() {
-                                metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                quicfuscate::telemetry::QKEY_AUTH_FAIL_TOTAL.inc();
-                                let _ = conn.conn.close(true, 0x0, reason);
-                                qkey_auth.remove(&conn_id);
-                            }
-
-                            match flush_server_outgoing(&socket, &from, conn, &mut out, &metrics).await
-                            {
-                            Ok((bytes_out, _packets_out)) => {
-                                if bytes_out > 0 {
-                                    if let Ok(mut guard) = client_snapshots.lock() {
-                                        if let Some(snap) = guard.get_mut(&from) {
-                                            snap.bytes_out = snap.bytes_out.saturating_add(bytes_out);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to send packet to {}: {}", from, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read from socket: {}", e);
-                    }
-                }
-            }
-                _ = housekeeping.tick() => {
-                    let addresses: Vec<_> = clients.keys().cloned().collect();
-                    for addr in addresses {
-                        if let Some(conn) = clients.get_mut(&addr) {
-                        match flush_server_outgoing(&socket, &addr, conn, &mut out, &metrics).await {
-                            Ok((bytes_out, _packets_out)) => {
-                                if bytes_out > 0 {
-                                    if let Ok(mut guard) = client_snapshots.lock() {
-                                        if let Some(snap) = guard.get_mut(&addr) {
-                                            snap.bytes_out = snap.bytes_out.saturating_add(bytes_out);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to flush packets to {}: {}", addr, e);
-                            }
-                        }
-                        conn.update_state();
-                        info!(
-                            "client {} stats: RTT {:.0} ms, Loss {:.2}%",
-                            addr,
-                            conn.rtt_ms(),
-                            conn.loss_rate() * 100.0
-                        );
-                            conn.conn.on_timeout();
-                        }
-                    }
-                    // Enforce a strict QKey auth deadline for connections that require it.
-                    // The public QKey id is visible in the Initial header, but the secret token must
-                    // be provided post-handshake via encrypted HTTP/3 headers.
-                    {
-                        let mut timed_out_conn_ids: Vec<Vec<u8>> = Vec::new();
-                        for conn in clients.values() {
-                            let conn_id = conn.conn.source_id().as_ref().to_vec();
-                            if let Some(state) = qkey_auth.get(&conn_id) {
-                                if !state.authed
-                                    && state.connected_at.elapsed() > Duration::from_secs(5)
-                                {
-                                    timed_out_conn_ids.push(conn_id);
-                                }
-                            }
-                        }
-                        for conn_id in timed_out_conn_ids {
-                            for conn in clients.values_mut() {
-                                if conn.conn.source_id().as_ref() == conn_id.as_slice() {
-                                    metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
-                                    quicfuscate::telemetry::QKEY_AUTH_FAIL_TOTAL.inc();
-                                    let _ = conn.conn.close(true, 0x0, b"qkey_auth_timeout");
-                                    break;
-                                }
-                            }
-                            qkey_auth.remove(&conn_id);
-                        }
-                    }
-                    clients.retain(|_, conn| !conn.conn.is_closed());
-                    qkey_auth.retain(|conn_id, _| {
-                        clients
-                            .values()
-                            .any(|conn| conn.conn.source_id().as_ref() == conn_id.as_slice())
-                    });
-                    metrics.clients_active.store(clients.len() as u64, Ordering::Relaxed);
-                    if let Ok(mut guard) = client_snapshots.lock() {
-                        guard.retain(|addr, _| clients.contains_key(addr));
-                    }
-                    tokio::task::yield_now().await;
-                }
-        }
-    }
+    runtime.run_standalone(launch).await?;
 
     Ok(())
 }
